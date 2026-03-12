@@ -29,7 +29,10 @@ public class DefaultToolExecutor implements ToolExecutor {
         long start = System.currentTimeMillis();
         try {
             ToolResult toolResult = tool.execute(new ToolInvocation(
+                    context.agentId(),
+                    context.runId(),
                     context.sessionId(),
+                    context.userId(),
                     decision.normalizedToolName(),
                     decision.normalizedArgumentsJson()
             ));

@@ -59,3 +59,33 @@ curl "http://localhost:8080/api/chat/stream?sessionId=s2&message=/tool%20echo%20
 - `MEMORY.md`：显式长期记忆
 - `TOOLS.yaml`：工具白名单/黑名单策略
 - `knowledge/*.md`：附加知识文档，会被截断后拼入 prompt
+
+当前内置了两个 workspace：
+
+- `dev-agent`：默认开发代理
+- `ops-agent`：当 `userId=ops` 或 `sessionId` 以 `ops-` 开头时自动路由
+
+当前内置工具包括：
+
+- `echo`
+- `file.list`
+- `file.read`
+- `file.write`
+- `artifact.save`
+- `http.fetch`
+- `shell.exec`
+
+## 验证
+
+完整本地校验：
+
+```bash
+.\gradlew.bat build
+```
+
+其中 `check` 会自动执行 `:agent-app:smokeTest`，覆盖以下最小链路：
+
+- 路由规则解析
+- Runtime + Tool Loop
+- artifact 持久化查询
+- memory note 持久化查询

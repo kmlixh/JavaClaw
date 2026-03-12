@@ -1,9 +1,11 @@
 package com.janyee.agent.web.controller;
 
 import com.janyee.agent.api.AgentDefinitionResponse;
+import com.janyee.agent.api.ArtifactResponse;
 import com.janyee.agent.api.RunDetailResponse;
 import com.janyee.agent.api.SessionDetailResponse;
 import com.janyee.agent.api.SessionMessageResponse;
+import com.janyee.agent.api.MemoryNoteResponse;
 import com.janyee.agent.api.ToolAuditLogResponse;
 import com.janyee.agent.runtime.agent.AgentDefinitionService;
 import com.janyee.agent.runtime.query.AgentQueryService;
@@ -94,7 +96,36 @@ public class QueryController {
                                 audit.durationMillis(),
                                 audit.createdAt()
                         ))
+                        .toList(),
+                view.artifacts().stream()
+                        .map(artifact -> new ArtifactResponse(
+                                artifact.id(),
+                                artifact.sessionId(),
+                                artifact.runId(),
+                                artifact.agentId(),
+                                artifact.artifactType(),
+                                artifact.name(),
+                                artifact.path(),
+                                artifact.contentType(),
+                                artifact.sizeBytes(),
+                                artifact.createdAt()
+                        ))
                         .toList()
         );
+    }
+
+    @GetMapping("/agents/{id}/memories")
+    public java.util.List<MemoryNoteResponse> listMemories(@PathVariable("id") String id) {
+        return agentQueryService.listMemoryNotes(id).stream()
+                .map(note -> new MemoryNoteResponse(
+                        note.id(),
+                        note.agentId(),
+                        note.sessionId(),
+                        note.runId(),
+                        note.source(),
+                        note.content(),
+                        note.createdAt()
+                ))
+                .toList();
     }
 }

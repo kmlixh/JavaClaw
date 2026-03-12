@@ -37,7 +37,32 @@ agent:
     key-prefix: "agent:session-lock:"
     ttl: 30s
   approval:
-    required-tools: []
+    required-tools:
+      - file.write
+      - http.fetch
+      - shell.exec
+  routing:
+    bindings:
+      - channel: web
+        user-id: ops
+        agent-id: ops-agent
+      - channel: web
+        session-prefix: ops-
+        agent-id: ops-agent
+  worker:
+    shell:
+      shell: powershell
+      timeout-millis: 10000
+      allowed-prefixes:
+        - Get-ChildItem
+        - Get-Content
+        - Get-Location
+        - Write-Output
+        - echo
+        - dir
+        - ls
+        - pwd
+        - type
 
 logging:
   level:

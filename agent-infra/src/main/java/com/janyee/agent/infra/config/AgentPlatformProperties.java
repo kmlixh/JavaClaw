@@ -12,7 +12,9 @@ public record AgentPlatformProperties(
         RuntimeProperties runtime,
         LlmProperties llm,
         SessionLockProperties sessionLock,
-        ApprovalProperties approval
+        ApprovalProperties approval,
+        RoutingProperties routing,
+        WorkerProperties worker
 ) {
     public record RuntimeProperties(
             int maxToolIterations,
@@ -40,6 +42,31 @@ public record AgentPlatformProperties(
 
     public record ApprovalProperties(
             List<String> requiredTools
+    ) {
+    }
+
+    public record RoutingProperties(
+            List<RouteBindingProperties> bindings
+    ) {
+    }
+
+    public record RouteBindingProperties(
+            String channel,
+            String userId,
+            String sessionPrefix,
+            String agentId
+    ) {
+    }
+
+    public record WorkerProperties(
+            ShellWorkerProperties shell
+    ) {
+    }
+
+    public record ShellWorkerProperties(
+            String shell,
+            Long timeoutMillis,
+            List<String> allowedPrefixes
     ) {
     }
 }

@@ -12,6 +12,7 @@ public record RunDetailResponse(
         String detail,
         Instant createdAt,
         Instant updatedAt,
-        List<ToolAuditLogResponse> toolAudits
+        List<ToolAuditLogResponse> toolAudits,
+        List<ArtifactResponse> artifacts
 ) {
 }

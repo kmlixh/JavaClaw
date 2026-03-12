@@ -1,6 +1,7 @@
 package com.janyee.agent.domain;
 
 public record AgentBinding(
-        String agentId
+        String agentId,
+        String reason
 ) {
 }

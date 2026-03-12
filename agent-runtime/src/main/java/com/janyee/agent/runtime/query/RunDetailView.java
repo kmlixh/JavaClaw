@@ -12,6 +12,7 @@ public record RunDetailView(
         String detail,
         Instant createdAt,
         Instant updatedAt,
-        List<ToolAuditLogView> toolAudits
+        List<ToolAuditLogView> toolAudits,
+        List<ArtifactView> artifacts
 ) {
 }

@@ -4,4 +4,6 @@ public interface AgentQueryService {
     SessionDetailView getSession(String sessionId);
 
     RunDetailView getRun(String runId);
+
+    java.util.List<MemoryNoteView> listMemoryNotes(String agentId);
 }

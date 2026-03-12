@@ -6,6 +6,7 @@ import com.janyee.agent.domain.PromptContext;
 import com.janyee.agent.domain.RunRequest;
 import com.janyee.agent.domain.RunStatus;
 import com.janyee.agent.infra.config.AgentPlatformProperties;
+import com.janyee.agent.memory.MemoryService;
 import com.janyee.agent.runtime.AgentRunner;
 import com.janyee.agent.runtime.loop.ToolCallOutcome;
 import com.janyee.agent.runtime.loop.ToolLoopContext;
@@ -37,6 +38,7 @@ public class SimpleAgentRunner implements AgentRunner {
     private final SessionLockManager sessionLockManager;
     private final AgentPlatformProperties properties;
     private final RunRecordService runRecordService;
+    private final MemoryService memoryService;
 
     public SimpleAgentRunner(
             PromptAssembler promptAssembler,
@@ -45,7 +47,8 @@ public class SimpleAgentRunner implements AgentRunner {
             SessionTranscriptService transcriptService,
             SessionLockManager sessionLockManager,
             AgentPlatformProperties properties,
-            RunRecordService runRecordService
+            RunRecordService runRecordService,
+            MemoryService memoryService
     ) {
         this.promptAssembler = promptAssembler;
         this.toolLoopOrchestrator = toolLoopOrchestrator;
@@ -54,6 +57,7 @@ public class SimpleAgentRunner implements AgentRunner {
         this.sessionLockManager = sessionLockManager;
         this.properties = properties;
         this.runRecordService = runRecordService;
+        this.memoryService = memoryService;
     }
 
     @Override
@@ -98,6 +102,16 @@ public class SimpleAgentRunner implements AgentRunner {
 
             if (!loopResult.finalAssistantText().isBlank()) {
                 transcriptService.appendAssistantMessage(request.sessionId(), runId, loopResult.finalAssistantText());
+                memoryService.saveNote(
+                        request.agentId(),
+                        request.sessionId(),
+                        runId,
+                        """
+                        User: %s
+                        Assistant: %s
+                        """.formatted(request.message(), loopResult.finalAssistantText()),
+                        "run_summary"
+                );
             }
 
             RunStatus finalStatus = switch (loopResult.finalState()) {

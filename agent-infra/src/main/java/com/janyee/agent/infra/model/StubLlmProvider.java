@@ -28,9 +28,8 @@ final class StubLlmProvider {
         if (message.startsWith("/tool echo ")) {
             String text = message.substring("/tool echo ".length()).trim();
             return Flux.just(
-                    new LlmStreamEvent("token", """
-                            TOOL_CALL: echo
-                            ARGS: {"text":"%s"}""".formatted(escapeJson(text))),
+                    new LlmStreamEvent("tool_call_request", """
+                            {"id":"stub-tool-call","name":"echo","arguments":"{\\"text\\":\\"%s\\"}"}""".formatted(escapeJson(text))),
                     new LlmStreamEvent("finish", "tool_call")
             );
         }

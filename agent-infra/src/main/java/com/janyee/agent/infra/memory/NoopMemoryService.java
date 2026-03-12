@@ -13,4 +13,8 @@ public class NoopMemoryService implements MemoryService {
     public List<MemoryItem> retrieve(MemoryQuery query) {
         return List.of();
     }
+
+    @Override
+    public void saveNote(String agentId, String sessionId, String runId, String content, String source) {
+    }
 }

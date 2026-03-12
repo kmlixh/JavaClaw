@@ -18,3 +18,14 @@ dependencies {
 bootJar {
     archiveFileName = 'agent-app.jar'
 }
+
+tasks.register('smokeTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs local smoke checks against the agent platform application context.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.janyee.agent.app.SmokeTestMain'
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('smokeTest')
+}
