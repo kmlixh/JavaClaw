@@ -1,9 +1,11 @@
 package com.janyee.agent.web.controller;
 
+import com.janyee.agent.api.AgentDefinitionResponse;
 import com.janyee.agent.api.RunDetailResponse;
 import com.janyee.agent.api.SessionDetailResponse;
 import com.janyee.agent.api.SessionMessageResponse;
 import com.janyee.agent.api.ToolAuditLogResponse;
+import com.janyee.agent.runtime.agent.AgentDefinitionService;
 import com.janyee.agent.runtime.query.AgentQueryService;
 import com.janyee.agent.runtime.query.RunDetailView;
 import com.janyee.agent.runtime.query.SessionDetailView;
@@ -17,9 +19,22 @@ import org.springframework.web.bind.annotation.RestController;
 public class QueryController {
 
     private final AgentQueryService agentQueryService;
+    private final AgentDefinitionService agentDefinitionService;
 
-    public QueryController(AgentQueryService agentQueryService) {
+    public QueryController(AgentQueryService agentQueryService, AgentDefinitionService agentDefinitionService) {
         this.agentQueryService = agentQueryService;
+        this.agentDefinitionService = agentDefinitionService;
+    }
+
+    @GetMapping("/agents")
+    public java.util.List<AgentDefinitionResponse> listAgents() {
+        return agentDefinitionService.listAgents().stream()
+                .map(agent -> new AgentDefinitionResponse(
+                        agent.id(),
+                        agent.displayName(),
+                        agent.workspacePath()
+                ))
+                .toList();
     }
 
     @GetMapping("/sessions/{id}")
