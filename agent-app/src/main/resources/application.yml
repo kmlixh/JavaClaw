@@ -1,0 +1,45 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ai-agent-platform
+  main:
+    web-application-type: reactive
+  datasource:
+    url: jdbc:h2:mem:agent_platform;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+
+agent:
+  workspace-root: ./workspaces
+  default-agent-id: dev-agent
+  runtime:
+    max-tool-iterations: 5
+    stream-buffer-size: 256
+  llm:
+    enabled: false
+    provider: openai-compatible
+    model: gpt-4o-mini
+    base-url:
+    api-key:
+    chat-path: /v1/chat/completions
+    stream: false
+  session-lock:
+    type: in-memory
+    key-prefix: "agent:session-lock:"
+    ttl: 30s
+  approval:
+    required-tools: []
+
+logging:
+  level:
+    root: INFO
+    com.janyee.agent: INFO

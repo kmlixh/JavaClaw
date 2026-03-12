@@ -1,0 +1,20 @@
+plugins {
+    id 'org.springframework.boot' version '3.3.2'
+}
+
+dependencies {
+    implementation project(':agent-infra')
+    implementation project(':agent-memory')
+    implementation project(':agent-runtime')
+    implementation project(':agent-security')
+    implementation project(':agent-tool')
+    implementation project(':agent-web')
+    implementation project(':agent-workspace')
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+}
+
+bootJar {
+    archiveFileName = 'agent-app.jar'
+}

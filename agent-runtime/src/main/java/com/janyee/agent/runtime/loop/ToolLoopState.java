@@ -1,0 +1,15 @@
+package com.janyee.agent.runtime.loop;
+
+public enum ToolLoopState {
+    INITIALIZING,
+    MODEL_REQUESTING,
+    MODEL_STREAMING,
+    TOOL_CALL_DETECTED,
+    TOOL_POLICY_CHECKING,
+    TOOL_EXECUTING,
+    TOOL_RESULT_APPENDING,
+    MODEL_RESUMING,
+    COMPLETED,
+    FAILED,
+    WAITING_APPROVAL
+}

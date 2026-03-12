@@ -1,0 +1,4 @@
+mode: allow-list
+allow:
+  - echo
+deny: []

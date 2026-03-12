@@ -1,0 +1,8 @@
+dependencies {
+    implementation project(':agent-api')
+    implementation project(':agent-domain')
+    implementation project(':agent-runtime')
+    implementation project(':agent-security')
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+}

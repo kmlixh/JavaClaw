@@ -1,0 +1,21 @@
+package com.janyee.agent.api;
+
+import java.time.Instant;
+
+public record ToolAuditLogResponse(
+        Long id,
+        String requestId,
+        String toolName,
+        String phase,
+        boolean allowed,
+        boolean approvalRequired,
+        Boolean success,
+        Boolean executed,
+        String reason,
+        String argumentsJson,
+        String resultSummary,
+        String errorMessage,
+        Long durationMillis,
+        Instant createdAt
+) {
+}

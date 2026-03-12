@@ -1,0 +1,13 @@
+rootProject.name = 'ai-agent-platform'
+
+include 'agent-app'
+include 'agent-api'
+include 'agent-domain'
+include 'agent-infra'
+include 'agent-runtime'
+include 'agent-tool'
+include 'agent-memory'
+include 'agent-workspace'
+include 'agent-security'
+include 'agent-channel'
+include 'agent-web'
