@@ -29,6 +29,9 @@ public class SessionEntity {
     @Column(name = "status", nullable = false, length = 64)
     private String status;
 
+    @Column(name = "title", length = 255)
+    private String title;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -77,6 +80,14 @@ public class SessionEntity {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public String getTitle() {
+        return title;
+    }
+
+    public void setTitle(String title) {
+        this.title = title;
     }
 
     public Instant getUpdatedAt() {

@@ -5,6 +5,7 @@ import java.util.List;
 
 public record SessionDetailResponse(
         String sessionId,
+        String title,
         String agentId,
         String userId,
         String channel,

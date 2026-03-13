@@ -1,0 +1,33 @@
+[0313/140741.615:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: 拒绝访问。 (0x5)
+[36288:4612:0313/140741.799:FATAL:mojo\public\cpp\platform\platform_channel.cc:108] Check failed: . : 拒绝访问。 (0x5)
+[36288:16748:0313/140741.805:ERROR:chrome\installer\util\google_update_settings.cc:265] Failed opening key Software\Google\Update\ClientStateMedium\{8A69D345-D564-463c-AFF1-A69D9E530F96} to set usagestats; result: 5
+[36288:32548:0313/140741.840:ERROR:content\browser\network_sandbox.cc:385] Failed to grant sandbox access to cache directory E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Cache\Cache_Data: 拒绝访问。 (0x5)
+[36288:32548:0313/140741.843:ERROR:content\browser\network_sandbox.cc:318] Failed to grant sandbox access to NoVarySearch directory E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Cache\No_Vary_Search: 拒绝访问。 (0x5)
+
+DevTools listening on ws://127.0.0.1:9223/devtools/browser/7e9cf886-a2b4-4071-b3cc-44fd0dfa0c64
+[36288:32548:0313/140741.878:ERROR:content\browser\network_sandbox.cc:318] Failed to grant sandbox access to SharedDictionary directory E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Shared Dictionary: 拒绝访问。 (0x5)
+[36288:16748:0313/140741.890:ERROR:content\browser\network_sandbox.cc:490] Failed to grant sandbox access to network context data directory E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Safe Browsing Network: 拒绝访问。 (0x5)
+[36288:32548:0313/140741.893:ERROR:content\browser\network_sandbox.cc:490] Failed to grant sandbox access to network context data directory E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Network: 拒绝访问。 (0x5)
+[36288:13464:0313/140741.958:ERROR:net\disk_cache\blockfile\backend_impl.cc:1446] Unable to map Index file
+[36288:13464:0313/140741.976:ERROR:net\disk_cache\blockfile\backend_impl.cc:1446] Unable to map Index file
+[36288:13464:0313/140741.989:ERROR:net\disk_cache\blockfile\backend_impl.cc:1446] Unable to map Index file
+[36288:33400:0313/140742.019:ERROR:content\browser\network_service_instance_impl.cc:243] Encountered error while migrating network context data or granting sandbox access for E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Safe Browsing Network. Result: 6: 操作成功完成。 (0x0)
+[36288:33400:0313/140742.019:ERROR:content\browser\network_service_instance_impl.cc:243] Encountered error while migrating network context data or granting sandbox access for E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\Network. Result: 6: 操作成功完成。 (0x0)
+[36288:13464:0313/140742.030:ERROR:net\disk_cache\blockfile\backend_impl.cc:1446] Unable to map Index file
+[36288:39988:0313/140742.032:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: 拒绝访问。 (0x5)
+[36288:39988:0313/140742.040:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: 拒绝访问。 (0x5)
+[36288:36568:0313/140742.040:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: 拒绝访问。 (0x5)
+[36288:33400:0313/140742.047:ERROR:net\disk_cache\disk_cache.cc:272] Unable to create cache
+[36288:33400:0313/140742.047:ERROR:gpu\ipc\host\gpu_disk_cache.cc:725] Gpu Cache Creation failed: -2
+[36288:33400:0313/140742.047:ERROR:net\disk_cache\disk_cache.cc:272] Unable to create cache
+[36288:33400:0313/140742.047:ERROR:gpu\ipc\host\gpu_disk_cache.cc:725] Gpu Cache Creation failed: -2
+[36288:33400:0313/140742.047:ERROR:net\disk_cache\disk_cache.cc:272] Unable to create cache
+[36288:33400:0313/140742.047:ERROR:gpu\ipc\host\gpu_disk_cache.cc:725] Gpu Cache Creation failed: -2
+[36288:23048:0313/140742.047:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: 拒绝访问。 (0x5)
+[36288:33400:0313/140742.047:ERROR:net\disk_cache\disk_cache.cc:272] Unable to create cache
+[36288:33400:0313/140742.048:ERROR:gpu\ipc\host\gpu_disk_cache.cc:725] Gpu Cache Creation failed: -2
+[36288:36568:0313/140743.156:ERROR:components\services\storage\service_worker\service_worker_storage.cc:1814] Failed to delete the database: Database IO error
+[36288:37152:0313/140743.291:ERROR:components\segmentation_platform\internal\database\ukm_database_backend.cc:148] Failed to open UKM database: 0 disk I/O error
+[36288:10780:0313/140748.846:ERROR:google_apis\gcm\engine\gcm_store_impl.cc:321] Failed to open database E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\GCM Store: IO error: E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\GCM Store/000001.dbtmp: Could not rename file: Access denied. (ChromeMethodBFE: 14::RenameFile::5)
+[36288:10780:0313/140749.927:ERROR:google_apis\gcm\engine\gcm_store_impl.cc:418] Destroy failed: IO error: E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile\Default\GCM Store/000001.dbtmp: Could not delete file. (ChromeMethodOnly: 22::RemoveFile)
+[36288:40840:0313/140749.927:ERROR:components\gcm_driver\gcm_client_impl.cc:759] Failed to reset GCM store

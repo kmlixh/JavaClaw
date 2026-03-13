@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <bytecodeTargetLevel target="21" />
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="ai-agent-platform.agent-api" options="-parameters" />
+      <module name="ai-agent-platform.agent-api.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-api.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-app" options="-parameters" />
+      <module name="ai-agent-platform.agent-app.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-app.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-channel" options="-parameters" />
+      <module name="ai-agent-platform.agent-channel.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-channel.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-domain" options="-parameters" />
+      <module name="ai-agent-platform.agent-domain.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-domain.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-infra" options="-parameters" />
+      <module name="ai-agent-platform.agent-infra.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-infra.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-memory" options="-parameters" />
+      <module name="ai-agent-platform.agent-memory.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-memory.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-runtime" options="-parameters" />
+      <module name="ai-agent-platform.agent-runtime.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-runtime.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-security" options="-parameters" />
+      <module name="ai-agent-platform.agent-security.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-security.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-tool" options="-parameters" />
+      <module name="ai-agent-platform.agent-tool.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-tool.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-web" options="-parameters" />
+      <module name="ai-agent-platform.agent-web.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-web.test" options="-parameters" />
+      <module name="ai-agent-platform.agent-workspace" options="-parameters" />
+      <module name="ai-agent-platform.agent-workspace.main" options="-parameters" />
+      <module name="ai-agent-platform.agent-workspace.test" options="-parameters" />
+    </option>
+  </component>
+</project>

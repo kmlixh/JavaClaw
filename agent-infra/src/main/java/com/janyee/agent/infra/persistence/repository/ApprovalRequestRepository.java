@@ -5,4 +5,6 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface ApprovalRequestRepository extends JpaRepository<ApprovalRequestEntity, String> {
     boolean existsByRunIdAndToolNameAndStatus(String runId, String toolName, String status);
+
+    void deleteBySessionId(String sessionId);
 }

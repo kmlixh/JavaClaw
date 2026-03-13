@@ -20,13 +20,24 @@ public class JpaRunRecordService implements RunRecordService {
 
     @Override
     @Transactional
-    public String createAcceptedRun(String sessionId, String agentId, String userId, String message) {
+    public String createAcceptedRun(
+            String sessionId,
+            String agentId,
+            String userId,
+            String message,
+            String llmConfigId,
+            String llmProvider,
+            String llmModel
+    ) {
         RunRecordEntity entity = new RunRecordEntity();
         String runId = UUID.randomUUID().toString();
         entity.setId(runId);
         entity.setSessionId(sessionId);
         entity.setAgentId(agentId);
         entity.setUserId(userId);
+        entity.setLlmConfigId(llmConfigId);
+        entity.setLlmProvider(llmProvider);
+        entity.setLlmModel(llmModel);
         entity.setStatus(RunStatus.RECEIVED.name());
         entity.setDetail(message);
         runRecordRepository.save(entity);

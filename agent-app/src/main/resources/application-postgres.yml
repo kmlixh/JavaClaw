@@ -1,0 +1,33 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:10.173.108.120}:${DB_PORT:5433}/${DB_NAME:java_claw}
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:JL0Is1KqGuQMayeF}
+    hikari:
+      connection-timeout: 10000
+      validation-timeout: 5000
+      max-lifetime: 240000
+      keepalive-time: 60000
+      minimum-idle: 2
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  flyway:
+    enabled: false
+    baseline-on-migrate: false
+
+agent:
+  llm:
+    enabled: true
+    provider: openai-compatible
+    model: ${SILICONFLOW_MODEL:Pro/zai-org/GLM-4.7}
+    base-url: ${SILICONFLOW_BASE_URL:https://api.siliconflow.cn/v1}
+    api-key: ${SILICONFLOW_API_KEY:}
+    chat-path: /chat/completions
+    stream: true
+  session-lock:
+    type: in-memory

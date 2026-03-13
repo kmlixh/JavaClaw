@@ -6,6 +6,7 @@ import java.util.List;
 
 public record LlmChatRequest(
         String model,
+        String configId,
         String prompt,
         List<ToolSchema> tools
 ) {

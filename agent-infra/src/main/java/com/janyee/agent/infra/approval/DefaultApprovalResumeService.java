@@ -49,7 +49,8 @@ public class DefaultApprovalResumeService implements ApprovalResumeService {
                 run.getAgentId(),
                 run.getUserId(),
                 userMessage.getContent(),
-                true
+                true,
+                run.getLlmConfigId()
         )).subscribe();
     }
 }

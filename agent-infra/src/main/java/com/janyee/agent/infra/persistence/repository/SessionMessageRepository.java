@@ -14,5 +14,17 @@ public interface SessionMessageRepository extends JpaRepository<SessionMessageEn
 
     List<SessionMessageEntity> findBySessionIdOrderBySeqNoAsc(String sessionId);
 
+    Optional<SessionMessageEntity> findFirstBySessionIdAndRoleOrderBySeqNoAsc(String sessionId, String role);
+
     Optional<SessionMessageEntity> findFirstByRunIdAndRoleOrderByIdAsc(String runId, String role);
+
+    void deleteBySessionId(String sessionId);
+
+    @Query("""
+            select m from SessionMessageEntity m
+            where (:sessionId is null or m.sessionId = :sessionId)
+              and lower(m.content) like lower(concat('%', :query, '%'))
+            order by m.createdAt desc
+            """)
+    List<SessionMessageEntity> searchByContent(String query, String sessionId);
 }

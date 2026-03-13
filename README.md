@@ -89,3 +89,22 @@ curl "http://localhost:8080/api/chat/stream?sessionId=s2&message=/tool%20echo%20
 - Runtime + Tool Loop
 - artifact 持久化查询
 - memory note 持久化查询
+
+## PostgreSQL
+
+PostgreSQL profile:
+
+```bash
+$env:DB_HOST="10.173.108.120"
+$env:DB_PORT="5433"
+$env:DB_NAME="java_claw"
+$env:DB_USER="postgres"
+$env:DB_PASSWORD="..."
+.\gradlew.bat :agent-app:bootRun --args='--spring.profiles.active=postgres'
+```
+
+也可以执行：
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\scripts\init-postgres.ps1
+```

@@ -12,6 +12,7 @@ public class ToolLoopContext {
     private final String runId;
     private final String agentId;
     private final String userId;
+    private final String llmConfigId;
     private final int maxIterations;
     private final PromptContext promptContext;
     private final StringBuilder assistantTextBuffer = new StringBuilder();
@@ -28,6 +29,7 @@ public class ToolLoopContext {
         this.runId = runId;
         this.agentId = request.agentId();
         this.userId = request.userId();
+        this.llmConfigId = request.llmConfigId();
         this.promptContext = promptContext;
         this.maxIterations = maxIterations;
     }
@@ -46,6 +48,10 @@ public class ToolLoopContext {
 
     public String userId() {
         return userId;
+    }
+
+    public String llmConfigId() {
+        return llmConfigId;
     }
 
     public ToolLoopState state() {

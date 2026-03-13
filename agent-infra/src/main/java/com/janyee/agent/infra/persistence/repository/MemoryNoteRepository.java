@@ -7,4 +7,8 @@ import java.util.List;
 
 public interface MemoryNoteRepository extends JpaRepository<MemoryNoteEntity, Long> {
     List<MemoryNoteEntity> findTop20ByAgentIdOrderByCreatedAtDesc(String agentId);
+
+    List<MemoryNoteEntity> findTop20ByAgentIdAndContentContainingIgnoreCaseOrderByCreatedAtDesc(String agentId, String content);
+
+    void deleteBySessionId(String sessionId);
 }

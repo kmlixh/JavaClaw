@@ -1,19 +1,7 @@
 package com.janyee.agent.app;
 
-import com.janyee.agent.domain.AgentBinding;
-import com.janyee.agent.domain.AgentEvent;
-import com.janyee.agent.domain.AgentEventType;
-import com.janyee.agent.domain.RunRequest;
-import com.janyee.agent.runtime.AgentRunner;
-import com.janyee.agent.runtime.agent.AgentRouteRequest;
-import com.janyee.agent.runtime.agent.AgentRouter;
-import com.janyee.agent.runtime.artifact.ArtifactService;
-import com.janyee.agent.runtime.query.AgentQueryService;
-import com.janyee.agent.runtime.run.RunRecordService;
-import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
-
-import java.util.List;
+import org.springframework.web.reactive.function.client.WebClient;
 
 public final class SmokeTestMain {
 
@@ -21,41 +9,24 @@ public final class SmokeTestMain {
     }
 
     public static void main(String[] args) {
-        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(AgentApplication.class)
-                .properties(
-                        "spring.main.web-application-type=none",
-                        "server.port=0"
-                )
-                .run(args)) {
+        try (ConfigurableApplicationContext context = FlowTestSupport.startContext()) {
+            FlowTestSupport.requireRouting(context);
+            FlowTestSupport.seedLlmConfig(
+                    context,
+                    "smoke-glm47",
+                    "Smoke GLM-4.7",
+                    "Pro/zai-org/GLM-4.7",
+                    "http://127.0.0.1:9/v1",
+                    "smoke-key",
+                    "/chat/completions",
+                    true,
+                    true
+            );
 
-            AgentRouter agentRouter = context.getBean(AgentRouter.class);
-            RunRecordService runRecordService = context.getBean(RunRecordService.class);
-            AgentRunner agentRunner = context.getBean(AgentRunner.class);
-            AgentQueryService agentQueryService = context.getBean(AgentQueryService.class);
-            ArtifactService artifactService = context.getBean(ArtifactService.class);
-
-            AgentBinding opsBinding = agentRouter.route(new AgentRouteRequest("web", "ops", "ops-smoke-session", null));
-            require("ops-agent".equals(opsBinding.agentId()), "route binding to ops-agent failed");
-
-            String sessionId = "smoke-session";
-            String runId = runRecordService.createAcceptedRun(sessionId, "dev-agent", "smoke-user", "/tool echo smoke");
-            List<AgentEvent> events = agentRunner.run(new RunRequest(runId, sessionId, "dev-agent", "smoke-user", "/tool echo smoke", false))
-                    .collectList()
-                    .block();
-            require(events != null && events.stream().anyMatch(event -> event.type() == AgentEventType.TOOL_COMPLETED),
-                    "tool loop smoke run did not complete a tool");
-
-            artifactService.saveTextArtifact("dev-agent", sessionId, runId, "smoke", "smoke.txt", "text/plain", "artifact smoke");
-            require(!agentQueryService.getRun(runId).artifacts().isEmpty(), "artifact query did not return saved artifact");
-            require(!agentQueryService.listMemoryNotes("dev-agent").isEmpty(), "memory notes were not persisted");
+            WebClient webClient = FlowTestSupport.createClient(context);
+            FlowTestSupport.verifyHttpFlow(webClient, "smoke-glm47", "Pro/zai-org/GLM-4.7", "/tool echo smoke");
 
             System.out.println("SMOKE TEST PASSED");
-        }
-    }
-
-    private static void require(boolean condition, String message) {
-        if (!condition) {
-            throw new IllegalStateException(message);
         }
     }
 }

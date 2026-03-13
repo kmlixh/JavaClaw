@@ -13,4 +13,5 @@ dependencies {
     implementation 'org.yaml:snakeyaml'
     implementation 'io.projectreactor:reactor-core'
     runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql'
 }

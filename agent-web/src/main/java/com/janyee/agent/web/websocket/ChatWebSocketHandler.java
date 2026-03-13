@@ -6,6 +6,8 @@ import com.janyee.agent.domain.RunRequest;
 import com.janyee.agent.runtime.AgentRunner;
 import com.janyee.agent.runtime.agent.AgentRouteRequest;
 import com.janyee.agent.runtime.agent.AgentRouter;
+import com.janyee.agent.runtime.model.LlmConfigDescriptor;
+import com.janyee.agent.runtime.model.LlmConfigService;
 import com.janyee.agent.runtime.run.RunRecordService;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.socket.WebSocketHandler;
@@ -22,17 +24,20 @@ public class ChatWebSocketHandler implements WebSocketHandler {
     private final AgentRunner agentRunner;
     private final RunRecordService runRecordService;
     private final AgentRouter agentRouter;
+    private final LlmConfigService llmConfigService;
     private final ObjectMapper objectMapper;
 
     public ChatWebSocketHandler(
             AgentRunner agentRunner,
             RunRecordService runRecordService,
             AgentRouter agentRouter,
+            LlmConfigService llmConfigService,
             ObjectMapper objectMapper
     ) {
         this.agentRunner = agentRunner;
         this.runRecordService = runRecordService;
         this.agentRouter = agentRouter;
+        this.llmConfigService = llmConfigService;
         this.objectMapper = objectMapper;
     }
 
@@ -43,13 +48,31 @@ public class ChatWebSocketHandler implements WebSocketHandler {
         String userId = valueOrDefault(params.get("userId"), "anonymous");
         String message = valueOrDefault(params.get("message"), "hello");
         String requestedAgentId = params.get("agentId");
+        String requestedLlmConfigId = params.get("llmConfigId");
         String runId = params.get("runId");
 
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("websocket", userId, sessionId, requestedAgentId));
+        LlmConfigDescriptor llmConfig = llmConfigService.resolveRequested(requestedLlmConfigId).orElse(null);
         String resolvedRunId = runId != null && !runId.isBlank()
                 ? runId
-                : runRecordService.createAcceptedRun(sessionId, binding.agentId(), userId, message);
-        RunRequest request = new RunRequest(resolvedRunId, sessionId, binding.agentId(), userId, message, false);
+                : runRecordService.createAcceptedRun(
+                        sessionId,
+                        binding.agentId(),
+                        userId,
+                        message,
+                        llmConfig != null ? llmConfig.configId() : null,
+                        llmConfig != null ? llmConfig.provider() : null,
+                        llmConfig != null ? llmConfig.model() : null
+                );
+        RunRequest request = new RunRequest(
+                resolvedRunId,
+                sessionId,
+                binding.agentId(),
+                userId,
+                message,
+                false,
+                llmConfig != null ? llmConfig.configId() : null
+        );
 
         return session.send(agentRunner.run(request)
                 .map(event -> {

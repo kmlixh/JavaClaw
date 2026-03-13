@@ -3,6 +3,8 @@ plugins {
 }
 
 dependencies {
+    implementation project(':agent-api')
+    implementation project(':agent-domain')
     implementation project(':agent-infra')
     implementation project(':agent-memory')
     implementation project(':agent-runtime')
@@ -13,6 +15,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-webflux'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 
 bootJar {
@@ -26,6 +29,55 @@ tasks.register('smokeTest', JavaExec) {
     mainClass = 'com.janyee.agent.app.SmokeTestMain'
 }
 
+tasks.register('postgresFlowTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs full HTTP flow checks against the PostgreSQL profile.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.janyee.agent.app.PostgresFlowTestMain'
+    environment 'DB_HOST', System.getenv('DB_HOST') ?: '10.173.108.120'
+    environment 'DB_PORT', System.getenv('DB_PORT') ?: '5433'
+    environment 'DB_NAME', System.getenv('DB_NAME') ?: 'java_claw'
+    environment 'DB_USER', System.getenv('DB_USER') ?: 'postgres'
+    environment 'DB_PASSWORD', System.getenv('DB_PASSWORD') ?: 'JL0Is1KqGuQMayeF'
+}
+
+tasks.register('siliconflowIntegrationTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs PostgreSQL-backed integration checks using the database-configured SiliconFlow GLM-4.7 model.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.janyee.agent.app.SiliconFlowIntegrationTestMain'
+    environment 'DB_HOST', System.getenv('DB_HOST') ?: '10.173.108.120'
+    environment 'DB_PORT', System.getenv('DB_PORT') ?: '5433'
+    environment 'DB_NAME', System.getenv('DB_NAME') ?: 'java_claw'
+    environment 'DB_USER', System.getenv('DB_USER') ?: 'postgres'
+    environment 'DB_PASSWORD', System.getenv('DB_PASSWORD') ?: 'JL0Is1KqGuQMayeF'
+}
+
+tasks.register('realFlowTest') {
+    group = 'verification'
+    description = 'Runs the PostgreSQL flow test and the SiliconFlow GLM-4.7 integration test together.'
+    dependsOn tasks.named('postgresFlowTest')
+    dependsOn tasks.named('siliconflowIntegrationTest')
+}
+
+tasks.register('webE2eFlowTest', Exec) {
+    group = 'verification'
+    description = 'Runs browser-level end-to-end flow checks against the frontend and PostgreSQL-backed backend.'
+    workingDir = file("${rootDir}/web-console")
+    commandLine 'npm.cmd', 'run', 'e2e'
+}
+
+tasks.withType(Test).configureEach {
+    environment 'DB_HOST', System.getenv('DB_HOST') ?: '10.173.108.120'
+    environment 'DB_PORT', System.getenv('DB_PORT') ?: '5433'
+    environment 'DB_NAME', System.getenv('DB_NAME') ?: 'java_claw'
+    environment 'DB_USER', System.getenv('DB_USER') ?: 'postgres'
+    environment 'DB_PASSWORD', System.getenv('DB_PASSWORD') ?: 'JL0Is1KqGuQMayeF'
+}
+
 tasks.named('check') {
     dependsOn tasks.named('smokeTest')
+    if ((System.getenv('RUN_REAL_INTEGRATION') ?: 'false').toBoolean()) {
+        dependsOn tasks.named('realFlowTest')
+    }
 }

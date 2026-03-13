@@ -4,6 +4,8 @@ public record ChatSendResponse(
         String sessionId,
         String agentId,
         String runId,
-        String status
+        String status,
+        String llmConfigId,
+        String llmModel
 ) {
 }

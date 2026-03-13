@@ -4,6 +4,8 @@ server:
 spring:
   application:
     name: ai-agent-platform
+  profiles:
+    default: postgres
   main:
     web-application-type: reactive
   datasource:

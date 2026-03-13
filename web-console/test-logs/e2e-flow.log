@@ -1,0 +1,25 @@
+2026-03-13T05:59:04.165Z starting backend
+2026-03-13T05:59:04.189Z starting frontend proxy
+2026-03-13T05:59:04.241Z starting chrome with userDataDir=C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-AmdF4G
+2026-03-13T05:59:04.259Z waiting backend /api/llms
+2026-03-13T05:59:04.314Z waiting frontend root
+2026-03-13T05:59:05.331Z waiting chrome devtools
+2026-03-13T06:02:04.175Z timeout reached
+2026-03-13T06:03:08.530Z starting backend
+2026-03-13T06:03:08.554Z starting frontend proxy
+2026-03-13T06:03:08.614Z starting chrome with userDataDir=C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J
+2026-03-13T06:03:08.634Z waiting backend /api/llms
+2026-03-13T06:03:08.690Z waiting frontend root
+2026-03-13T06:03:09.705Z waiting chrome devtools
+2026-03-13T06:03:09.710Z creating chrome page target
+2026-03-13T06:03:09.733Z connecting chrome websocket
+2026-03-13T06:06:08.549Z timeout reached
+2026-03-13T06:07:41.320Z starting backend
+2026-03-13T06:07:41.509Z starting frontend proxy
+2026-03-13T06:07:41.564Z starting chrome with userDataDir=E:\WorkSpace\CMDI\javaClaw\web-console\test-logs\chrome-profile
+2026-03-13T06:07:41.585Z waiting backend /api/llms
+2026-03-13T06:07:41.647Z waiting frontend root
+2026-03-13T06:07:42.677Z waiting chrome devtools
+2026-03-13T06:07:42.682Z creating chrome page target
+2026-03-13T06:07:42.715Z connecting chrome websocket
+2026-03-13T06:10:41.337Z timeout reached

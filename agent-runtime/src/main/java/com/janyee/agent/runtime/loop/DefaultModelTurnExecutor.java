@@ -29,10 +29,17 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
                 .filter(tool -> toolPolicyService.isAllowed(context.agentId(), tool.name()))
                 .map(tool -> tool.schema())
                 .toList();
-        List<LlmStreamEvent> events = llmProvider.chatStream(new LlmChatRequest(null, context.currentPrompt(), toolSchemas))
+        List<LlmStreamEvent> events = llmProvider.chatStream(new LlmChatRequest(null, context.llmConfigId(), context.currentPrompt(), toolSchemas))
                 .collectList()
                 .blockOptional()
                 .orElse(List.of());
+
+        events.stream()
+                .filter(event -> "error".equalsIgnoreCase(event.type()))
+                .findFirst()
+                .ifPresent(event -> {
+                    throw new ToolLoopException(event.content());
+                });
 
         String fullText = events.stream()
                 .filter(event -> "token".equalsIgnoreCase(event.type()))

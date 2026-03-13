@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.janyee.agent.domain.ToolSchema;
 import com.janyee.agent.infra.config.AgentPlatformProperties;
+import com.janyee.agent.runtime.model.LlmConfigDescriptor;
+import com.janyee.agent.runtime.model.LlmConfigService;
 import com.janyee.agent.runtime.model.LlmChatRequest;
 import com.janyee.agent.runtime.model.LlmProvider;
 import com.janyee.agent.runtime.model.LlmStreamEvent;
@@ -29,18 +31,24 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
     private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleLlmProvider.class);
 
     private final AgentPlatformProperties properties;
+    private final LlmConfigService llmConfigService;
     private final ObjectMapper objectMapper;
     private final WebClient webClient;
 
-    public OpenAiCompatibleLlmProvider(AgentPlatformProperties properties, ObjectMapper objectMapper) {
+    public OpenAiCompatibleLlmProvider(
+            AgentPlatformProperties properties,
+            LlmConfigService llmConfigService,
+            ObjectMapper objectMapper
+    ) {
         this.properties = properties;
+        this.llmConfigService = llmConfigService;
         this.objectMapper = objectMapper;
         this.webClient = WebClient.builder().build();
     }
 
     @Override
     public Flux<LlmStreamEvent> chatStream(LlmChatRequest request) {
-        AgentPlatformProperties.LlmProperties llm = properties.llm();
+        LlmConfigDescriptor llm = resolveConfig(request.configId());
         if (llm == null || !llm.enabled() || isBlank(llm.baseUrl())) {
             return StubLlmProvider.response(request);
         }
@@ -51,12 +59,15 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
 
         return upstream
                 .onErrorResume(error -> {
-                    log.warn("openai-compatible provider failed, fallback to stub: {}", error.getMessage());
-                    return StubLlmProvider.response(request);
+                    log.warn("openai-compatible provider failed for config {}: {}", llm.configId(), error.getMessage());
+                    return Flux.error(new IllegalStateException(
+                            "Configured LLM request failed for " + llm.displayName() + ": " + error.getMessage(),
+                            error
+                    ));
                 });
     }
 
-    private Mono<String> requestCompletion(LlmChatRequest request, AgentPlatformProperties.LlmProperties llm) {
+    private Mono<String> requestCompletion(LlmChatRequest request, LlmConfigDescriptor llm) {
         Map<String, Object> payload = basePayload(request, llm, llm.stream());
 
         return webClient.post()
@@ -69,7 +80,7 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
                 .bodyToMono(String.class);
     }
 
-    private Flux<ServerSentEvent<String>> requestStreamingCompletion(LlmChatRequest request, AgentPlatformProperties.LlmProperties llm) {
+    private Flux<ServerSentEvent<String>> requestStreamingCompletion(LlmChatRequest request, LlmConfigDescriptor llm) {
         Map<String, Object> payload = basePayload(request, llm, true);
 
         return webClient.post()
@@ -188,7 +199,7 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         }
     }
 
-    private Map<String, Object> basePayload(LlmChatRequest request, AgentPlatformProperties.LlmProperties llm, boolean stream) {
+    private Map<String, Object> basePayload(LlmChatRequest request, LlmConfigDescriptor llm, boolean stream) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", defaultIfBlank(request.model(), llm.model()));
         payload.put("stream", stream);
@@ -216,10 +227,32 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         }
     }
 
-    private void applyAuth(HttpHeaders headers, AgentPlatformProperties.LlmProperties llm) {
+    private void applyAuth(HttpHeaders headers, LlmConfigDescriptor llm) {
         if (!isBlank(llm.apiKey())) {
             headers.setBearerAuth(llm.apiKey());
         }
+    }
+
+    private LlmConfigDescriptor resolveConfig(String configId) {
+        return llmConfigService.resolveRequested(configId)
+                .orElseGet(() -> {
+                    AgentPlatformProperties.LlmProperties llm = properties.llm();
+                    if (llm == null) {
+                        return null;
+                    }
+                    return new LlmConfigDescriptor(
+                            "application-default",
+                            defaultIfBlank(llm.provider(), "openai-compatible"),
+                            "Application Default",
+                            llm.model(),
+                            llm.baseUrl(),
+                            llm.apiKey(),
+                            llm.chatPath(),
+                            llm.stream(),
+                            llm.enabled(),
+                            true
+                    );
+                });
     }
 
     private String joinUrl(String baseUrl, String path) {

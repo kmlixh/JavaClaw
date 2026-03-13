@@ -1,0 +1,35 @@
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.3.2)
+
+2026-03-13T15:11:43.942+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.janyee.agent.app.AgentApplication    : Starting AgentApplication v0.0.1-SNAPSHOT using Java 25 with PID 38956 (E:\WorkSpace\CMDI\javaClaw\agent-app\build\libs\agent-app.jar started by kmlix in E:\WorkSpace\CMDI\javaClaw)
+2026-03-13T15:11:43.948+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.janyee.agent.app.AgentApplication    : The following 1 profile is active: "postgres"
+2026-03-13T15:11:44.698+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Multiple Spring Data modules found, entering strict repository configuration mode
+2026-03-13T15:11:44.699+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Spring Data JPA repositories in DEFAULT mode.
+2026-03-13T15:11:44.850+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Finished Spring Data repository scanning in 143 ms. Found 8 JPA repository interfaces.
+2026-03-13T15:11:45.043+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Multiple Spring Data modules found, entering strict repository configuration mode
+2026-03-13T15:11:45.045+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Spring Data Redis repositories in DEFAULT mode.
+2026-03-13T15:11:45.066+08:00  INFO 38956 --- [ai-agent-platform] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Finished Spring Data repository scanning in 12 ms. Found 0 Redis repository interfaces.
+2026-03-13T15:11:45.742+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.hibernate.jpa.internal.util.LogHelper  : HHH000204: Processing PersistenceUnitInfo [name: default]
+2026-03-13T15:11:45.818+08:00  INFO 38956 --- [ai-agent-platform] [           main] org.hibernate.Version                    : HHH000412: Hibernate ORM core version 6.5.2.Final
+2026-03-13T15:11:45.877+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.h.c.internal.RegionFactoryInitiator    : HHH000026: Second-level cache disabled
+2026-03-13T15:11:46.381+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.s.o.j.p.SpringPersistenceUnitInfo      : No LoadTimeWeaver setup: ignoring JPA class transformer
+2026-03-13T15:11:46.413+08:00  WARN 38956 --- [ai-agent-platform] [           main] com.zaxxer.hikari.HikariConfig           : HikariPool-1 - idleTimeout is close to or more than maxLifetime, disabling it.
+2026-03-13T15:11:46.415+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Starting...
+2026-03-13T15:11:46.607+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.zaxxer.hikari.pool.HikariPool        : HikariPool-1 - Added connection org.postgresql.jdbc.PgConnection@8f6b4ab
+2026-03-13T15:11:46.609+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.
+2026-03-13T15:11:46.646+08:00  WARN 38956 --- [ai-agent-platform] [           main] org.hibernate.orm.deprecation            : HHH90000025: PostgreSQLDialect does not need to be specified explicitly using 'hibernate.dialect' (remove the property setting and it will be selected by default)
+2026-03-13T15:11:47.858+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.h.e.t.j.p.i.JtaPlatformInitiator       : HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)
+2026-03-13T15:11:47.991+08:00  INFO 38956 --- [ai-agent-platform] [           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA EntityManagerFactory for persistence unit 'default'
+2026-03-13T15:11:48.617+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.s.d.j.r.query.QueryEnhancerFactory     : Hibernate is in classpath; If applicable, HQL parser will be used.
+2026-03-13T15:11:50.199+08:00  INFO 38956 --- [ai-agent-platform] [           main] o.s.b.web.embedded.netty.NettyWebServer  : Netty started on port 18085 (http)
+2026-03-13T15:11:50.208+08:00  INFO 38956 --- [ai-agent-platform] [           main] com.janyee.agent.app.AgentApplication    : Started AgentApplication in 6.801 seconds (process running for 7.347)
+2026-03-13T15:11:54.396+08:00  INFO 38956 --- [ai-agent-platform] [ionShutdownHook] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'default'
+2026-03-13T15:11:54.399+08:00  INFO 38956 --- [ai-agent-platform] [ionShutdownHook] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown initiated...
+2026-03-13T15:11:54.400+08:00  INFO 38956 --- [ai-agent-platform] [ionShutdownHook] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown completed.

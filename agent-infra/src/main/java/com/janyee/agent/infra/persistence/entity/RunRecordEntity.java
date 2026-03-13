@@ -26,6 +26,15 @@ public class RunRecordEntity {
     @Column(name = "user_id", nullable = false, length = 128)
     private String userId;
 
+    @Column(name = "llm_config_id", length = 64)
+    private String llmConfigId;
+
+    @Column(name = "llm_provider", length = 64)
+    private String llmProvider;
+
+    @Column(name = "llm_model", length = 255)
+    private String llmModel;
+
     @Column(name = "status", nullable = false, length = 64)
     private String status;
 
@@ -68,6 +77,30 @@ public class RunRecordEntity {
 
     public void setUserId(String userId) {
         this.userId = userId;
+    }
+
+    public String getLlmConfigId() {
+        return llmConfigId;
+    }
+
+    public void setLlmConfigId(String llmConfigId) {
+        this.llmConfigId = llmConfigId;
+    }
+
+    public String getLlmProvider() {
+        return llmProvider;
+    }
+
+    public void setLlmProvider(String llmProvider) {
+        this.llmProvider = llmProvider;
+    }
+
+    public String getLlmModel() {
+        return llmModel;
+    }
+
+    public void setLlmModel(String llmModel) {
+        this.llmModel = llmModel;
     }
 
     public String getStatus() {

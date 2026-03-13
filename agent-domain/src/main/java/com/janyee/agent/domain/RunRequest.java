@@ -6,6 +6,7 @@ public record RunRequest(
         String agentId,
         String userId,
         String message,
-        boolean resume
+        boolean resume,
+        String llmConfigId
 ) {
 }

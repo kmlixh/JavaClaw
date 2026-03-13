@@ -10,14 +10,14 @@ import java.util.regex.Pattern;
 final class StubLlmProvider {
 
     private static final Pattern MESSAGE_PATTERN = Pattern.compile("(?m)^Message:\\s*(.+)$");
-    private static final Pattern TOOL_RESULT_SUMMARY_PATTERN = Pattern.compile("(?m)^summary:\\s*(.+)$");
+    private static final Pattern TOOL_RESULT_SUMMARY_PATTERN = Pattern.compile("(?im)^summary:\\s*(.+)$");
 
     private StubLlmProvider() {
     }
 
     static Flux<LlmStreamEvent> response(LlmChatRequest request) {
         String prompt = request.prompt();
-        if (prompt.contains("Tool result:")) {
+        if (prompt.contains("Tool result:") || prompt.contains("Tool execution result:")) {
             return Flux.just(
                     new LlmStreamEvent("token", "Tool loop completed. " + extractToolSummary(prompt)),
                     new LlmStreamEvent("finish", "completed")

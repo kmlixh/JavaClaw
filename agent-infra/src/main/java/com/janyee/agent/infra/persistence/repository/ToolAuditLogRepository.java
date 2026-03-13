@@ -7,4 +7,6 @@ import java.util.List;
 
 public interface ToolAuditLogRepository extends JpaRepository<ToolAuditLogEntity, Long> {
     List<ToolAuditLogEntity> findByRunIdOrderByIdAsc(String runId);
+
+    void deleteBySessionId(String sessionId);
 }

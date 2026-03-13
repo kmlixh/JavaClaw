@@ -1,0 +1,22 @@
+[31mfailed to load config from E:\WorkSpace\CMDI\javaClaw\web-console\vite.config.js[39m
+node:internal/child_process:420
+    throw new ErrnoException(err, 'spawn');
+          ^
+
+Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:420:11)
+    at Object.spawn (node:child_process:754:9)
+    at ensureServiceIsRunning (E:\WorkSpace\CMDI\javaClaw\web-console\node_modules\esbuild\lib\main.js:1975:29)
+    at build (E:\WorkSpace\CMDI\javaClaw\web-console\node_modules\esbuild\lib\main.js:1873:26)
+    at bundleConfigFile (file:///E:/WorkSpace/CMDI/javaClaw/web-console/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:66845:24)
+    at loadConfigFromFile (file:///E:/WorkSpace/CMDI/javaClaw/web-console/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:66815:27)
+    at resolveConfig (file:///E:/WorkSpace/CMDI/javaClaw/web-console/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:66416:30)
+    at _createServer (file:///E:/WorkSpace/CMDI/javaClaw/web-console/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:63015:24)
+    at createServer (file:///E:/WorkSpace/CMDI/javaClaw/web-console/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:63012:10)
+    at file:///E:/WorkSpace/CMDI/javaClaw/web-console/scripts/dev-server.mjs:4:22 {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawn'
+}
+
+Node.js v22.17.1

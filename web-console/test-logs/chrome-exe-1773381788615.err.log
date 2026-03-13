@@ -1,0 +1,17 @@
+[0313/140308.697:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: 拒绝访问。 (0x5)
+[32712:38976:0313/140308.860:FATAL:mojo\public\cpp\platform\platform_channel.cc:108] Check failed: . : 拒绝访问。 (0x5)
+[32712:444:0313/140308.867:ERROR:chrome\installer\util\google_update_settings.cc:265] Failed opening key Software\Google\Update\ClientStateMedium\{8A69D345-D564-463c-AFF1-A69D9E530F96} to set usagestats; result: 5
+[32712:33228:0313/140308.901:ERROR:content\browser\network_sandbox.cc:385] Failed to grant sandbox access to cache directory C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Cache\Cache_Data: 拒绝访问。 (0x5)
+[32712:33228:0313/140308.906:ERROR:content\browser\network_sandbox.cc:318] Failed to grant sandbox access to NoVarySearch directory C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Cache\No_Vary_Search: 拒绝访问。 (0x5)
+[32712:33228:0313/140308.908:ERROR:content\browser\network_sandbox.cc:318] Failed to grant sandbox access to SharedDictionary directory C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Shared Dictionary: 拒绝访问。 (0x5)
+[32712:33228:0313/140308.915:ERROR:content\browser\network_sandbox.cc:490] Failed to grant sandbox access to network context data directory C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Network: 拒绝访问。 (0x5)
+[32712:40292:0313/140308.922:ERROR:content\browser\network_sandbox.cc:490] Failed to grant sandbox access to network context data directory C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Safe Browsing Network: 拒绝访问。 (0x5)
+
+DevTools listening on ws://127.0.0.1:9223/devtools/browser/880ff15d-b224-4d6d-8da8-35171ea7f079
+[32712:33616:0313/140309.054:ERROR:content\browser\network_service_instance_impl.cc:243] Encountered error while migrating network context data or granting sandbox access for C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Network. Result: 6: 操作成功完成。 (0x0)
+[32712:33616:0313/140309.056:ERROR:content\browser\network_service_instance_impl.cc:243] Encountered error while migrating network context data or granting sandbox access for C:\Users\kmlix\AppData\Local\Temp\java-claw-e2e-ebmk5J\Default\Safe Browsing Network. Result: 6: 操作成功完成。 (0x0)
+[32712:33616:0313/140344.140:ERROR:components\webapps\browser\web_contents\web_app_url_loader.cc:180] Error loading about:blank page took too long to load.
+[32712:33616:0313/140414.182:ERROR:components\webapps\browser\web_contents\web_app_url_loader.cc:180] Error loading about:blank page took too long to load.
+[32712:33616:0313/140444.218:ERROR:components\webapps\browser\web_contents\web_app_url_loader.cc:180] Error loading about:blank page took too long to load.
+[32712:33616:0313/140514.260:ERROR:components\webapps\browser\web_contents\web_app_url_loader.cc:180] Error loading about:blank page took too long to load.
+[32712:33616:0313/140544.295:ERROR:components\webapps\browser\web_contents\web_app_url_loader.cc:180] Error loading about:blank page took too long to load.
