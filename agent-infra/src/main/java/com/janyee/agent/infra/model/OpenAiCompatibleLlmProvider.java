@@ -16,10 +16,13 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Component;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
@@ -43,7 +46,12 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         this.properties = properties;
         this.llmConfigService = llmConfigService;
         this.objectMapper = objectMapper;
-        this.webClient = WebClient.builder().build();
+        HttpClient httpClient = HttpClient.create()
+                .compress(true)
+                .responseTimeout(Duration.ofSeconds(120));
+        this.webClient = WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
     }
 
     @Override
@@ -59,9 +67,10 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
 
         return upstream
                 .onErrorResume(error -> {
-                    log.warn("openai-compatible provider failed for config {}: {}", llm.configId(), error.getMessage());
+                    String errorDetail = describeError(error);
+                    log.warn("openai-compatible provider failed for config {}: {}", llm.configId(), errorDetail, error);
                     return Flux.error(new IllegalStateException(
-                            "Configured LLM request failed for " + llm.displayName() + ": " + error.getMessage(),
+                            "Configured LLM request failed for " + llm.displayName() + ": " + errorDetail,
                             error
                     ));
                 });
@@ -271,5 +280,39 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private String describeError(Throwable error) {
+        if (error == null) {
+            return "unknown error";
+        }
+        Throwable root = rootCause(error);
+        String message = firstNonBlank(root.getMessage(), error.getMessage());
+        String type = root.getClass().getSimpleName();
+        if ("ClosedChannelException".equals(type)) {
+            return "SSL/TLS handshake was closed before completion. Check local proxy/VPN/TUN interception, outbound HTTPS access, or certificate trust";
+        }
+        if (message == null) {
+            return type;
+        }
+        return type + ": " + message;
+    }
+
+    private Throwable rootCause(Throwable error) {
+        Throwable current = error;
+        while (current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+        return current;
+    }
+
+    private String firstNonBlank(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        if (second != null && !second.isBlank()) {
+            return second;
+        }
+        return null;
     }
 }

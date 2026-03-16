@@ -7,6 +7,8 @@ public record RunRequest(
         String userId,
         String message,
         boolean resume,
-        String llmConfigId
+        String llmConfigId,
+        java.util.List<ChatContextReference> references,
+        java.util.List<ChatAttachment> attachments
 ) {
 }

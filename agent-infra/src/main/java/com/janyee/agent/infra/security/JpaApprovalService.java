@@ -9,6 +9,8 @@ import com.janyee.agent.security.ApprovalService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -71,6 +73,9 @@ public class JpaApprovalService implements ApprovalService, ApprovalQueryService
     private ApprovalDecision updateStatus(String requestId, String status, ApprovalDecision decision) {
         ApprovalRequestEntity entity = repository.findById(requestId)
                 .orElseThrow(() -> new IllegalArgumentException("approval request not found: " + requestId));
+        if (!"PENDING".equals(entity.getStatus())) {
+            throw new IllegalStateException("approval request already decided: " + requestId + ", currentStatus=" + entity.getStatus());
+        }
         entity.setStatus(status);
         repository.save(entity);
         return decision;
@@ -81,6 +86,32 @@ public class JpaApprovalService implements ApprovalService, ApprovalQueryService
     public ApprovalRequestView getRequest(String requestId) {
         ApprovalRequestEntity entity = repository.findById(requestId)
                 .orElseThrow(() -> new IllegalArgumentException("approval request not found: " + requestId));
+        return toView(entity);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ApprovalRequestView> listRequests(String agentId, String sessionId, String status) {
+        List<ApprovalRequestEntity> entities;
+        if (sessionId != null && !sessionId.isBlank()) {
+            entities = repository.findBySessionIdOrderByCreatedAtDesc(sessionId);
+        } else if (agentId != null && !agentId.isBlank()) {
+            entities = repository.findByAgentIdOrderByCreatedAtDesc(agentId);
+        } else if (status != null && !status.isBlank()) {
+            entities = repository.findByStatusOrderByCreatedAtDesc(status);
+        } else {
+            entities = repository.findAllByOrderByCreatedAtDesc();
+        }
+        return entities.stream()
+                .filter(entity -> agentId == null || agentId.isBlank() || agentId.equals(entity.getAgentId()))
+                .filter(entity -> sessionId == null || sessionId.isBlank() || sessionId.equals(entity.getSessionId()))
+                .filter(entity -> status == null || status.isBlank() || status.equals(entity.getStatus()))
+                .sorted(Comparator.comparing(ApprovalRequestEntity::getCreatedAt).reversed())
+                .map(this::toView)
+                .toList();
+    }
+
+    private ApprovalRequestView toView(ApprovalRequestEntity entity) {
         return new ApprovalRequestView(
                 entity.getId(),
                 entity.getRunId(),

@@ -65,7 +65,9 @@ class PostgresFlowIntegrationTest {
                         "dev-agent",
                         "junit-user",
                         TEST_LLM_ID,
-                        "/tool echo postgres junit"
+                        "/tool echo postgres junit",
+                        java.util.List.of(),
+                        java.util.List.of()
                 ))
                 .retrieve()
                 .bodyToMono(ChatSendResponse.class)

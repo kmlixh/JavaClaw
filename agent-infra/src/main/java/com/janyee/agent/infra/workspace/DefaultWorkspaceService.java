@@ -1,6 +1,8 @@
 package com.janyee.agent.infra.workspace;
 
 import com.janyee.agent.infra.config.AgentPlatformProperties;
+import com.janyee.agent.infra.persistence.repository.KnowledgeEntryRepository;
+import com.janyee.agent.infra.persistence.repository.ToolDefinitionRepository;
 import com.janyee.agent.workspace.WorkspaceService;
 import com.janyee.agent.workspace.WorkspaceKnowledgeFile;
 import com.janyee.agent.workspace.WorkspaceToolPolicy;
@@ -26,10 +28,18 @@ import java.util.stream.Stream;
 public class DefaultWorkspaceService implements WorkspaceService {
 
     private final AgentPlatformProperties properties;
+    private final KnowledgeEntryRepository knowledgeEntryRepository;
+    private final ToolDefinitionRepository toolDefinitionRepository;
     private final Yaml yaml;
 
-    public DefaultWorkspaceService(AgentPlatformProperties properties) {
+    public DefaultWorkspaceService(
+            AgentPlatformProperties properties,
+            KnowledgeEntryRepository knowledgeEntryRepository,
+            ToolDefinitionRepository toolDefinitionRepository
+    ) {
         this.properties = properties;
+        this.knowledgeEntryRepository = knowledgeEntryRepository;
+        this.toolDefinitionRepository = toolDefinitionRepository;
         this.yaml = new Yaml(new SafeConstructor(new LoaderOptions()));
     }
 
@@ -75,13 +85,20 @@ public class DefaultWorkspaceService implements WorkspaceService {
 
     @Override
     public List<WorkspaceKnowledgeFile> listKnowledgeFiles(String agentId) {
+        List<WorkspaceKnowledgeFile> databaseFiles = knowledgeEntryRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
+                .limit(10)
+                .map(entity -> new WorkspaceKnowledgeFile(
+                        "db/" + entity.getTitle(),
+                        entity.getContent()
+                ))
+                .toList();
         Path knowledgeRoot = getWorkspaceRoot(agentId).resolve("knowledge").normalize();
         if (!Files.exists(knowledgeRoot) || !Files.isDirectory(knowledgeRoot)) {
-            return List.of();
+            return databaseFiles;
         }
 
         try (Stream<Path> stream = Files.walk(knowledgeRoot, 2)) {
-            return stream
+            List<WorkspaceKnowledgeFile> fileBased = stream
                     .filter(Files::isRegularFile)
                     .sorted(Comparator.naturalOrder())
                     .limit(10)
@@ -90,6 +107,9 @@ public class DefaultWorkspaceService implements WorkspaceService {
                             readFile(path)
                     ))
                     .toList();
+            return Stream.concat(databaseFiles.stream(), fileBased.stream())
+                    .limit(20)
+                    .toList();
         } catch (IOException error) {
             throw new IllegalStateException("failed to list knowledge files for agent: " + agentId, error);
         }
@@ -97,6 +117,18 @@ public class DefaultWorkspaceService implements WorkspaceService {
 
     @Override
     public WorkspaceToolPolicy getToolPolicy(String agentId) {
+        List<String> databaseTools = toolDefinitionRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
+                .map(entity -> WorkspaceToolPolicy.normalize(entity.getToolName()))
+                .filter(name -> !name.isBlank())
+                .distinct()
+                .toList();
+        if (!databaseTools.isEmpty()) {
+            return new WorkspaceToolPolicy(
+                    WorkspaceToolPolicy.Mode.ALLOW_LIST,
+                    Set.copyOf(databaseTools),
+                    Set.of()
+            );
+        }
         String content = readAgentFile(agentId, "TOOLS.yaml").orElse(null);
         if (content == null || content.isBlank()) {
             return WorkspaceToolPolicy.allowAll();

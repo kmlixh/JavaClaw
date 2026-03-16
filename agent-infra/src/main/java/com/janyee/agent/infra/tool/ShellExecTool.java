@@ -33,7 +33,7 @@ public class ShellExecTool implements AgentTool {
     public ToolSchema schema() {
         return new ToolSchema(
                 name(),
-                "Execute a restricted shell command through the isolated worker",
+                "Execute a restricted shell command through the isolated worker. Only use direct allow-listed command prefixes such as Get-Location, pwd, ls, dir, Get-ChildItem, Get-Content, echo, Write-Output, or type. Do not wrap commands with powershell -Command and do not use cd.",
                 "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}"
         );
     }

@@ -27,6 +27,22 @@ public class InMemorySessionTranscriptService implements SessionTranscriptServic
         saveMessage(sessionId, runId, "assistant", "chat", content);
     }
 
+    @Override
+    @Transactional
+    public void appendToolMessage(String sessionId, String runId, String toolName, String toolArgsJson, String toolResultJson, String content) {
+        SessionMessageEntity entity = new SessionMessageEntity();
+        entity.setSessionId(sessionId);
+        entity.setRunId(runId);
+        entity.setRole("tool");
+        entity.setMessageType("tool_result");
+        entity.setContent(content);
+        entity.setToolName(toolName);
+        entity.setToolArgsJson(toolArgsJson);
+        entity.setToolResultJson(toolResultJson);
+        entity.setSeqNo(sessionMessageRepository.findMaxSeqNoBySessionId(sessionId) + 1);
+        sessionMessageRepository.save(entity);
+    }
+
     private void saveMessage(String sessionId, String runId, String role, String messageType, String content) {
         SessionMessageEntity entity = new SessionMessageEntity();
         entity.setSessionId(sessionId);

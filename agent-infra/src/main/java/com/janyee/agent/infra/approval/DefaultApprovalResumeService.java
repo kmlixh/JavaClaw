@@ -8,10 +8,14 @@ import com.janyee.agent.infra.persistence.repository.SessionMessageRepository;
 import com.janyee.agent.runtime.AgentRunner;
 import com.janyee.agent.runtime.approval.ApprovalResumeService;
 import com.janyee.agent.domain.RunRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 @Service
 public class DefaultApprovalResumeService implements ApprovalResumeService {
+
+    private static final Logger log = LoggerFactory.getLogger(DefaultApprovalResumeService.class);
 
     private final ApprovalRequestRepository approvalRequestRepository;
     private final RunRecordRepository runRecordRepository;
@@ -32,6 +36,7 @@ public class DefaultApprovalResumeService implements ApprovalResumeService {
 
     @Override
     public void resumeApprovedRequest(String approvalRequestId) {
+        log.info("approval.resume.start approvalRequestId={}", approvalRequestId);
         var approval = approvalRequestRepository.findById(approvalRequestId)
                 .orElseThrow(() -> new IllegalArgumentException("approval request not found: " + approvalRequestId));
         if (!"APPROVED".equals(approval.getStatus())) {
@@ -43,6 +48,8 @@ public class DefaultApprovalResumeService implements ApprovalResumeService {
         SessionMessageEntity userMessage = sessionMessageRepository.findFirstByRunIdAndRoleOrderByIdAsc(run.getId(), "user")
                 .orElseThrow(() -> new IllegalArgumentException("user message not found for run: " + run.getId()));
 
+        log.info("approval.resume.dispatch approvalRequestId={}, runId={}, sessionId={}, agentId={}, llmConfigId={}",
+                approvalRequestId, run.getId(), run.getSessionId(), run.getAgentId(), run.getLlmConfigId());
         agentRunner.run(new RunRequest(
                 run.getId(),
                 run.getSessionId(),
@@ -50,7 +57,11 @@ public class DefaultApprovalResumeService implements ApprovalResumeService {
                 run.getUserId(),
                 userMessage.getContent(),
                 true,
-                run.getLlmConfigId()
-        )).subscribe();
+                run.getLlmConfigId(),
+                java.util.List.of(),
+                java.util.List.of()
+        )).doOnComplete(() -> log.info("approval.resume.complete approvalRequestId={}, runId={}", approvalRequestId, run.getId()))
+                .doOnError(error -> log.error("approval.resume.error approvalRequestId={}, runId={}", approvalRequestId, run.getId(), error))
+                .subscribe();
     }
 }

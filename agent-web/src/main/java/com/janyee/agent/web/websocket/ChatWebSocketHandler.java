@@ -6,6 +6,8 @@ import com.janyee.agent.domain.RunRequest;
 import com.janyee.agent.runtime.AgentRunner;
 import com.janyee.agent.runtime.agent.AgentRouteRequest;
 import com.janyee.agent.runtime.agent.AgentRouter;
+import com.janyee.agent.runtime.chat.PendingRunLaunch;
+import com.janyee.agent.runtime.chat.PendingRunLaunchStore;
 import com.janyee.agent.runtime.model.LlmConfigDescriptor;
 import com.janyee.agent.runtime.model.LlmConfigService;
 import com.janyee.agent.runtime.run.RunRecordService;
@@ -26,19 +28,22 @@ public class ChatWebSocketHandler implements WebSocketHandler {
     private final AgentRouter agentRouter;
     private final LlmConfigService llmConfigService;
     private final ObjectMapper objectMapper;
+    private final PendingRunLaunchStore pendingRunLaunchStore;
 
     public ChatWebSocketHandler(
             AgentRunner agentRunner,
             RunRecordService runRecordService,
             AgentRouter agentRouter,
             LlmConfigService llmConfigService,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            PendingRunLaunchStore pendingRunLaunchStore
     ) {
         this.agentRunner = agentRunner;
         this.runRecordService = runRecordService;
         this.agentRouter = agentRouter;
         this.llmConfigService = llmConfigService;
         this.objectMapper = objectMapper;
+        this.pendingRunLaunchStore = pendingRunLaunchStore;
     }
 
     @Override
@@ -53,13 +58,17 @@ public class ChatWebSocketHandler implements WebSocketHandler {
 
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("websocket", userId, sessionId, requestedAgentId));
         LlmConfigDescriptor llmConfig = llmConfigService.resolveRequested(requestedLlmConfigId).orElse(null);
+        PendingRunLaunch pending = runId != null && !runId.isBlank()
+                ? pendingRunLaunchStore.consume(runId).orElse(null)
+                : null;
+        String effectiveMessage = pending != null ? pending.message() : message;
         String resolvedRunId = runId != null && !runId.isBlank()
                 ? runId
                 : runRecordService.createAcceptedRun(
                         sessionId,
                         binding.agentId(),
                         userId,
-                        message,
+                        effectiveMessage,
                         llmConfig != null ? llmConfig.configId() : null,
                         llmConfig != null ? llmConfig.provider() : null,
                         llmConfig != null ? llmConfig.model() : null
@@ -69,9 +78,11 @@ public class ChatWebSocketHandler implements WebSocketHandler {
                 sessionId,
                 binding.agentId(),
                 userId,
-                message,
+                effectiveMessage,
                 false,
-                llmConfig != null ? llmConfig.configId() : null
+                llmConfig != null ? llmConfig.configId() : null,
+                pending != null ? pending.references() : java.util.List.of(),
+                pending != null ? pending.attachments() : java.util.List.of()
         );
 
         return session.send(agentRunner.run(request)

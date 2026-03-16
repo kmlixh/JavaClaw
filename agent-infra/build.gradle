@@ -9,6 +9,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     implementation 'org.springframework:spring-webflux'
+    implementation 'io.projectreactor.netty:reactor-netty-http'
     implementation 'org.flywaydb:flyway-core'
     implementation 'org.yaml:snakeyaml'
     implementation 'io.projectreactor:reactor-core'

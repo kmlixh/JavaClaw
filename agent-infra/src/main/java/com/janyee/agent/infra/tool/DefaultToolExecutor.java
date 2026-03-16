@@ -10,10 +10,14 @@ import com.janyee.agent.runtime.loop.ToolExecutor;
 import com.janyee.agent.runtime.loop.ToolLoopContext;
 import com.janyee.agent.tool.AgentTool;
 import com.janyee.agent.tool.registry.ToolRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class DefaultToolExecutor implements ToolExecutor {
+
+    private static final Logger log = LoggerFactory.getLogger(DefaultToolExecutor.class);
 
     private final ToolRegistry toolRegistry;
 
@@ -27,6 +31,8 @@ public class DefaultToolExecutor implements ToolExecutor {
                 .orElseThrow(() -> new ToolExecutionFailedException("tool not found: " + decision.normalizedToolName(), null));
 
         long start = System.currentTimeMillis();
+        log.info("tool.execute.start runId={}, toolName={}, arguments={}",
+                context.runId(), decision.normalizedToolName(), abbreviate(decision.normalizedArgumentsJson()));
         try {
             ToolResult toolResult = tool.execute(new ToolInvocation(
                     context.agentId(),
@@ -36,7 +42,7 @@ public class DefaultToolExecutor implements ToolExecutor {
                     decision.normalizedToolName(),
                     decision.normalizedArgumentsJson()
             ));
-            return new ToolCallOutcome(
+            ToolCallOutcome outcome = new ToolCallOutcome(
                     request,
                     decision,
                     true,
@@ -45,8 +51,24 @@ public class DefaultToolExecutor implements ToolExecutor {
                     toolResult.error(),
                     System.currentTimeMillis() - start
             );
+            log.info("tool.execute.finish runId={}, toolName={}, ok={}, durationMs={}, error={}, summary={}",
+                    context.runId(),
+                    decision.normalizedToolName(),
+                    toolResult.ok(),
+                    outcome.durationMillis(),
+                    toolResult.error(),
+                    abbreviate(toolResult.summary()));
+            return outcome;
         } catch (Exception error) {
+            log.error("tool.execute.error runId={}, toolName={}", context.runId(), decision.normalizedToolName(), error);
             throw new ToolExecutionFailedException("tool execution failed: " + decision.normalizedToolName(), error);
         }
+    }
+
+    private String abbreviate(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.length() <= 200 ? value : value.substring(0, 200) + "...";
     }
 }

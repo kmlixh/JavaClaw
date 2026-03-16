@@ -71,6 +71,63 @@ export async function getApproval(id) {
   return check(await fetch(`/api/approvals/${encodeURIComponent(id)}`)).then((r) => r.json());
 }
 
+export async function listApprovals({ agentId, sessionId, status } = {}) {
+  const params = new URLSearchParams();
+  if (agentId) params.set("agentId", agentId);
+  if (sessionId) params.set("sessionId", sessionId);
+  if (status) params.set("status", status);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return check(await fetch(`/api/approvals${suffix}`)).then((r) => r.json());
+}
+
+export async function listKnowledgeEntries(agentId) {
+  return check(await fetch(`/api/admin/knowledge?agentId=${encodeURIComponent(agentId)}`)).then((r) => r.json());
+}
+
+export async function saveKnowledgeEntry(payload) {
+  return check(await fetch("/api/admin/knowledge", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  })).then((r) => r.json());
+}
+
+export async function deleteKnowledgeEntry(id) {
+  return check(await fetch(`/api/admin/knowledge/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
+
+export async function listToolDefinitions(agentId) {
+  return check(await fetch(`/api/admin/tools?agentId=${encodeURIComponent(agentId)}`)).then((r) => r.json());
+}
+
+export async function saveToolDefinition(payload) {
+  return check(await fetch("/api/admin/tools", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  })).then((r) => r.json());
+}
+
+export async function deleteToolDefinition(id) {
+  return check(await fetch(`/api/admin/tools/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
+
+export async function listSkillDefinitions(agentId) {
+  return check(await fetch(`/api/admin/skills?agentId=${encodeURIComponent(agentId)}`)).then((r) => r.json());
+}
+
+export async function saveSkillDefinition(payload) {
+  return check(await fetch("/api/admin/skills", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  })).then((r) => r.json());
+}
+
+export async function deleteSkillDefinition(id) {
+  return check(await fetch(`/api/admin/skills/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
+
 export async function approve(id) {
   return check(await fetch(`/api/approvals/${encodeURIComponent(id)}/approve`, { method: "POST" })).then((r) => r.json());
 }
@@ -85,6 +142,7 @@ export function createSseStream({ sessionId, agentId, llmConfigId, userId, messa
   if (llmConfigId) params.set("llmConfigId", llmConfigId);
   if (runId) params.set("runId", runId);
   const source = new EventSource(`/api/chat/stream?${params.toString()}`);
+  let terminalReceived = false;
 
   [
     "RUN_STARTED",
@@ -98,6 +156,9 @@ export function createSseStream({ sessionId, agentId, llmConfigId, userId, messa
     "RUN_FAILED"
   ].forEach((type) => {
     source.addEventListener(type, (event) => {
+      if (type === "RUN_COMPLETED" || type === "RUN_FAILED") {
+        terminalReceived = true;
+      }
       onEvent({
         type,
         runId: event.lastEventId,
@@ -108,6 +169,10 @@ export function createSseStream({ sessionId, agentId, llmConfigId, userId, messa
   });
 
   source.onerror = (error) => {
+    if (terminalReceived || source.readyState === EventSource.CLOSED) {
+      source.close();
+      return;
+    }
     onError(error);
     source.close();
   };

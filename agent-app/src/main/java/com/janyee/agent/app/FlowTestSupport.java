@@ -104,7 +104,9 @@ final class FlowTestSupport {
                         "dev-agent",
                         "smoke-user",
                         llmConfigId,
-                        message
+                        message,
+                        java.util.List.of(),
+                        java.util.List.of()
                 ))
                 .retrieve()
                 .bodyToMono(ChatSendResponse.class)

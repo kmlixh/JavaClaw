@@ -2,9 +2,14 @@ mode: allow-list
 allow:
   - echo
   - artifact.save
+  - workspace.path
   - file.list
   - file.read
   - file.write
   - http.fetch
   - shell.exec
+  - db.query
+  - db.execute
+  - table.render
+  - chart.echarts
 deny: []

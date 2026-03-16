@@ -10,7 +10,9 @@
     "e2e": "node scripts/e2e-flow.mjs"
   },
   "dependencies": {
-    "vue": "^3.5.13"
+    "echarts": "^5.6.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.1"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",

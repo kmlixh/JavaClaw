@@ -37,6 +37,12 @@ public class DefaultToolResultAppender implements ToolResultAppender {
                 Use the tool result above to answer the user's latest request directly.
                 If the tool output already contains the needed information, provide the final answer instead of calling the same tool again.
                 When listing files, include concrete file or directory names from Data JSON.
+                If the tool output is a rendered table or chart, do not repeat the raw rows, JSON payload, or a markdown table in the final answer.
+                Summarize the result briefly and let the rendered block carry the detailed data.
+                When the user asks for grouping, aggregation, statistics, trends, or chart visualization, prefer:
+                1) db.query for the aggregate SQL
+                2) chart.echarts for visualization
+                3) a brief natural-language summary
                 """.formatted(
                 outcome.request().toolName(),
                 safe(outcome.request().argumentsJson()),
