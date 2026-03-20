@@ -51,7 +51,8 @@ public class DatabaseExecuteTool implements AgentTool {
             if (normalized.startsWith("select") || normalized.startsWith("with")) {
                 return new ToolResult(false, "statement rejected", "{}", "[]", "use db.query for SELECT statements");
             }
-            try (Connection connection = DatabaseConnectionSupport.openConnection(dataSource, args);
+            DatabaseConnectionSupport.ConnectionTarget target = DatabaseConnectionSupport.openConnection(dataSource, args);
+            try (Connection connection = target.connection();
                  Statement statement = connection.createStatement()) {
                 int affected = statement.executeUpdate(sql);
                 return new ToolResult(

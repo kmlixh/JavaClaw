@@ -11,6 +11,8 @@ import com.janyee.agent.api.SessionSummaryResponse;
 import com.janyee.agent.api.SessionTitleUpdateRequest;
 import com.janyee.agent.api.MemoryNoteResponse;
 import com.janyee.agent.api.ToolAuditLogResponse;
+import com.janyee.agent.runtime.artifact.ArtifactBinary;
+import com.janyee.agent.runtime.artifact.ArtifactService;
 import com.janyee.agent.runtime.agent.AgentDefinitionService;
 import com.janyee.agent.runtime.model.LlmConfigService;
 import com.janyee.agent.runtime.query.AgentQueryService;
@@ -26,6 +28,10 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 
 @RestController
 @RequestMapping("/api")
@@ -35,17 +41,20 @@ public class QueryController {
     private final AgentDefinitionService agentDefinitionService;
     private final LlmConfigService llmConfigService;
     private final SessionService sessionService;
+    private final ArtifactService artifactService;
 
     public QueryController(
             AgentQueryService agentQueryService,
             AgentDefinitionService agentDefinitionService,
             LlmConfigService llmConfigService,
-            SessionService sessionService
+            SessionService sessionService,
+            ArtifactService artifactService
     ) {
         this.agentQueryService = agentQueryService;
         this.agentDefinitionService = agentDefinitionService;
         this.llmConfigService = llmConfigService;
         this.sessionService = sessionService;
+        this.artifactService = artifactService;
     }
 
     @GetMapping("/agents")
@@ -251,5 +260,19 @@ public class QueryController {
                         ))
                         .toList()
         );
+    }
+
+    @GetMapping("/artifacts/{id}/download")
+    public ResponseEntity<ByteArrayResource> downloadArtifact(@PathVariable("id") Long id) {
+        ArtifactBinary artifact = artifactService.loadArtifact(id);
+        String contentType = artifact.artifact().contentType();
+        MediaType mediaType = contentType != null && !contentType.isBlank()
+                ? MediaType.parseMediaType(contentType)
+                : MediaType.APPLICATION_OCTET_STREAM;
+        return ResponseEntity.ok()
+                .contentType(mediaType)
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + artifact.artifact().name() + "\"")
+                .contentLength(artifact.content().length)
+                .body(new ByteArrayResource(artifact.content()));
     }
 }

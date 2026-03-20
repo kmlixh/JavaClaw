@@ -100,17 +100,17 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                         decision,
                         repeatedOutcome.get(),
                         ToolLoopState.TOOL_CALL_DETECTED,
-                        ToolLoopState.COMPLETED
+                        repeatedOutcome.get().success() ? ToolLoopState.COMPLETED : ToolLoopState.FAILED
                 ));
                 context.appendAssistantText(renderRepeatedToolResult(decision, repeatedOutcome.get()));
-                context.advanceState(ToolLoopState.COMPLETED);
+                context.advanceState(repeatedOutcome.get().success() ? ToolLoopState.COMPLETED : ToolLoopState.FAILED);
                 return new ToolLoopResult(
-                        true,
+                        repeatedOutcome.get().success(),
                         context.state(),
                         context.assistantText(),
                         context.toolOutcomes(),
                         context.iterations(),
-                        null
+                        repeatedOutcome.get().success() ? null : safe(repeatedOutcome.get().errorMessage())
                 );
             }
 
@@ -191,7 +191,7 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                         ToolLoopState.TOOL_CALL_DETECTED,
                         ToolLoopState.COMPLETED
                 ));
-                String terminalSummary = renderTerminalSummary(modelTurnResult.fullText(), outcome);
+                String terminalSummary = renderTerminalSummary(outcome);
                 context.appendAssistantText(terminalSummary);
                 context.advanceState(ToolLoopState.COMPLETED);
                 log.info("tool.loop.render_terminated runId={}, toolName={}, summary={}",
@@ -277,20 +277,16 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
         return "table.render".equals(toolName) || "chart.echarts".equals(toolName);
     }
 
-    private String renderTerminalSummary(String modelOutput, ToolCallOutcome outcome) {
-        String trimmed = modelOutput == null ? "" : modelOutput.trim();
-        if (!trimmed.isBlank()) {
-            return trimmed;
-        }
+    private String renderTerminalSummary(ToolCallOutcome outcome) {
         String toolName = outcome.decision() != null ? outcome.decision().normalizedToolName() : outcome.request().toolName();
         String summary = outcome.toolResult() != null ? safe(outcome.toolResult().summary()) : "";
         if ("chart.echarts".equals(toolName)) {
-            return summary.isBlank() ? "图表已生成，请查看下方图表结果。" : summary;
+            return "图表已生成，请查看下方图表结果。";
         }
         if ("table.render".equals(toolName)) {
-            return summary.isBlank() ? "表格已生成，请查看下方表格结果。" : summary;
+            return "表格已生成，请查看下方表格结果。";
         }
-        return summary;
+        return summary.isBlank() ? "结果已生成。" : summary;
     }
 
     private String formatIterations(java.util.List<ToolLoopIteration> iterations) {

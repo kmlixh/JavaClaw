@@ -1,6 +1,7 @@
 package com.janyee.agent.infra.workspace;
 
 import com.janyee.agent.infra.config.AgentPlatformProperties;
+import com.janyee.agent.infra.prompt.BuiltinDocumentWorkflowCatalog;
 import com.janyee.agent.infra.persistence.repository.KnowledgeEntryRepository;
 import com.janyee.agent.infra.persistence.repository.ToolDefinitionRepository;
 import com.janyee.agent.workspace.WorkspaceService;
@@ -85,6 +86,7 @@ public class DefaultWorkspaceService implements WorkspaceService {
 
     @Override
     public List<WorkspaceKnowledgeFile> listKnowledgeFiles(String agentId) {
+        List<WorkspaceKnowledgeFile> builtinFiles = BuiltinDocumentWorkflowCatalog.knowledgeFiles();
         List<WorkspaceKnowledgeFile> databaseFiles = knowledgeEntryRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
                 .limit(10)
                 .map(entity -> new WorkspaceKnowledgeFile(
@@ -94,7 +96,9 @@ public class DefaultWorkspaceService implements WorkspaceService {
                 .toList();
         Path knowledgeRoot = getWorkspaceRoot(agentId).resolve("knowledge").normalize();
         if (!Files.exists(knowledgeRoot) || !Files.isDirectory(knowledgeRoot)) {
-            return databaseFiles;
+            return Stream.concat(Stream.concat(builtinFiles.stream(), databaseFiles.stream()), Stream.<WorkspaceKnowledgeFile>empty())
+                    .limit(20)
+                    .toList();
         }
 
         try (Stream<Path> stream = Files.walk(knowledgeRoot, 2)) {
@@ -107,7 +111,7 @@ public class DefaultWorkspaceService implements WorkspaceService {
                             readFile(path)
                     ))
                     .toList();
-            return Stream.concat(databaseFiles.stream(), fileBased.stream())
+            return Stream.concat(Stream.concat(builtinFiles.stream(), databaseFiles.stream()), fileBased.stream())
                     .limit(20)
                     .toList();
         } catch (IOException error) {

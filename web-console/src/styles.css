@@ -814,6 +814,15 @@ textarea {
   border-radius: 6px;
 }
 
+.dock-actions-secondary {
+  margin-top: 8px;
+}
+
+.dock-actions-secondary button {
+  background: #f7f7f8;
+  color: #1f2937;
+}
+
 .reference-picker {
   display: grid;
   gap: 8px;
@@ -941,6 +950,32 @@ textarea {
   background: #1f2937;
   border-color: #1f2937;
   color: #f9fafb;
+}
+
+.artifact-block {
+  align-items: center;
+}
+
+.download-link,
+.artifact-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid #d7dde5;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #111827;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.artifact-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 6px;
 }
 
 .echarts-block {

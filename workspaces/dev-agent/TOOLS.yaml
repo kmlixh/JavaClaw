@@ -2,6 +2,10 @@ mode: allow-list
 allow:
   - echo
   - artifact.save
+  - artifact.markdown
+  - artifact.word
+  - artifact.excel
+  - artifact.ppt
   - workspace.path
   - file.list
   - file.read

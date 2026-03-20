@@ -10,4 +10,16 @@ public interface ArtifactService {
             String contentType,
             String content
     );
+
+    ArtifactRecord saveBinaryArtifact(
+            String agentId,
+            String sessionId,
+            String runId,
+            String artifactType,
+            String name,
+            String contentType,
+            byte[] content
+    );
+
+    ArtifactBinary loadArtifact(Long artifactId);
 }

@@ -55,6 +55,10 @@ export async function getRun(runId) {
   return check(await fetch(`/api/runs/${encodeURIComponent(runId)}`)).then((r) => r.json());
 }
 
+export function artifactDownloadUrl(artifactId) {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
 export async function getMemories(agentId) {
   return check(await fetch(`/api/agents/${encodeURIComponent(agentId)}/memories`)).then((r) => r.json());
 }

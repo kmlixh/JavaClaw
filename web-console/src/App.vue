@@ -6,6 +6,7 @@ import {
   approve,
   createSseStream,
   createWebSocketStream,
+  artifactDownloadUrl,
   getApproval,
   getMemories,
   getRun,
@@ -235,6 +236,11 @@ function renderBlockTitle(message) {
   if (payload.displayType === "table") return payload.title || "表格结果";
   if (payload.displayType === "echarts") return payload.title || "图表结果";
   return message.toolName || "结果";
+}
+
+function artifactPayload(message) {
+  const payload = toolDisplayPayload(message);
+  return payload?.displayType === "artifact" ? payload : null;
 }
 
 function chartOverrideKey(message) {
@@ -624,6 +630,24 @@ async function handleAttachmentChange(event) {
 
 function removeAttachment(attachment) {
   form.attachments = form.attachments.filter((item) => item !== attachment);
+}
+
+function appendMessageText(value) {
+  const text = String(value || "").trim();
+  if (!text) return;
+  const current = (form.message || "").trim();
+  form.message = current ? `${current}\n${text}` : text;
+  syncComposerEditor(true);
+}
+
+function presetDocumentRequest(outputType) {
+  const templates = {
+    markdown: "请基于当前会话上下文、已有数据和图表，生成一份结构化 Markdown 报告，并提供可下载文件。",
+    word: "请基于当前会话上下文、已有数据和图表，生成一份正式 Word 报告，并提供可下载文件。",
+    excel: "请基于当前会话上下文和已有查询结果，生成一份可下载的 Excel 文件，保留结构化表格数据。",
+    ppt: "请基于当前会话上下文、已有数据和图表，生成一份用于汇报的 PPT，并提供可下载文件。"
+  };
+  appendMessageText(templates[outputType]);
 }
 
 function formatSessionTime(value) {
@@ -1654,6 +1678,17 @@ function eventTone(type) {
                       <EchartsBlock :option="displayChartOption(block.message)" />
                     </div>
                   </template>
+                  <template v-else-if="artifactPayload(block.message)">
+                    <div class="render-block artifact-block">
+                      <div class="render-block-head">
+                        <div class="render-block-heading">
+                          <strong>{{ artifactPayload(block.message)?.name || renderBlockTitle(block.message) }}</strong>
+                          <span>{{ artifactPayload(block.message)?.contentType || block.message.toolName }}</span>
+                        </div>
+                        <a class="download-link" :href="artifactDownloadUrl(artifactPayload(block.message)?.artifactId)" target="_blank" rel="noopener">下载</a>
+                      </div>
+                    </div>
+                  </template>
                   <pre v-else-if="block.message.toolResultJson" class="tool-payload">{{ block.message.toolResultJson }}</pre>
                 </article>
                 <article v-else-if="block.kind === 'live'" class="bubble assistant live">
@@ -1767,6 +1802,12 @@ function eventTone(type) {
             <button @click="refreshSession">刷新会话</button>
             <button @click="refreshRun">刷新运行</button>
             <button @click="refreshMemories">刷新记忆</button>
+          </div>
+          <div class="dock-actions dock-actions-secondary">
+            <button @click="presetDocumentRequest('markdown')">导出 Markdown</button>
+            <button @click="presetDocumentRequest('word')">导出 Word</button>
+            <button @click="presetDocumentRequest('excel')">导出 Excel</button>
+            <button @click="presetDocumentRequest('ppt')">导出 PPT</button>
           </div>
           <input ref="fileInput" type="file" multiple hidden @change="handleAttachmentChange" />
         </div>
@@ -1931,6 +1972,18 @@ function eventTone(type) {
           <div class="kv"><span>LLM</span><strong data-testid="llm-model">{{ state.run?.llmModel || llms.find((item) => item.configId === form.llmConfigId)?.model || "default" }}</strong></div>
           <div class="kv"><span>Artifacts</span><strong>{{ state.run?.artifacts?.length || 0 }}</strong></div>
           <div class="kv"><span>Audits</span><strong>{{ state.run?.toolAudits?.length || 0 }}</strong></div>
+          <div v-if="state.run?.artifacts?.length" class="artifact-links">
+            <a
+              v-for="artifact in state.run?.artifacts || []"
+              :key="artifact.id"
+              class="artifact-link"
+              :href="artifactDownloadUrl(artifact.id)"
+              target="_blank"
+              rel="noopener"
+            >
+              {{ artifact.name }}
+            </a>
+          </div>
         </div>
       </section>
 

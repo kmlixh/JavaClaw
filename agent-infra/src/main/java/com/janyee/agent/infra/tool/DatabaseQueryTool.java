@@ -6,6 +6,8 @@ import com.janyee.agent.domain.ToolInvocation;
 import com.janyee.agent.domain.ToolResult;
 import com.janyee.agent.domain.ToolSchema;
 import com.janyee.agent.tool.AgentTool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import javax.sql.DataSource;
@@ -21,6 +23,8 @@ import java.util.Map;
 
 @Component
 public class DatabaseQueryTool implements AgentTool {
+
+    private static final Logger log = LoggerFactory.getLogger(DatabaseQueryTool.class);
 
     private final DataSource dataSource;
     private final ObjectMapper objectMapper;
@@ -57,7 +61,14 @@ public class DatabaseQueryTool implements AgentTool {
             if (!normalized.startsWith("select") && !normalized.startsWith("with")) {
                 return new ToolResult(false, "query rejected", "{}", "[]", "db.query only allows SELECT/CTE statements");
             }
-            try (Connection connection = DatabaseConnectionSupport.openConnection(dataSource, args);
+            DatabaseConnectionSupport.ConnectionTarget target = DatabaseConnectionSupport.openConnection(dataSource, args);
+            log.info("db.query.target runId={}, mode={}, jdbcUrl={}, schema={}, sql={}",
+                    invocation.runId(),
+                    target.mode(),
+                    summarize(target.jdbcUrl()),
+                    target.schema(),
+                    summarize(sql));
+            try (Connection connection = target.connection();
                  Statement statement = connection.createStatement()) {
                 statement.setMaxRows(maxRows);
                 try (ResultSet resultSet = statement.executeQuery(sql)) {
@@ -92,5 +103,12 @@ public class DatabaseQueryTool implements AgentTool {
         } catch (Exception error) {
             return new ToolResult(false, "query failed", "{}", "[]", error.getMessage());
         }
+    }
+
+    private String summarize(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.length() <= 240 ? value : value.substring(0, 240);
     }
 }

@@ -9,16 +9,29 @@ import java.util.Locale;
 
 final class DatabaseConnectionSupport {
 
+    record ConnectionTarget(
+            Connection connection,
+            String mode,
+            String jdbcUrl,
+            String schema
+    ) {
+    }
+
     private DatabaseConnectionSupport() {
     }
 
-    static Connection openConnection(DataSource fallbackDataSource, JsonNode args) throws Exception {
+    static ConnectionTarget openConnection(DataSource fallbackDataSource, JsonNode args) throws Exception {
         String jdbcUrl = args.path("jdbcUrl").asText("").trim();
         if (!jdbcUrl.isBlank()) {
-            return DriverManager.getConnection(
+            return new ConnectionTarget(
+                    DriverManager.getConnection(
                     jdbcUrl,
                     args.path("username").asText(""),
                     args.path("password").asText("")
+                    ),
+                    "explicit-jdbc-url",
+                    jdbcUrl,
+                    ""
             );
         }
 
@@ -29,6 +42,15 @@ final class DatabaseConnectionSupport {
         String password = args.path("password").asText("");
         int port = args.path("port").asInt(defaultPort(dbType));
         String schema = args.path("schema").asText("").trim();
+        boolean hasExplicitConnectionFields = !host.isBlank()
+                || !database.isBlank()
+                || !username.isBlank()
+                || !schema.isBlank()
+                || args.hasNonNull("port");
+
+        if (dbType.isBlank() && hasExplicitConnectionFields) {
+            dbType = inferDbType(port);
+        }
 
         if (!dbType.isBlank() && !host.isBlank() && !database.isBlank() && !username.isBlank()) {
             String url = buildJdbcUrl(dbType, host, port, database);
@@ -36,10 +58,20 @@ final class DatabaseConnectionSupport {
             if (!schema.isBlank()) {
                 connection.setSchema(schema);
             }
-            return connection;
+            return new ConnectionTarget(connection, "explicit-target", url, schema);
         }
 
-        return fallbackDataSource.getConnection();
+        if (hasExplicitConnectionFields) {
+            throw new IllegalArgumentException("incomplete remote database connection arguments; require dbType/host/database/username or jdbcUrl");
+        }
+
+        Connection connection = fallbackDataSource.getConnection();
+        return new ConnectionTarget(
+                connection,
+                "fallback-datasource",
+                safeUrl(connection),
+                safeSchema(connection)
+        );
     }
 
     private static String buildJdbcUrl(String dbType, String host, int port, String database) {
@@ -58,5 +90,30 @@ final class DatabaseConnectionSupport {
             case "sqlserver", "mssql" -> 1433;
             default -> 0;
         };
+    }
+
+    private static String inferDbType(int port) {
+        return switch (port) {
+            case 5432 -> "postgresql";
+            case 3306 -> "mysql";
+            case 1433 -> "sqlserver";
+            default -> throw new IllegalArgumentException("dbType is missing and could not be inferred from port " + port);
+        };
+    }
+
+    private static String safeUrl(Connection connection) {
+        try {
+            return connection.getMetaData().getURL();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private static String safeSchema(Connection connection) {
+        try {
+            return connection.getSchema();
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 }
