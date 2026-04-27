@@ -9,6 +9,7 @@ public record ChatSendRequest(
         String agentId,
         String userId,
         String llmConfigId,
+        String llmModel,
         @NotBlank String message,
         List<ChatContextReference> references,
         List<ChatAttachment> attachments

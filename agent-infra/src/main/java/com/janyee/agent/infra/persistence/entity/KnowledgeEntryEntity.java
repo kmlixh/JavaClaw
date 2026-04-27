@@ -73,10 +73,36 @@ public class KnowledgeEntryEntity {
         Instant now = Instant.now();
         createdAt = now;
         updatedAt = now;
+        if (scopeType == null || scopeType.isBlank()) {
+            scopeType = "SYSTEM";
+            if (appId == null || appId.isBlank()) appId = "system-default";
+        }
     }
 
     @PreUpdate
     void onUpdate() {
         updatedAt = Instant.now();
     }
+
+    // ===== V23: multi-tenant scope fields (参看 SkillDefinitionEntity 注释) ===
+    @Column(name = "scope_type", length = 16, nullable = false)
+    private String scopeType;
+
+    @Column(name = "scope_tenant_id", length = 64)
+    private String scopeTenantId;
+
+    @Column(name = "scope_user_id", length = 64)
+    private String scopeUserId;
+
+    @Column(name = "app_id", length = 64)
+    private String appId;
+
+    public String getScopeType() { return scopeType; }
+    public void setScopeType(String scopeType) { this.scopeType = scopeType; }
+    public String getScopeTenantId() { return scopeTenantId; }
+    public void setScopeTenantId(String scopeTenantId) { this.scopeTenantId = scopeTenantId; }
+    public String getScopeUserId() { return scopeUserId; }
+    public void setScopeUserId(String scopeUserId) { this.scopeUserId = scopeUserId; }
+    public String getAppId() { return appId; }
+    public void setAppId(String appId) { this.appId = appId; }
 }

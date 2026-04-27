@@ -11,6 +11,11 @@ public record SessionMessageView(
         String toolName,
         String toolArgsJson,
         String toolResultJson,
+        // Nullable for pre-V20 rows. JSON array of ChatContextReference payloads.
+        String referencesJson,
+        // Nullable for pre-V20 rows. JSON array of ChatAttachment payloads
+        // (空间区域 / 图片 / 文件).
+        String attachmentsJson,
         Long seqNo,
         Instant createdAt
 ) {

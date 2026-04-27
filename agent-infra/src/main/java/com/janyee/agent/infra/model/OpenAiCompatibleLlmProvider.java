@@ -11,13 +11,16 @@ import com.janyee.agent.runtime.model.LlmProvider;
 import com.janyee.agent.runtime.model.LlmStreamEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Component;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import io.netty.channel.ChannelOption;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
 import reactor.netty.http.client.HttpClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -26,8 +29,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.concurrent.TimeUnit;
 
-@Primary
 @Component
 public class OpenAiCompatibleLlmProvider implements LlmProvider {
 
@@ -46,9 +49,20 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         this.properties = properties;
         this.llmConfigService = llmConfigService;
         this.objectMapper = objectMapper;
+        // responseTimeout 只覆盖 request -> 首字节;流体本身没管。SSE 中途断流但不关连接,
+        // reactor-netty 要等 TCP keepalive 兜底才能发现,现场卡过几分钟。加 ReadTimeoutHandler
+        // 作为 per-chunk idle timeout。
+        //
+        // 读超时给到 300s (5 min):LLM thinking / tool-call 阶段长时间无输出是正常的,给足
+        // 余量避免"还在思考就被当成死链路掐掉"。写超时 120s 是读超时的对称余量 —— 发请求阶段
+        // 理论上用不了这么久,但给大 prompt + 慢网络留缓冲。
         HttpClient httpClient = HttpClient.create()
                 .compress(true)
-                .responseTimeout(Duration.ofSeconds(120));
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10_000)
+                .responseTimeout(Duration.ofSeconds(120))
+                .doOnConnected(connection -> connection
+                        .addHandlerLast(new ReadTimeoutHandler(300, TimeUnit.SECONDS))
+                        .addHandlerLast(new WriteTimeoutHandler(120, TimeUnit.SECONDS)));
         this.webClient = WebClient.builder()
                 .clientConnector(new ReactorClientHttpConnector(httpClient))
                 .build();
@@ -60,7 +74,10 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         if (llm == null || !llm.enabled() || isBlank(llm.baseUrl())) {
             return StubLlmProvider.response(request);
         }
+        return chatStream(request, llm);
+    }
 
+    public Flux<LlmStreamEvent> chatStream(LlmChatRequest request, LlmConfigDescriptor llm) {
         Flux<LlmStreamEvent> upstream = llm.stream()
                 ? requestStreamingCompletion(request, llm).flatMapIterable(this::mapStreamChunkToEvents)
                 : requestCompletion(request, llm).flatMapMany(this::mapResponseToEvents);
@@ -80,7 +97,7 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         Map<String, Object> payload = basePayload(request, llm, llm.stream());
 
         return webClient.post()
-                .uri(joinUrl(llm.baseUrl(), defaultIfBlank(llm.chatPath(), "/v1/chat/completions")))
+                .uri(resolveEndpoint(llm))
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.APPLICATION_JSON)
                 .headers(headers -> applyAuth(headers, llm))
@@ -93,7 +110,7 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         Map<String, Object> payload = basePayload(request, llm, true);
 
         return webClient.post()
-                .uri(joinUrl(llm.baseUrl(), defaultIfBlank(llm.chatPath(), "/v1/chat/completions")))
+                .uri(resolveEndpoint(llm))
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .headers(headers -> applyAuth(headers, llm))
@@ -254,6 +271,9 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
                             defaultIfBlank(llm.provider(), "openai-compatible"),
                             "Application Default",
                             llm.model(),
+                            llm.model() == null || llm.model().isBlank()
+                                    ? "{\"models\":[]}"
+                                    : "{\"models\":[{\"displayName\":\"" + llm.model() + "\",\"apiModel\":\"" + llm.model() + "\"}]}",
                             llm.baseUrl(),
                             llm.apiKey(),
                             llm.chatPath(),
@@ -264,14 +284,26 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
                 });
     }
 
-    private String joinUrl(String baseUrl, String path) {
-        if (baseUrl.endsWith("/") && path.startsWith("/")) {
-            return baseUrl.substring(0, baseUrl.length() - 1) + path;
+    private String resolveEndpoint(LlmConfigDescriptor llm) {
+        String url = defaultIfBlank(llm.baseUrl(), "");
+        if (url.isBlank()) {
+            return "http://localhost:11434/v1/chat/completions";
         }
-        if (!baseUrl.endsWith("/") && !path.startsWith("/")) {
-            return baseUrl + "/" + path;
+        String normalized = url.trim();
+        String lower = normalized.toLowerCase();
+        if (lower.contains("/chat/completions")) {
+            return normalized;
         }
-        return baseUrl + path;
+        if (lower.endsWith("/v1")) {
+            return normalized + "/chat/completions";
+        }
+        if (lower.endsWith("/v1/")) {
+            return normalized + "chat/completions";
+        }
+        if (normalized.endsWith("/")) {
+            return normalized + "v1/chat/completions";
+        }
+        return normalized + "/v1/chat/completions";
     }
 
     private String defaultIfBlank(String value, String defaultValue) {
@@ -289,6 +321,12 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         Throwable root = rootCause(error);
         String message = firstNonBlank(root.getMessage(), error.getMessage());
         String type = root.getClass().getSimpleName();
+        if (root instanceof WebClientResponseException responseException) {
+            String body = responseException.getResponseBodyAsString();
+            if (body != null && !body.isBlank()) {
+                message = firstNonBlank(message, "") + " | responseBody=" + body;
+            }
+        }
         if ("ClosedChannelException".equals(type)) {
             return "SSL/TLS handshake was closed before completion. Check local proxy/VPN/TUN interception, outbound HTTPS access, or certificate trust";
         }

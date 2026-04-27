@@ -4,10 +4,19 @@ import com.janyee.agent.runtime.skill.SkillPrompt;
 import com.janyee.agent.workspace.WorkspaceKnowledgeFile;
 
 import java.util.List;
+import java.util.Set;
 
 public final class BuiltinDocumentWorkflowCatalog {
 
     private BuiltinDocumentWorkflowCatalog() {
+    }
+
+    /**
+     * Tools that back built-in skills and must stay callable regardless of a
+     * workspace's explicit allow-list. Explicit deny entries still take priority.
+     */
+    public static Set<String> builtinToolNames() {
+        return Set.of("db.schema.inspect", "plan.create", "plan.update");
     }
 
     public static List<WorkspaceKnowledgeFile> knowledgeFiles() {
@@ -23,9 +32,9 @@ public final class BuiltinDocumentWorkflowCatalog {
                         1. Clarify the target output type: markdown, word, excel, ppt.
                         2. Gather required data from tools such as db.query, file.read, http.fetch, workspace.path, or existing knowledge.
                         3. Organize the output into sections, tables, and charts before generating the final file.
-                        4. If charts or tables are needed, prefer:
-                           - db.query -> table.render for tabular deliverables
-                           - db.query -> chart.echarts for chart deliverables
+                        4. If charts or tables are needed (there are no dedicated rendering tools):
+                           - db.query -> write a GFM markdown table by hand inside the artifact body
+                           - db.query -> write a ```echarts\n{ECharts option JSON}\n``` fenced block inside the artifact body for charts
                         5. After the structure is ready, call the correct artifact tool:
                            - artifact.markdown
                            - artifact.word
@@ -76,7 +85,7 @@ public final class BuiltinDocumentWorkflowCatalog {
                         - Each slide should have one main message.
                         - Prefer short bullet points.
                         - Charts should support the headline, not replace it.
-                        - If chart.echarts result exists, summarize the insight and convert it into a slide-friendly narrative before calling artifact.ppt.
+                        - Describe chart intent in slide-friendly narrative; do not paste raw JSON.
                         """
                 ),
                 new WorkspaceKnowledgeFile(
@@ -128,8 +137,8 @@ public final class BuiltinDocumentWorkflowCatalog {
                         1. Detect output intent: markdown, word, excel, ppt.
                         2. Gather data first. Do not create the artifact before data and structure are ready.
                         3. If statistics are requested, use db.query.
-                        4. If the user wants a table in the final deliverable, use table.render or reuse db.query result columns/rows.
-                        5. If the user wants a chart, use chart.echarts before generating the final file.
+                        4. If the user wants a table in the final deliverable, write a GitHub-flavored markdown table by hand inside the artifact body using the db.query result columns/rows. There is no table-rendering tool.
+                        5. If the user wants a chart in the final deliverable, write a ```echarts\n{ECharts option JSON}\n``` fenced code block inside the artifact.markdown body. The frontend renders it as an interactive chart. There is no chart-rendering tool.
                         6. Then generate exactly one final artifact file using the matching artifact tool.
                         7. Final assistant text should briefly summarize what was generated and the core findings.
                         """
@@ -141,7 +150,9 @@ public final class BuiltinDocumentWorkflowCatalog {
                         For markdown output:
                         - Build a clear title and section structure first.
                         - Prefer markdown headings, bullet lists, and tables.
-                        - Use artifact.markdown to save the final deliverable.
+                        - Use artifact.markdown to save the final deliverable; the UI can preview its returned markdown directly.
+                        - If the markdown needs images and the prompt specifies image locations, placeholders, generated SVG, base64, or data URL images, pass them through artifact.markdown images using sourcePath/svg/base64/dataUrl or inline data URLs so the server stores the images and rewrites markdown image links.
+                        - Do not leave image references pointing to inaccessible local paths. Use the server artifact URL returned by artifact.markdown.
                         - Do not return the whole markdown body in chat if the file has already been generated.
                         """
                 ),

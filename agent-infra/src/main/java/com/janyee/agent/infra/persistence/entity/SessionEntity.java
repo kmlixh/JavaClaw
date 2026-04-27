@@ -32,6 +32,13 @@ public class SessionEntity {
     @Column(name = "title", length = 255)
     private String title;
 
+    // V23: 多租户字段。匿名时段的会话已由 V24 backfill 到 SYSTEM 租户 + system-default app。
+    @Column(name = "tenant_id", length = 64)
+    private String tenantId;
+
+    @Column(name = "app_id", length = 64)
+    private String appId;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -93,6 +100,11 @@ public class SessionEntity {
     public Instant getUpdatedAt() {
         return updatedAt;
     }
+
+    public String getTenantId() { return tenantId; }
+    public void setTenantId(String tenantId) { this.tenantId = tenantId; }
+    public String getAppId() { return appId; }
+    public void setAppId(String appId) { this.appId = appId; }
 
     @PrePersist
     void onCreate() {

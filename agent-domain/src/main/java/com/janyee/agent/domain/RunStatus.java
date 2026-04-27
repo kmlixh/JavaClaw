@@ -9,5 +9,6 @@ public enum RunStatus {
     TOOL_RESULT_APPENDED,
     COMPLETED,
     FAILED,
-    WAITING_APPROVAL
+    WAITING_APPROVAL,
+    CANCELLED
 }

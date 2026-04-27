@@ -46,6 +46,17 @@ public class SessionMessageEntity {
     @Column(name = "seq_no", nullable = false)
     private Long seqNo;
 
+    // JSON array of ChatContextReference payloads (@mention 引用的知识/资源).
+    // Nullable 以兼容 V20 之前的老数据;读出来为 null 时调用方当成空列表处理。
+    @Column(name = "references_json", columnDefinition = "TEXT")
+    private String referencesJson;
+
+    // JSON array of ChatAttachment payloads (地图空间区域 / 图片 / 普通文件).
+    // Nullable 同上。大文件 base64 内容也写这里 —— session_message 现在是发送历史的唯一真相,
+    // resend 走这一张表就能完整还原用户上次发过什么。
+    @Column(name = "attachments_json", columnDefinition = "TEXT")
+    private String attachmentsJson;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -123,6 +134,22 @@ public class SessionMessageEntity {
 
     public void setSeqNo(Long seqNo) {
         this.seqNo = seqNo;
+    }
+
+    public String getReferencesJson() {
+        return referencesJson;
+    }
+
+    public void setReferencesJson(String referencesJson) {
+        this.referencesJson = referencesJson;
+    }
+
+    public String getAttachmentsJson() {
+        return attachmentsJson;
+    }
+
+    public void setAttachmentsJson(String attachmentsJson) {
+        this.attachmentsJson = attachmentsJson;
     }
 
     public Instant getCreatedAt() {

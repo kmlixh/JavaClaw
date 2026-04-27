@@ -11,5 +11,6 @@ public enum ToolLoopState {
     MODEL_RESUMING,
     COMPLETED,
     FAILED,
-    WAITING_APPROVAL
+    WAITING_APPROVAL,
+    CANCELLED
 }

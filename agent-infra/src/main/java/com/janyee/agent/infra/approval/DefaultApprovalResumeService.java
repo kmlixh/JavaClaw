@@ -58,6 +58,7 @@ public class DefaultApprovalResumeService implements ApprovalResumeService {
                 userMessage.getContent(),
                 true,
                 run.getLlmConfigId(),
+                run.getLlmModel(),
                 java.util.List.of(),
                 java.util.List.of()
         )).doOnComplete(() -> log.info("approval.resume.complete approvalRequestId={}, runId={}", approvalRequestId, run.getId()))

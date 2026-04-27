@@ -68,7 +68,10 @@ public class ChatController {
         String userId = request.userId() != null && !request.userId().isBlank() ? request.userId() : "anonymous";
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("web", userId, sessionId, request.agentId()));
         String agentId = binding.agentId();
-        LlmConfigDescriptor llmConfig = llmConfigService.resolveRequested(request.llmConfigId()).orElse(null);
+        LlmConfigDescriptor llmConfig = applyModelOverride(
+                llmConfigService.resolveRequested(request.llmConfigId()).orElse(null),
+                request.llmModel()
+        );
         if (llmConfig == null) {
             log.warn("chat.send.rejected sessionId={}, userId={}, requestedAgentId={}, reason=no_available_llm",
                     sessionId, userId, request.agentId());
@@ -82,19 +85,24 @@ public class ChatController {
                 agentId,
                 userId,
                 request.message(),
+                toDomainReferences(request),
+                toDomainAttachments(request),
                 llmConfig != null ? llmConfig.configId() : null,
                 llmConfig != null ? llmConfig.provider() : null,
                 llmConfig != null ? llmConfig.model() : null
         );
+        java.util.List<ChatContextReference> references = toDomainReferences(request);
+        java.util.List<ChatAttachment> attachments = toDomainAttachments(request);
         pendingRunLaunchStore.save(new PendingRunLaunch(
                 runId,
                 sessionId,
                 agentId,
                 userId,
                 llmConfig != null ? llmConfig.configId() : null,
+                llmConfig != null ? llmConfig.model() : null,
                 request.message(),
-                toDomainReferences(request),
-                toDomainAttachments(request)
+                references,
+                attachments
         ));
         log.info("chat.send.accepted sessionId={}, runId={}, agentId={}, llmConfigId={}, model={}",
                 sessionId, runId, agentId,
@@ -116,6 +124,7 @@ public class ChatController {
             @RequestParam("sessionId") String sessionId,
             @RequestParam(value = "agentId", required = false) String agentId,
             @RequestParam(value = "llmConfigId", required = false) String llmConfigId,
+            @RequestParam(value = "llmModel", required = false) String llmModel,
             @RequestParam(value = "userId", required = false, defaultValue = "anonymous") String userId,
             @RequestParam("message") String message
     ) {
@@ -123,7 +132,10 @@ public class ChatController {
                 runId, sessionId, userId, agentId, llmConfigId, message != null ? message.length() : 0);
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("web", userId, sessionId, agentId));
         String resolvedAgentId = binding.agentId();
-        LlmConfigDescriptor llmConfig = llmConfigService.resolveRequested(llmConfigId).orElse(null);
+        LlmConfigDescriptor llmConfig = applyModelOverride(
+                llmConfigService.resolveRequested(llmConfigId).orElse(null),
+                llmModel
+        );
         if (llmConfig == null) {
             log.warn("chat.stream.rejected sessionId={}, userId={}, requestedAgentId={}, reason=no_available_llm",
                     sessionId, userId, agentId);
@@ -135,6 +147,12 @@ public class ChatController {
         PendingRunLaunch pending = runId != null && !runId.isBlank()
                 ? pendingRunLaunchStore.consume(runId).orElse(null)
                 : null;
+        if (pending != null) {
+            llmConfig = applyModelOverride(
+                    llmConfigService.resolveRequested(pending.llmConfigId()).orElse(llmConfig),
+                    pending.llmModel()
+            );
+        }
         String effectiveMessage = pending != null ? pending.message() : message;
         String effectiveRunId = runId != null && !runId.isBlank()
                 ? runId
@@ -143,6 +161,8 @@ public class ChatController {
                         resolvedAgentId,
                         userId,
                         effectiveMessage,
+                        pending != null ? pending.references() : java.util.List.of(),
+                        pending != null ? pending.attachments() : java.util.List.of(),
                         llmConfig != null ? llmConfig.configId() : null,
                         llmConfig != null ? llmConfig.provider() : null,
                         llmConfig != null ? llmConfig.model() : null
@@ -159,25 +179,19 @@ public class ChatController {
                 effectiveMessage,
                 false,
                 llmConfig != null ? llmConfig.configId() : null,
+                llmConfig != null ? llmConfig.model() : null,
                 pending != null ? pending.references() : java.util.List.of(),
                 pending != null ? pending.attachments() : java.util.List.of()
         );
         return agentRunner.run(runRequest)
                 .doOnNext(event -> log.debug("chat.stream.event runId={}, type={}, content={}",
-                        event.runId(), event.type(), abbreviate(event.content())))
+                        event.runId(), event.type(), event.content()))
                 .doOnComplete(() -> log.info("chat.stream.complete runId={}, sessionId={}", effectiveRunId, sessionId))
                 .doOnError(error -> log.error("chat.stream.error runId={}, sessionId={}", effectiveRunId, sessionId, error))
                 .map(event -> ServerSentEvent.<String>builder(event.content())
                         .event(event.type().name())
                         .id(event.runId())
                         .build());
-    }
-
-    private static String abbreviate(String content) {
-        if (content == null) {
-            return "";
-        }
-        return content.length() <= 160 ? content : content.substring(0, 160) + "...";
     }
 
     private java.util.List<ChatContextReference> toDomainReferences(ChatSendRequest request) {
@@ -198,5 +212,25 @@ public class ChatController {
                 .filter(item -> item != null && item.name() != null && item.content() != null)
                 .map(item -> new ChatAttachment(item.name(), item.contentType(), item.content()))
                 .toList();
+    }
+
+    private LlmConfigDescriptor applyModelOverride(LlmConfigDescriptor config, String requestedModel) {
+        if (config == null || requestedModel == null || requestedModel.isBlank()) {
+            return config;
+        }
+        String model = requestedModel.trim();
+        return new LlmConfigDescriptor(
+                config.configId(),
+                config.provider(),
+                config.displayName(),
+                model,
+                config.modelMappingJson(),
+                config.baseUrl(),
+                config.apiKey(),
+                config.chatPath(),
+                config.stream(),
+                config.enabled(),
+                config.defaultConfig()
+        );
     }
 }

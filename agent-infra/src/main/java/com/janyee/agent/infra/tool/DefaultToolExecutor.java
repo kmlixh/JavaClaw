@@ -14,10 +14,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.regex.Pattern;
+
 @Component
 public class DefaultToolExecutor implements ToolExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(DefaultToolExecutor.class);
+    private static final Pattern JSON_SECRET_PATTERN = Pattern.compile(
+            "(?i)\"(password|apiKey|api_key|token|accessToken|access_token)\"\\s*:\\s*\"([^\"]*)\""
+    );
+    private static final Pattern KV_SECRET_PATTERN = Pattern.compile(
+            "(?i)(password|apiKey|api_key|token|accessToken|access_token)\\s*=\\s*([^,\\s\\]}]+)"
+    );
 
     private final ToolRegistry toolRegistry;
 
@@ -32,7 +40,7 @@ public class DefaultToolExecutor implements ToolExecutor {
 
         long start = System.currentTimeMillis();
         log.info("tool.execute.start runId={}, toolName={}, arguments={}",
-                context.runId(), decision.normalizedToolName(), abbreviate(decision.normalizedArgumentsJson()));
+                context.runId(), decision.normalizedToolName(), redactSecrets(decision.normalizedArgumentsJson()));
         try {
             ToolResult toolResult = tool.execute(new ToolInvocation(
                     context.agentId(),
@@ -57,7 +65,7 @@ public class DefaultToolExecutor implements ToolExecutor {
                     toolResult.ok(),
                     outcome.durationMillis(),
                     toolResult.error(),
-                    abbreviate(toolResult.summary()));
+                    safe(toolResult.summary()));
             return outcome;
         } catch (Exception error) {
             log.error("tool.execute.error runId={}, toolName={}", context.runId(), decision.normalizedToolName(), error);
@@ -65,10 +73,20 @@ public class DefaultToolExecutor implements ToolExecutor {
         }
     }
 
-    private String abbreviate(String value) {
+    private String safe(String value) {
         if (value == null) {
             return "";
         }
-        return value.length() <= 200 ? value : value.substring(0, 200) + "...";
+        return value;
+    }
+
+    private String redactSecrets(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String redacted = JSON_SECRET_PATTERN.matcher(value)
+                .replaceAll("\"$1\":\"***\"");
+        return KV_SECRET_PATTERN.matcher(redacted)
+                .replaceAll("$1=***");
     }
 }

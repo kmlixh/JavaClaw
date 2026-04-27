@@ -26,6 +26,9 @@ public class LlmProviderConfigEntity {
     @Column(name = "model", nullable = false, length = 255)
     private String model;
 
+    @Column(name = "model_mapping_json", nullable = false, columnDefinition = "TEXT")
+    private String modelMappingJson;
+
     @Column(name = "base_url", nullable = false, length = 255)
     private String baseUrl;
 
@@ -80,6 +83,14 @@ public class LlmProviderConfigEntity {
 
     public void setModel(String model) {
         this.model = model;
+    }
+
+    public String getModelMappingJson() {
+        return modelMappingJson;
+    }
+
+    public void setModelMappingJson(String modelMappingJson) {
+        this.modelMappingJson = modelMappingJson;
     }
 
     public String getBaseUrl() {
@@ -143,6 +154,9 @@ public class LlmProviderConfigEntity {
         Instant now = Instant.now();
         this.createdAt = now;
         this.updatedAt = now;
+        if (this.modelMappingJson == null || this.modelMappingJson.isBlank()) {
+            this.modelMappingJson = "{\"models\":[]}";
+        }
     }
 
     @PreUpdate

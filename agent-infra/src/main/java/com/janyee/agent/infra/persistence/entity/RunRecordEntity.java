@@ -41,6 +41,28 @@ public class RunRecordEntity {
     @Column(name = "detail", columnDefinition = "TEXT")
     private String detail;
 
+    @Column(name = "request_message", columnDefinition = "TEXT")
+    private String requestMessage;
+
+    @Column(name = "request_references_json", columnDefinition = "TEXT")
+    private String requestReferencesJson;
+
+    @Column(name = "request_attachments_json", columnDefinition = "TEXT")
+    private String requestAttachmentsJson;
+
+    // Snapshot of the current RunPlan (toSnapshot() serialized). Updated on every plan
+    // mutation — create/update/auto-seed. Historical runs surface this so users can see
+    // "how did this run plan its steps" retroactively. Null for runs with no plan.
+    @Column(name = "plan_json", columnDefinition = "TEXT")
+    private String planJson;
+
+    // V23: 多租户字段
+    @Column(name = "tenant_id", length = 64)
+    private String tenantId;
+
+    @Column(name = "app_id", length = 64)
+    private String appId;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -118,6 +140,43 @@ public class RunRecordEntity {
     public void setDetail(String detail) {
         this.detail = detail;
     }
+
+    public String getRequestMessage() {
+        return requestMessage;
+    }
+
+    public void setRequestMessage(String requestMessage) {
+        this.requestMessage = requestMessage;
+    }
+
+    public String getRequestReferencesJson() {
+        return requestReferencesJson;
+    }
+
+    public void setRequestReferencesJson(String requestReferencesJson) {
+        this.requestReferencesJson = requestReferencesJson;
+    }
+
+    public String getRequestAttachmentsJson() {
+        return requestAttachmentsJson;
+    }
+
+    public void setRequestAttachmentsJson(String requestAttachmentsJson) {
+        this.requestAttachmentsJson = requestAttachmentsJson;
+    }
+
+    public String getPlanJson() {
+        return planJson;
+    }
+
+    public void setPlanJson(String planJson) {
+        this.planJson = planJson;
+    }
+
+    public String getTenantId() { return tenantId; }
+    public void setTenantId(String tenantId) { this.tenantId = tenantId; }
+    public String getAppId() { return appId; }
+    public void setAppId(String appId) { this.appId = appId; }
 
     public Instant getCreatedAt() {
         return createdAt;

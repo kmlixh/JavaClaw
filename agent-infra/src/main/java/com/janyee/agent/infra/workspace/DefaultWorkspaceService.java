@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -86,37 +87,58 @@ public class DefaultWorkspaceService implements WorkspaceService {
 
     @Override
     public List<WorkspaceKnowledgeFile> listKnowledgeFiles(String agentId) {
-        List<WorkspaceKnowledgeFile> builtinFiles = BuiltinDocumentWorkflowCatalog.knowledgeFiles();
-        List<WorkspaceKnowledgeFile> databaseFiles = knowledgeEntryRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
+        // Plan A Phase 3: DB 是 knowledge 的唯一真相源；workspace 文件只做为 fallback，只在
+        // DB 里没有同名条目时才挤进 prompt，这样避免"两份同名知识并列渲染让 LLM 分不清用哪份"。
+        //
+        // 输出的 relativePath 用 "db/<title>" / "builtin/<path>" / "workspace/<relative>" 前缀
+        // 明示来源 —— prompt 里 LLM 能看出来这份知识的出处，排查起来方便。
+
+        List<WorkspaceKnowledgeFile> builtinFiles = BuiltinDocumentWorkflowCatalog.knowledgeFiles().stream()
+                .map(f -> new WorkspaceKnowledgeFile("builtin/" + f.relativePath(), f.content()))
+                .toList();
+
+        List<WorkspaceKnowledgeFile> databaseFiles = knowledgeEntryRepository
+                .findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
                 .limit(10)
                 .map(entity -> new WorkspaceKnowledgeFile(
                         "db/" + entity.getTitle(),
                         entity.getContent()
                 ))
                 .toList();
-        Path knowledgeRoot = getWorkspaceRoot(agentId).resolve("knowledge").normalize();
-        if (!Files.exists(knowledgeRoot) || !Files.isDirectory(knowledgeRoot)) {
-            return Stream.concat(Stream.concat(builtinFiles.stream(), databaseFiles.stream()), Stream.<WorkspaceKnowledgeFile>empty())
-                    .limit(20)
-                    .toList();
-        }
 
-        try (Stream<Path> stream = Files.walk(knowledgeRoot, 2)) {
-            List<WorkspaceKnowledgeFile> fileBased = stream
-                    .filter(Files::isRegularFile)
-                    .sorted(Comparator.naturalOrder())
-                    .limit(10)
-                    .map(path -> new WorkspaceKnowledgeFile(
-                            knowledgeRoot.relativize(path).toString().replace('\\', '/'),
-                            readFile(path)
-                    ))
-                    .toList();
-            return Stream.concat(Stream.concat(builtinFiles.stream(), databaseFiles.stream()), fileBased.stream())
-                    .limit(20)
-                    .toList();
-        } catch (IOException error) {
-            throw new IllegalStateException("failed to list knowledge files for agent: " + agentId, error);
+        // 收集 DB 里的 title（小写），用于对 workspace 文件做去重
+        java.util.Set<String> dbTitles = databaseFiles.stream()
+                .map(f -> f.relativePath().substring("db/".length()).toLowerCase(Locale.ROOT).trim())
+                .collect(java.util.stream.Collectors.toSet());
+
+        List<WorkspaceKnowledgeFile> result = new java.util.ArrayList<>(builtinFiles);
+        result.addAll(databaseFiles);
+
+        Path knowledgeRoot = getWorkspaceRoot(agentId).resolve("knowledge").normalize();
+        if (Files.exists(knowledgeRoot) && Files.isDirectory(knowledgeRoot)) {
+            try (Stream<Path> stream = Files.walk(knowledgeRoot, 2)) {
+                List<WorkspaceKnowledgeFile> fileBased = stream
+                        .filter(Files::isRegularFile)
+                        .sorted(Comparator.naturalOrder())
+                        .limit(10)
+                        .map(path -> {
+                            String rel = knowledgeRoot.relativize(path).toString().replace('\\', '/');
+                            return new WorkspaceKnowledgeFile("workspace/" + rel, readFile(path));
+                        })
+                        // 去重：文件名与 DB title 匹配就跳过（DB 优先）
+                        .filter(f -> {
+                            String rel = f.relativePath().substring("workspace/".length());
+                            String basename = rel.contains("/") ? rel.substring(rel.lastIndexOf('/') + 1) : rel;
+                            if (basename.endsWith(".md")) basename = basename.substring(0, basename.length() - 3);
+                            return !dbTitles.contains(basename.toLowerCase(Locale.ROOT).trim());
+                        })
+                        .toList();
+                result.addAll(fileBased);
+            } catch (IOException error) {
+                throw new IllegalStateException("failed to list knowledge files for agent: " + agentId, error);
+            }
         }
+        return result.stream().limit(20).toList();
     }
 
     @Override
@@ -129,7 +151,7 @@ public class DefaultWorkspaceService implements WorkspaceService {
         if (!databaseTools.isEmpty()) {
             return new WorkspaceToolPolicy(
                     WorkspaceToolPolicy.Mode.ALLOW_LIST,
-                    Set.copyOf(databaseTools),
+                    mergeBuiltinAllow(databaseTools, Set.of()),
                     Set.of()
             );
         }
@@ -149,7 +171,21 @@ public class DefaultWorkspaceService implements WorkspaceService {
         WorkspaceToolPolicy.Mode mode = parseMode(policyRoot.get("mode"));
         Set<String> allow = readToolNames(policyRoot.get("allow"));
         Set<String> deny = readToolNames(policyRoot.get("deny"));
+        if (mode == WorkspaceToolPolicy.Mode.ALLOW_LIST) {
+            allow = mergeBuiltinAllow(allow, deny);
+        }
         return new WorkspaceToolPolicy(mode, allow, deny);
+    }
+
+    private Set<String> mergeBuiltinAllow(Collection<String> explicitAllow, Set<String> deny) {
+        Set<String> merged = new LinkedHashSet<>(explicitAllow);
+        for (String builtin : BuiltinDocumentWorkflowCatalog.builtinToolNames()) {
+            String normalized = WorkspaceToolPolicy.normalize(builtin);
+            if (!normalized.isBlank() && !deny.contains(normalized)) {
+                merged.add(normalized);
+            }
+        }
+        return Set.copyOf(merged);
     }
 
     private String readFile(Path path) {

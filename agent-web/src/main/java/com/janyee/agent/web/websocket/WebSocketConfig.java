@@ -12,9 +12,15 @@ import java.util.Map;
 public class WebSocketConfig {
 
     @Bean
-    public HandlerMapping webSocketMapping(ChatWebSocketHandler chatWebSocketHandler) {
+    public HandlerMapping webSocketMapping(
+            ChatWebSocketHandler chatWebSocketHandler,
+            BridgeWebSocketHandler bridgeWebSocketHandler
+    ) {
         SimpleUrlHandlerMapping mapping = new SimpleUrlHandlerMapping();
-        mapping.setUrlMap(Map.of("/ws/chat", chatWebSocketHandler));
+        mapping.setUrlMap(Map.of(
+                "/ws/chat", chatWebSocketHandler,
+                "/ws/bridge", bridgeWebSocketHandler
+        ));
         mapping.setOrder(-1);
         return mapping;
     }

@@ -5,6 +5,7 @@ public record LlmConfigResponse(
         String provider,
         String displayName,
         String model,
+        String modelMappingJson,
         boolean stream,
         boolean defaultConfig
 ) {

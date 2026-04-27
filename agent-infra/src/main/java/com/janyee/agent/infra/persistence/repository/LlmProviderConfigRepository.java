@@ -7,6 +7,8 @@ import java.util.List;
 import java.util.Optional;
 
 public interface LlmProviderConfigRepository extends JpaRepository<LlmProviderConfigEntity, String> {
+    java.util.List<LlmProviderConfigEntity> findAllByOrderByDisplayNameAsc();
+
     List<LlmProviderConfigEntity> findByEnabledTrueOrderByDisplayNameAsc();
 
     Optional<LlmProviderConfigEntity> findFirstByEnabledTrueAndDefaultConfigTrueOrderByDisplayNameAsc();

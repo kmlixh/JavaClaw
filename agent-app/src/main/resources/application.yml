@@ -21,10 +21,14 @@ spring:
     enabled: true
 
 agent:
+  auth:
+    # P4: 强制登录;关掉匿名兜底,所有 /api/* /oauth/* /ws/* 必须带 JWT。
+    # 临时回退本地开发可在 application-postgres.yml 或环境变量里覆盖为 true。
+    anonymous-enabled: false
   workspace-root: ./workspaces
   default-agent-id: dev-agent
   runtime:
-    max-tool-iterations: 5
+    max-tool-iterations: 100
     stream-buffer-size: 256
   llm:
     enabled: false

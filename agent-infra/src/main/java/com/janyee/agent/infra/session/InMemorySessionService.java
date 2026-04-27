@@ -83,6 +83,12 @@ public class InMemorySessionService implements SessionService {
         session.setUserId(userId);
         session.setChannel("web");
         session.setStatus("ACTIVE");
+        // P3:从当前认证上下文读 tenant/app 写进新 session。匿名期默认 SYSTEM + system-default,
+        // 和 V24 backfill 的老数据口径一致。
+        com.janyee.agent.infra.auth.AuthPrincipal principal =
+                com.janyee.agent.infra.auth.SecurityContextHolder.current();
+        session.setTenantId(principal.tenantId());
+        session.setAppId(principal.appId());
         return sessionRepository.save(session);
     }
 

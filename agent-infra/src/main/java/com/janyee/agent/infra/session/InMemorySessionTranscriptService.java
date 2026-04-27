@@ -17,14 +17,27 @@ public class InMemorySessionTranscriptService implements SessionTranscriptServic
 
     @Override
     @Transactional
-    public void appendUserMessage(String sessionId, String runId, String content) {
-        saveMessage(sessionId, runId, "user", "chat", content);
+    public void appendUserMessage(String sessionId, String runId, String content, String referencesJson, String attachmentsJson) {
+        SessionMessageEntity entity = new SessionMessageEntity();
+        entity.setSessionId(sessionId);
+        entity.setRunId(runId);
+        entity.setRole("user");
+        entity.setMessageType("chat");
+        entity.setContent(content);
+        entity.setReferencesJson(blankToNull(referencesJson));
+        entity.setAttachmentsJson(blankToNull(attachmentsJson));
+        entity.setSeqNo(sessionMessageRepository.findMaxSeqNoBySessionId(sessionId) + 1);
+        sessionMessageRepository.save(entity);
     }
 
     @Override
     @Transactional
     public void appendAssistantMessage(String sessionId, String runId, String content) {
         saveMessage(sessionId, runId, "assistant", "chat", content);
+    }
+
+    private String blankToNull(String value) {
+        return (value == null || value.isBlank()) ? null : value;
     }
 
     @Override

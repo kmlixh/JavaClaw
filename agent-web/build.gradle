@@ -1,8 +1,13 @@
 dependencies {
     implementation project(':agent-api')
     implementation project(':agent-domain')
+    // P2:AuthController / JwtAuthWebFilter 需要 JwtService / AuthService / SecurityContextHolder
+    // 这些都在 agent-infra,agent-infra 不依赖 agent-web,无环。
+    implementation project(':agent-infra')
     implementation project(':agent-runtime')
     implementation project(':agent-security')
+    // JWT parsing needs to see Jwts/JwtException types in controller/filter signatures.
+    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-webflux'
 }

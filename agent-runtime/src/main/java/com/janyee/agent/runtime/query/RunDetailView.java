@@ -13,6 +13,11 @@ public record RunDetailView(
         String llmModel,
         String status,
         String detail,
+        String requestMessage,
+        String requestReferencesJson,
+        String requestAttachmentsJson,
+        // Snapshot of the run's plan. Nullable — only runs with a plan carry this.
+        String planJson,
         Instant createdAt,
         Instant updatedAt,
         List<ToolAuditLogView> toolAudits,

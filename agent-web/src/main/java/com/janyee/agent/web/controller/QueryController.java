@@ -2,8 +2,10 @@ package com.janyee.agent.web.controller;
 
 import com.janyee.agent.api.AgentDefinitionResponse;
 import com.janyee.agent.api.ArtifactResponse;
+import com.janyee.agent.api.CancelRunResponse;
 import com.janyee.agent.api.LlmConfigResponse;
 import com.janyee.agent.api.RunDetailResponse;
+import com.janyee.agent.api.RunSummaryResponse;
 import com.janyee.agent.api.SearchResponse;
 import com.janyee.agent.api.SessionDetailResponse;
 import com.janyee.agent.api.SessionMessageResponse;
@@ -11,6 +13,7 @@ import com.janyee.agent.api.SessionSummaryResponse;
 import com.janyee.agent.api.SessionTitleUpdateRequest;
 import com.janyee.agent.api.MemoryNoteResponse;
 import com.janyee.agent.api.ToolAuditLogResponse;
+import com.janyee.agent.domain.RunStatus;
 import com.janyee.agent.runtime.artifact.ArtifactBinary;
 import com.janyee.agent.runtime.artifact.ArtifactService;
 import com.janyee.agent.runtime.agent.AgentDefinitionService;
@@ -18,7 +21,10 @@ import com.janyee.agent.runtime.model.LlmConfigService;
 import com.janyee.agent.runtime.query.AgentQueryService;
 import com.janyee.agent.runtime.query.RunDetailView;
 import com.janyee.agent.runtime.query.SessionDetailView;
+import com.janyee.agent.runtime.run.RunCancellationRegistry;
+import com.janyee.agent.runtime.run.RunRecordService;
 import com.janyee.agent.runtime.session.SessionService;
+import com.janyee.agent.infra.auth.PermissionGate;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -42,19 +48,25 @@ public class QueryController {
     private final LlmConfigService llmConfigService;
     private final SessionService sessionService;
     private final ArtifactService artifactService;
+    private final RunCancellationRegistry cancellationRegistry;
+    private final RunRecordService runRecordService;
 
     public QueryController(
             AgentQueryService agentQueryService,
             AgentDefinitionService agentDefinitionService,
             LlmConfigService llmConfigService,
             SessionService sessionService,
-            ArtifactService artifactService
+            ArtifactService artifactService,
+            RunCancellationRegistry cancellationRegistry,
+            RunRecordService runRecordService
     ) {
         this.agentQueryService = agentQueryService;
         this.agentDefinitionService = agentDefinitionService;
         this.llmConfigService = llmConfigService;
         this.sessionService = sessionService;
         this.artifactService = artifactService;
+        this.cancellationRegistry = cancellationRegistry;
+        this.runRecordService = runRecordService;
     }
 
     @GetMapping("/agents")
@@ -76,6 +88,7 @@ public class QueryController {
                         config.provider(),
                         config.displayName(),
                         config.model(),
+                        config.modelMappingJson(),
                         config.stream(),
                         config.defaultConfig()
                 ))
@@ -122,6 +135,8 @@ public class QueryController {
                                 message.toolName(),
                                 message.toolArgsJson(),
                                 message.toolResultJson(),
+                                message.referencesJson(),
+                                message.attachmentsJson(),
                                 message.seqNo(),
                                 message.createdAt()
                         ))
@@ -146,6 +161,95 @@ public class QueryController {
     @GetMapping("/runs/{id}")
     public RunDetailResponse getRun(@PathVariable("id") String id) {
         RunDetailView view = agentQueryService.getRun(id);
+        return toRunDetailResponse(view);
+    }
+
+    @GetMapping("/sessions/{id}/runs")
+    public java.util.List<RunSummaryResponse> listRunsBySession(@PathVariable("id") String id) {
+        return agentQueryService.listRunsBySession(id).stream()
+                .map(view -> new RunSummaryResponse(
+                        view.runId(),
+                        view.sessionId(),
+                        view.status(),
+                        view.detail(),
+                        view.createdAt(),
+                        view.updatedAt()
+                ))
+                .toList();
+    }
+
+    @GetMapping("/sessions/{id}/active-run")
+    public ResponseEntity<RunDetailResponse> getActiveRun(@PathVariable("id") String id) {
+        return agentQueryService.findActiveRun(id)
+                .map(this::toRunDetailResponse)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.noContent().build());
+    }
+
+    /**
+     * List runs currently executing on this process. The UI uses this to render the
+     * "running tasks" dock with a terminate button per row.
+     */
+    @GetMapping("/runs/active")
+    public java.util.List<RunDetailResponse> listActiveRuns() {
+        java.util.List<RunDetailResponse> result = new java.util.ArrayList<>();
+        for (String runId : cancellationRegistry.activeRunIds()) {
+            try {
+                RunDetailView view = agentQueryService.getRun(runId);
+                result.add(toRunDetailResponse(view));
+            } catch (Exception ignored) {
+                // DB race: run was registered in memory but the record is not yet visible.
+                // Dropping the row here is acceptable — UI polls and will pick it up next tick.
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Cancel an in-progress run. Three paths:
+     *   1. Registry has the run → flip the cancel flag; orchestrator exits cleanly.
+     *   2. Registry is empty but DB still shows a non-terminal status → force DB to CANCELLED
+     *      (zombie reconcile). Makes the UI's terminate button idempotent and useful even
+     *      after a backend restart.
+     *   3. Neither applies → 404.
+     */
+    @PostMapping("/runs/{id}/cancel")
+    public ResponseEntity<CancelRunResponse> cancelRun(@PathVariable("id") String id) {
+        PermissionGate.require("session.terminate");
+        boolean signalled = cancellationRegistry.requestCancel(id, "cancelled by user");
+        if (signalled) {
+            return ResponseEntity.ok(new CancelRunResponse(id, true, false,
+                    "Cancel signal delivered; run will exit on next iteration checkpoint."));
+        }
+        // Try DB-fallback: if the DB still thinks the run is in-progress but no live context
+        // exists on this process, the run is dead — flip the DB record so the UI isn't stuck.
+        try {
+            RunDetailView view = agentQueryService.getRun(id);
+            if (view != null && isNonTerminal(view.status())) {
+                runRecordService.updateStatus(id, RunStatus.CANCELLED,
+                        "cancelled by user (no live execution on this process)");
+                return ResponseEntity.ok(new CancelRunResponse(id, false, true,
+                        "Run was not active on this process; forced DB status to CANCELLED."));
+            }
+        } catch (Exception ignored) {
+            // Fall through to 404
+        }
+        return ResponseEntity.status(404)
+                .body(new CancelRunResponse(id, false, false,
+                        "Run not found or already in a terminal state."));
+    }
+
+    private boolean isNonTerminal(String status) {
+        if (status == null) {
+            return false;
+        }
+        return switch (status.toUpperCase()) {
+            case "COMPLETED", "FAILED", "CANCELLED" -> false;
+            default -> true;
+        };
+    }
+
+    private RunDetailResponse toRunDetailResponse(RunDetailView view) {
         return new RunDetailResponse(
                 view.runId(),
                 view.sessionId(),
@@ -156,6 +260,10 @@ public class QueryController {
                 view.llmModel(),
                 view.status(),
                 view.detail(),
+                view.requestMessage(),
+                view.requestReferencesJson(),
+                view.requestAttachmentsJson(),
+                view.planJson(),
                 view.createdAt(),
                 view.updatedAt(),
                 view.toolAudits().stream()
@@ -226,6 +334,8 @@ public class QueryController {
                                 message.toolName(),
                                 message.toolArgsJson(),
                                 message.toolResultJson(),
+                                message.referencesJson(),
+                                message.attachmentsJson(),
                                 message.seqNo(),
                                 message.createdAt()
                         ))
@@ -271,8 +381,45 @@ public class QueryController {
                 : MediaType.APPLICATION_OCTET_STREAM;
         return ResponseEntity.ok()
                 .contentType(mediaType)
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + artifact.artifact().name() + "\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, buildContentDisposition(artifact.artifact().name()))
                 .contentLength(artifact.content().length)
                 .body(new ByteArrayResource(artifact.content()));
+    }
+
+    /**
+     * Content-Disposition 头的 {@code filename=} 参数只认 ASCII —— 中文文件名到浏览器就被替换成
+     * 下划线，所以必须用 RFC 5987 的 {@code filename*=UTF-8''<percent-encoded>} 形式。
+     *
+     * <p>同时保留 {@code filename="..."} 作为 ASCII 降级值（把非 ASCII 字符换成 {@code _}），给不懂
+     * filename* 的老客户端看。支持 filename* 的现代浏览器（Chrome/Firefox/Edge/Safari）会优先解析
+     * filename*，从而拿到带中文的原始名。</p>
+     */
+    static String buildContentDisposition(String rawName) {
+        String safeName = rawName == null || rawName.isBlank() ? "artifact" : rawName;
+        String asciiFallback = toAsciiFallback(safeName);
+        String utf8Encoded = java.net.URLEncoder.encode(safeName, java.nio.charset.StandardCharsets.UTF_8)
+                .replace("+", "%20");
+        return "attachment; filename=\"" + asciiFallback + "\"; filename*=UTF-8''" + utf8Encoded;
+    }
+
+    /**
+     * Keep ASCII chars and the common safe punctuation; collapse other bytes to {@code _} so old
+     * clients still see a reasonable name. Avoids double quotes / CR / LF that would break the
+     * header itself.
+     */
+    private static String toAsciiFallback(String name) {
+        StringBuilder builder = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c <= 0x1F || c == 0x7F || c == '"' || c == '\\') {
+                builder.append('_');
+            } else if (c <= 0x7F) {
+                builder.append(c);
+            } else {
+                builder.append('_');
+            }
+        }
+        String trimmed = builder.toString().trim();
+        return trimmed.isEmpty() ? "artifact" : trimmed;
     }
 }

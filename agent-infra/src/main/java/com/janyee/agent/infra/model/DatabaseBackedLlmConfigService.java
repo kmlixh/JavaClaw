@@ -73,6 +73,9 @@ public class DatabaseBackedLlmConfigService implements LlmConfigService {
                 defaultIfBlank(llm.provider(), "openai-compatible"),
                 "Application Default",
                 llm.model(),
+                llm.model() == null || llm.model().isBlank()
+                        ? "{\"models\":[]}"
+                        : "{\"models\":[{\"displayName\":\"" + llm.model() + "\",\"apiModel\":\"" + llm.model() + "\"}]}",
                 llm.baseUrl(),
                 llm.apiKey(),
                 llm.chatPath(),
@@ -88,6 +91,7 @@ public class DatabaseBackedLlmConfigService implements LlmConfigService {
                 entity.getProvider(),
                 entity.getDisplayName(),
                 entity.getModel(),
+                entity.getModelMappingJson(),
                 entity.getBaseUrl(),
                 entity.getApiKey(),
                 entity.getChatPath(),

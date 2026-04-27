@@ -5,6 +5,7 @@ public record LlmConfigDescriptor(
         String provider,
         String displayName,
         String model,
+        String modelMappingJson,
         String baseUrl,
         String apiKey,
         String chatPath,

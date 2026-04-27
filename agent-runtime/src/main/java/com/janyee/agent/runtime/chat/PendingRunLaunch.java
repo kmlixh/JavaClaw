@@ -11,6 +11,7 @@ public record PendingRunLaunch(
         String agentId,
         String userId,
         String llmConfigId,
+        String llmModel,
         String message,
         List<ChatContextReference> references,
         List<ChatAttachment> attachments

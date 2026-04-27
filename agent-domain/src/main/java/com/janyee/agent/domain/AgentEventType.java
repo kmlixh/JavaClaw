@@ -8,6 +8,8 @@ public enum AgentEventType {
     TOOL_STARTED,
     TOOL_COMPLETED,
     APPROVAL_REQUIRED,
+    PLAN_UPDATED,
     RUN_COMPLETED,
-    RUN_FAILED
+    RUN_FAILED,
+    RUN_CANCELLED
 }

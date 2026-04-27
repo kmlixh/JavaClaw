@@ -12,8 +12,15 @@ dependencies {
     implementation 'io.projectreactor.netty:reactor-netty-http'
     implementation 'org.apache.poi:poi-ooxml:5.2.5'
     implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
     implementation 'org.yaml:snakeyaml'
     implementation 'io.projectreactor:reactor-core'
+    // BCrypt for password hashing. 不引整个 starter-security,只需要密码加密器,轻量。
+    implementation 'org.springframework.security:spring-security-crypto'
+    // JJWT:JWT 签发 + 验证。P2 自己实现认证,不走 Spring Security 的过滤器链。
+    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
+    runtimeOnly    'io.jsonwebtoken:jjwt-impl:0.12.6'
+    runtimeOnly    'io.jsonwebtoken:jjwt-jackson:0.12.6'
     runtimeOnly 'com.h2database:h2'
     runtimeOnly 'org.postgresql:postgresql'
 }

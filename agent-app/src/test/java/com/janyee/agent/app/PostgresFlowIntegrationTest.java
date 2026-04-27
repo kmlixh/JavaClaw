@@ -65,6 +65,7 @@ class PostgresFlowIntegrationTest {
                         "dev-agent",
                         "junit-user",
                         TEST_LLM_ID,
+                        "Pro/zai-org/GLM-4.7",
                         "/tool echo postgres junit",
                         java.util.List.of(),
                         java.util.List.of()
@@ -85,6 +86,7 @@ class PostgresFlowIntegrationTest {
                         .queryParam("sessionId", accepted.sessionId())
                         .queryParam("agentId", accepted.agentId())
                         .queryParam("llmConfigId", accepted.llmConfigId())
+                        .queryParam("llmModel", "Pro/zai-org/GLM-4.7")
                         .queryParam("userId", "junit-user")
                         .queryParam("message", "/tool echo postgres junit")
                         .build())

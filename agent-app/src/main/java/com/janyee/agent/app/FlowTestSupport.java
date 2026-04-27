@@ -104,6 +104,7 @@ final class FlowTestSupport {
                         "dev-agent",
                         "smoke-user",
                         llmConfigId,
+                        expectedModel,
                         message,
                         java.util.List.of(),
                         java.util.List.of()
@@ -123,6 +124,7 @@ final class FlowTestSupport {
                         .queryParam("sessionId", accepted.sessionId())
                         .queryParam("agentId", accepted.agentId())
                         .queryParam("llmConfigId", accepted.llmConfigId())
+                        .queryParam("llmModel", expectedModel)
                         .queryParam("userId", "smoke-user")
                         .queryParam("message", message)
                         .build())
