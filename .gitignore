@@ -15,3 +15,7 @@ FIRST_ADMIN_PASSWORD.txt
 
 # Claude session 数据
 .claude/
+
+# 本地临时 / 调试日志
+tmp/
+*.log
