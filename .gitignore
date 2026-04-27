@@ -1,8 +1,17 @@
 .gradle/
+.gradle-user/
 .m2/
 build/
 **/build/
 .idea/
+*.iml
 web-console/node_modules/
 web-console/dist/
 web-console/.vite/
+
+# 本地运行时产物 / 敏感数据 —— 永不入仓
+JWT_SECRET.txt
+FIRST_ADMIN_PASSWORD.txt
+
+# Claude session 数据
+.claude/
