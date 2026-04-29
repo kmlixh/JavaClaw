@@ -19,3 +19,7 @@ FIRST_ADMIN_PASSWORD.txt
 # 本地临时 / 调试日志
 tmp/
 *.log
+
+# Agent 运行时 LLM 产出物 (artifacts/{runId}/...) —— 永不入仓
+workspaces/**/artifacts/
+agent-app/workspaces/**/artifacts/
