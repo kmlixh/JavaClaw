@@ -53,6 +53,28 @@ public class LlmProviderConfigEntity {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
+    // ===== 通用 scope =====
+    @Column(name = "scope_type", length = 32, nullable = false)
+    private String scopeType;
+
+    @Column(name = "scope_tenant_id", length = 64)
+    private String scopeTenantId;
+
+    @Column(name = "scope_user_id", length = 64)
+    private String scopeUserId;
+
+    @Column(name = "app_id", length = 64)
+    private String appId;
+
+    public String getScopeType() { return scopeType; }
+    public void setScopeType(String scopeType) { this.scopeType = scopeType; }
+    public String getScopeTenantId() { return scopeTenantId; }
+    public void setScopeTenantId(String scopeTenantId) { this.scopeTenantId = scopeTenantId; }
+    public String getScopeUserId() { return scopeUserId; }
+    public void setScopeUserId(String scopeUserId) { this.scopeUserId = scopeUserId; }
+    public String getAppId() { return appId; }
+    public void setAppId(String appId) { this.appId = appId; }
+
     public String getId() {
         return id;
     }
@@ -156,6 +178,9 @@ public class LlmProviderConfigEntity {
         this.updatedAt = now;
         if (this.modelMappingJson == null || this.modelMappingJson.isBlank()) {
             this.modelMappingJson = "{\"models\":[]}";
+        }
+        if (this.scopeType == null || this.scopeType.isBlank()) {
+            this.scopeType = "SYSTEM";
         }
     }
 

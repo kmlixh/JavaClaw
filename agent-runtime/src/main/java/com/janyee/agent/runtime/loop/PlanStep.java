@@ -26,6 +26,14 @@ public class PlanStep {
     // step is IN_PROGRESS, so PlanStepRuleEvaluator can verify required heading anchors.
     private String artifactContent = "";
     private String jdbcUrl = "";
+    /**
+     * Step IDs that must each be COMPLETED (or SKIPPED) before this step may transition to
+     * IN_PROGRESS. Materialized from {@link com.janyee.agent.runtime.skill.PlanStepRule#dependsOn()}
+     * at plan-create / plan-seed time, with a default-serial fallback applied by
+     * {@code SkillPlanSeeder} / {@code PlanCreateTool} when the skill didn't declare deps —
+     * each step gets {@code [previousStepId]} so old skills get strict serial behavior.
+     */
+    private List<String> dependsOn = List.of();
 
     public PlanStep(String id, String title, String toolHint, String expectedOutput) {
         if (id == null || id.isBlank()) {
@@ -57,6 +65,7 @@ public class PlanStep {
     public List<String> reportPlaceholders() { return reportPlaceholders; }
     public String artifactContent() { return artifactContent; }
     public String jdbcUrl() { return jdbcUrl; }
+    public List<String> dependsOn() { return dependsOn; }
 
     public void updateStatus(PlanStatus next) {
         if (next == null) {
@@ -125,5 +134,9 @@ public class PlanStep {
 
     public void setJdbcUrl(String jdbcUrl) {
         this.jdbcUrl = jdbcUrl == null ? "" : jdbcUrl;
+    }
+
+    public void setDependsOn(List<String> dependsOn) {
+        this.dependsOn = dependsOn == null ? List.of() : List.copyOf(dependsOn);
     }
 }

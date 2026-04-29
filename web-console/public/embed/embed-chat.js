@@ -461,8 +461,11 @@
     if (state.bootstrapDone) return;
     if (!state.accessToken) return;
     state.bootstrapDone = true;
+    setStatusLabel("loading");
     await loadAgents();
     await loadLlmConfigs();
+    setStatusLabel("ready");
+    appendBubble("system", "鉴权完成，已加载 Agent 与模型，可以开始对话。");
   }
 
   function handleHostMessage(event) {
@@ -470,7 +473,9 @@
     if (!data || typeof data !== "object" || !data.type) {
       return;
     }
+    console.log("[embed-chat] received message", { type: data.type, origin: event.origin });
     if (state.config.hostOrigin !== "*" && event.origin !== state.config.hostOrigin) {
+      console.warn("[embed-chat] dropped: origin mismatch", { expected: state.config.hostOrigin, got: event.origin });
       return;
     }
     if (data.type === "jc.embed.init") {

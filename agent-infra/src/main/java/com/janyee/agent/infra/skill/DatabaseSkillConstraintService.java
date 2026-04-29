@@ -101,6 +101,13 @@ public class DatabaseSkillConstraintService implements SkillConstraintService {
             if (ruleNode == null || !ruleNode.isObject()) {
                 continue;
             }
+            // dependsOn 必须区分"skill 没声明"和"skill 声明了空数组":前者走默认串行兜底,
+            // 后者明确表示"我是根 step,无前置"。用 has() 判断 key 是否存在。
+            boolean dependsOnDeclared = ruleNode.has("dependsOn");
+            List<String> dependsOnList = dependsOnDeclared
+                    ? readStringArray(ruleNode.path("dependsOn"))
+                    : List.of();
+            PlanStepRule.Acceptance acceptance = readAcceptance(ruleNode.path("acceptance"));
             rules.put(stepId.trim(), new PlanStepRule(
                     readStringArray(ruleNode.path("requiresSuccess")),
                     readStringArray(ruleNode.path("tableAllowList")),
@@ -113,10 +120,25 @@ public class DatabaseSkillConstraintService implements SkillConstraintService {
                     readStringArray(ruleNode.path("sqlTemplatesNoFilter")),
                     readReportSection(ruleNode.path("reportSection")),
                     ruleNode.path("jdbcUrl").asText(""),
-                    readStringArray(ruleNode.path("requiredTables"))
+                    readStringArray(ruleNode.path("requiredTables")),
+                    dependsOnList,
+                    dependsOnDeclared,
+                    acceptance
             ));
         }
         return rules;
+    }
+
+    private PlanStepRule.Acceptance readAcceptance(JsonNode node) {
+        if (node == null || !node.isObject() || node.isEmpty()) {
+            return PlanStepRule.Acceptance.NONE;
+        }
+        List<String> requiredColumns = readStringArray(node.path("requiredColumns"));
+        boolean requireNonZero = node.path("requireNonZeroData").asBoolean(false);
+        if (requiredColumns.isEmpty() && !requireNonZero) {
+            return PlanStepRule.Acceptance.NONE;
+        }
+        return new PlanStepRule.Acceptance(requiredColumns, requireNonZero);
     }
 
     private PlanStepRule.ReportSection readReportSection(JsonNode node) {

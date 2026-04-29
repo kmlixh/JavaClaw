@@ -42,6 +42,7 @@ public class ChatWebSocketHandler implements WebSocketHandler {
     private final RunEventStreamService runEventStreamService;
     private final ObjectMapper objectMapper;
     private final PendingRunLaunchStore pendingRunLaunchStore;
+    private final com.janyee.agent.infra.auth.JwtService jwtService;
 
     public ChatWebSocketHandler(
             AgentRunner agentRunner,
@@ -50,7 +51,8 @@ public class ChatWebSocketHandler implements WebSocketHandler {
             LlmConfigService llmConfigService,
             RunEventStreamService runEventStreamService,
             ObjectMapper objectMapper,
-            PendingRunLaunchStore pendingRunLaunchStore
+            PendingRunLaunchStore pendingRunLaunchStore,
+            com.janyee.agent.infra.auth.JwtService jwtService
     ) {
         this.agentRunner = agentRunner;
         this.runRecordService = runRecordService;
@@ -59,6 +61,24 @@ public class ChatWebSocketHandler implements WebSocketHandler {
         this.runEventStreamService = runEventStreamService;
         this.objectMapper = objectMapper;
         this.pendingRunLaunchStore = pendingRunLaunchStore;
+        this.jwtService = jwtService;
+    }
+
+    /**
+     * WS handshake 时 JwtAuthWebFilter 已经把 principal 塞进 exchange.attribute,但 WebFlux
+     * WebSocket 不一定把它复制到 session.handshakeInfo.attributes。最稳路径:从 query 的
+     * access_token 自己再解一次,得到 userId/tenantId/appId 三元组带进 RunRequest。
+     * 解析失败(token 无效 / 缺失)返回 null,RunRequest 三元组留空,SimpleAgentRunner 那边
+     * fallback 到匿名兜底,跟改造前老行为一致。
+     */
+    private com.janyee.agent.infra.auth.JwtService.ParsedToken parseHandshakeToken(Map<String, String> params) {
+        String token = params.get("access_token");
+        if (token == null || token.isBlank()) return null;
+        try {
+            return jwtService.parse(token);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     @Override
@@ -79,6 +99,25 @@ public class ChatWebSocketHandler implements WebSocketHandler {
                     .map(event -> toWebSocketMessage(session, event, params.get("agentId"))));
         }
 
+        // 从 access_token 解出 principal 三元组;成功后用真实 OAuth userId 顶替前端传的
+        // 数字字符串(SDK 注入的 form.userId 跟 app_user 表的字符串主键 ext:tenant:xxx
+        // 对不上,会让 listSessions 永远查不到)。设置 ThreadLocal 让本线程内调
+        // createAcceptedRun 的 JpaRunRecordService.SecurityContextHolder.current() 拿到
+        // 正确身份;真正的跨调度器线程恢复靠 RunRequest 携带三元组完成。
+        com.janyee.agent.infra.auth.JwtService.ParsedToken parsedToken = parseHandshakeToken(params);
+        String authUserId = parsedToken != null ? parsedToken.userId() : null;
+        String authTenantId = parsedToken != null ? parsedToken.tenantId() : null;
+        String authAppId = parsedToken != null ? parsedToken.appId() : null;
+        if (authUserId != null && !authUserId.isBlank()) {
+            userId = authUserId;
+            com.janyee.agent.infra.auth.SecurityContextHolder.setCurrent(
+                    new com.janyee.agent.infra.auth.AuthPrincipal(
+                            authUserId,
+                            authTenantId == null ? "system" : authTenantId,
+                            authAppId == null ? "system-default" : authAppId,
+                            java.util.Set.of(),
+                            false));
+        }
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("websocket", userId, sessionId, requestedAgentId));
         LlmConfigDescriptor llmConfig = applyModelOverride(
                 llmConfigService.resolveRequested(requestedLlmConfigId).orElse(null),
@@ -122,7 +161,10 @@ public class ChatWebSocketHandler implements WebSocketHandler {
                 llmConfig != null ? llmConfig.configId() : null,
                 llmConfig != null ? llmConfig.model() : null,
                 pending != null ? pending.references() : java.util.List.of(),
-                pending != null ? pending.attachments() : java.util.List.of()
+                pending != null ? pending.attachments() : java.util.List.of(),
+                authUserId,
+                authTenantId,
+                authAppId
         );
 
         return session.send(agentRunner.run(request)

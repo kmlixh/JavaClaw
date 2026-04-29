@@ -93,6 +93,23 @@ public class PlanUpdateTool implements AgentTool {
                 return new ToolResult(false, "invalid status",
                         "{}", "[]", "status must be one of PENDING/IN_PROGRESS/COMPLETED/FAILED/SKIPPED");
             }
+            // Wave barrier:转 IN_PROGRESS 之前,所有声明的 dependsOn step 必须已经 COMPLETED 或 SKIPPED。
+            // 这堵住"LLM 跳过 PENDING 兄弟 step 直接做下一波"的漏洞 —— 也是用户明确要求的"并行 step
+            // 全部完成才能下一步"。SKIPPED 也算 OK,因为 skill 允许某些 step 在 zeroRowsAllowed=false
+            // 等场景下直接跳过(例如某城市没有 5G 数据,5G step 标 SKIPPED 后续不该被它阻塞)。
+            if (nextStatus == PlanStatus.IN_PROGRESS && step.status() != PlanStatus.IN_PROGRESS) {
+                List<String> unmet = plan.unmetDependencies(step);
+                if (!unmet.isEmpty()) {
+                    String reason = "step '" + step.id()
+                            + "' cannot start: waiting on dependencies " + unmet
+                            + ". Finish each predecessor (mark COMPLETED via plan.update) "
+                            + "before advancing this step.";
+                    log.warn("plan.update.dependency_unmet runId={}, stepId={}, unmet={}",
+                            invocation.runId(), step.id(), unmet);
+                    return new ToolResult(false, "step blocked by dependencies",
+                            "{}", "[]", reason);
+                }
+            }
             if (nextStatus == PlanStatus.COMPLETED) {
                 String completionError = validateCompletion(step);
                 if (completionError != null) {

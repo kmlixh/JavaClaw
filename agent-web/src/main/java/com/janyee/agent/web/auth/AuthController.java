@@ -117,6 +117,37 @@ public class AuthController {
         }
     }
 
+    /**
+     * 用 OAuth access_token(typ=oauth)换一个 session cookie。专门给 iframe 浮动面板的
+     * "跳转到主控台"按钮用 —— iframe 里身份是 OAuth Bearer,只在 JS 内存有效,刷新就丢。
+     * 这条端点拿同一个 user/tenant/app 签一个 typ=session 的 JWT 写 AGENT_TOKEN cookie,
+     * cookie 是 HttpOnly + Lax + 有 maxAge,刷新页面后浏览器自动带回,后端 JwtAuthWebFilter
+     * 照常解析,不用每次都重新登录。
+     *
+     * <p>不需要请求体:JwtAuthWebFilter 已经从 Authorization: Bearer 把 OAuth token 解过,
+     * principal 直接从 SecurityContext 取就是当前 OAuth 身份。匿名(没带 token / token 失效)
+     * 直接 401。</p>
+     */
+    @PostMapping("/exchange-oauth")
+    public ResponseEntity<?> exchangeOauthToSession(ServerWebExchange exchange) {
+        AuthPrincipal current = SecurityContextHolder.current();
+        if (current == null || current.anonymous()
+                || current.userId() == null || current.userId().isBlank()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Map.of("code", "UNAUTHENTICATED",
+                            "message", "需要带有效的 OAuth access_token (Authorization: Bearer ...)"));
+        }
+        String token = jwtService.issueSessionToken(
+                current.userId(),
+                current.tenantId(),
+                current.appId() == null || current.appId().isBlank() ? "system-default" : current.appId());
+        exchange.getResponse().addCookie(buildCookie(token, sessionTtl));
+        log.info("auth.exchange_oauth.issued userId={}, tenantId={}, appId={}",
+                current.userId(), current.tenantId(), current.appId());
+        AuthService.Whoami whoami = authService.buildWhoami(current.userId(), current.tenantId());
+        return ResponseEntity.ok(whoami);
+    }
+
     @PostMapping("/change-password")
     public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest body) {
         if (body == null || isBlank(body.oldPassword()) || isBlank(body.newPassword())) {

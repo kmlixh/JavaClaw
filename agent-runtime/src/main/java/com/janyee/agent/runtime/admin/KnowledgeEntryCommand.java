@@ -8,6 +8,10 @@ public record KnowledgeEntryCommand(
         String contentType,
         String source,
         String tagsJson,
-        boolean enabled
+        boolean enabled,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

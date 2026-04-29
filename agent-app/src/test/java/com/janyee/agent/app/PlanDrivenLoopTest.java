@@ -239,7 +239,10 @@ class PlanDrivenLoopTest {
                 List.of(),              // sqlTemplatesNoFilter
                 null,                   // reportSection
                 "",                     // jdbcUrl
-                List.of()               // requiredTables
+                List.of(),              // requiredTables
+                List.of(),              // dependsOn
+                false,                  // dependsOnDeclared
+                PlanStepRule.Acceptance.NONE
         );
         SkillGuard guard = new SkillGuard(
                 java.util.Set.of(),
@@ -276,6 +279,9 @@ class PlanDrivenLoopTest {
     @Test
     void planUpdateBlocksArtifactStepCompletionWithoutRealArtifact() throws Exception {
         seedPlan();
+        // 默认串行 dep 兜底要求 sector → weak → report;此测试只关心 artifact 完成性校验,
+        // 用 fixture 直推先把前两步标 COMPLETED 解锁 report。
+        forceCompleted("sector", "weak");
         // 先把 report 标为 IN_PROGRESS（合法，不需要 artifact）
         planUpdateTool.execute(new ToolInvocation(
                 "dev-agent", runId, "sess", "junit", "plan.update",
@@ -365,7 +371,10 @@ class PlanDrivenLoopTest {
                         "xmap_ott.layer_yunnan_5g_weak_coverage_region",
                         "xmap_ott.layer_yunnan_4g_weak_coverage_region",
                         "xmap.layer_mdt_grid_nokia_50_month_weakarea"
-                )
+                ),
+                List.of(),
+                false,
+                PlanStepRule.Acceptance.NONE
         );
         SkillGuard guard = new SkillGuard(
                 java.util.Set.of(), java.util.Set.of(),
@@ -375,6 +384,8 @@ class PlanDrivenLoopTest {
         );
         skillGuardStore.register(runId, guard);
         try {
+            // 默认串行 dep 兜底:weak 依赖 sector,先 fixture 推进 sector 解锁 weak
+            forceCompleted("sector");
             markInProgress("weak");
             // 只跑 OTT 5G 一张表 —— 不够
             toolResultAppender.append(context, successfulQueryOutcome(
@@ -411,6 +422,115 @@ class PlanDrivenLoopTest {
                             "resultNote", "三张表都查完"))));
             assertTrue(passed.ok(),
                     "三张 required table 都跑过 db.query 后应可通过: " + passed.error());
+        } finally {
+            skillGuardStore.unregister(runId);
+        }
+    }
+
+    @Test
+    void acceptanceRequireNonZeroDataRejectsAllZeroAggregateResults() throws Exception {
+        // 再现 bug:LLM 跑了一组 COUNT(*) 全部返回 0(filter 错或 region 真的空),
+        // 之前直接 plan.update COMPLETED + artifact.markdown 把 0 写进报告。
+        // acceptance.requireNonZeroData=true 必须挡住这一路。
+        seedPlan();
+        PlanStepRule sectorRule = new PlanStepRule(
+                List.of("db.query"), List.of(), 1, true, List.of(), "",
+                List.of(), List.of(), List.of(), null, "",
+                List.of(),
+                List.of(), false,
+                new PlanStepRule.Acceptance(
+                        List.of("cnt_2g", "cnt_4g", "cnt_5g"),
+                        true
+                )
+        );
+        SkillGuard guard = new SkillGuard(
+                java.util.Set.of(), java.util.Set.of(),
+                List.of("sector", "weak", "report"),
+                Map.of("sector", sectorRule),
+                List.of("skill.unit.test")
+        );
+        skillGuardStore.register(runId, guard);
+        try {
+            markInProgress("sector");
+            // 三条 SQL 全部返回 cnt=0,模拟"region 全空"现象
+            toolResultAppender.append(context, successfulQueryOutcome(
+                    "SELECT COUNT(*) AS cnt_2g FROM xmap.layer_wy_2g_cell_info_section_yn WHERE 1=1",
+                    "[{\"cnt_2g\":0}]", "1 rows", 1));
+            toolResultAppender.append(context, successfulQueryOutcome(
+                    "SELECT COUNT(*) AS cnt_4g FROM xmap.layer_wy_4g_cell_info_section_yn WHERE 1=1",
+                    "[{\"cnt_4g\":0}]", "1 rows", 1));
+            toolResultAppender.append(context, successfulQueryOutcome(
+                    "SELECT COUNT(*) AS cnt_5g FROM xmap.layer_wy_5g_cell_info_section_yn WHERE 1=1",
+                    "[{\"cnt_5g\":0}]", "1 rows", 1));
+
+            ToolResult rejected = planUpdateTool.execute(new ToolInvocation(
+                    "dev-agent", runId, "sess", "junit", "plan.update",
+                    objectMapper.writeValueAsString(Map.of(
+                            "stepId", "sector",
+                            "status", "COMPLETED",
+                            "resultNote", "全 0,但我还是想结束这一步"))));
+            assertFalse(rejected.ok(),
+                    "全 0 聚合结果在 requireNonZeroData=true 下必须被拒,LLM 才会重查或 SKIPPED");
+            assertTrue(rejected.error().contains("all numeric values")
+                            || rejected.error().contains("zero"),
+                    "错误消息应说明所有数值都为 0: " + rejected.error());
+
+            // 重跑一条带非零结果,完成应该通过
+            toolResultAppender.append(context, successfulQueryOutcome(
+                    "SELECT COUNT(*) AS cnt_5g FROM xmap.layer_wy_5g_cell_info_section_yn WHERE city = '昆明市'",
+                    "[{\"cnt_5g\":412}]", "1 rows", 1));
+            ToolResult passed = planUpdateTool.execute(new ToolInvocation(
+                    "dev-agent", runId, "sess", "junit", "plan.update",
+                    objectMapper.writeValueAsString(Map.of(
+                            "stepId", "sector",
+                            "status", "COMPLETED",
+                            "resultNote", "重查后 cnt_5g=412,有数据"))));
+            assertTrue(passed.ok(),
+                    "重查到非零数据后 acceptance 应通过: " + passed.error());
+        } finally {
+            skillGuardStore.unregister(runId);
+        }
+    }
+
+    @Test
+    void acceptanceRequiredColumnsRejectsWhenSelectListMissesField() throws Exception {
+        // requiredColumns 校验 LLM 是否查了正确的 SELECT 列。如果只 SELECT count(*) 但
+        // skill 要求字段名 cnt_2g/cnt_4g/cnt_5g,evaluator 应当指出缺哪些列。
+        seedPlan();
+        PlanStepRule sectorRule = new PlanStepRule(
+                List.of("db.query"), List.of(), 1, true, List.of(), "",
+                List.of(), List.of(), List.of(), null, "",
+                List.of(),
+                List.of(), false,
+                new PlanStepRule.Acceptance(
+                        List.of("cnt_2g", "cnt_4g", "cnt_5g"),
+                        false
+                )
+        );
+        SkillGuard guard = new SkillGuard(
+                java.util.Set.of(), java.util.Set.of(),
+                List.of("sector", "weak", "report"),
+                Map.of("sector", sectorRule),
+                List.of("skill.unit.test")
+        );
+        skillGuardStore.register(runId, guard);
+        try {
+            markInProgress("sector");
+            // 错的 SELECT 列名:不是 cnt_2g,而是 count
+            toolResultAppender.append(context, successfulQueryOutcome(
+                    "SELECT COUNT(*) AS count FROM xmap.layer_wy_2g_cell_info_section_yn",
+                    "[{\"count\":120}]", "1 rows", 1));
+            ToolResult rejected = planUpdateTool.execute(new ToolInvocation(
+                    "dev-agent", runId, "sess", "junit", "plan.update",
+                    objectMapper.writeValueAsString(Map.of(
+                            "stepId", "sector",
+                            "status", "COMPLETED",
+                            "resultNote", "用 count 字段了"))));
+            assertFalse(rejected.ok(),
+                    "SELECT 列名不匹配 requiredColumns 必须被拒");
+            assertTrue(rejected.error().contains("cnt_2g")
+                            || rejected.error().contains("required columns"),
+                    "错误消息应指出缺哪些列: " + rejected.error());
         } finally {
             skillGuardStore.unregister(runId);
         }
@@ -509,6 +629,19 @@ class PlanDrivenLoopTest {
                 "dev-agent", runId, "sess", "junit", "plan.update",
                 objectMapper.writeValueAsString(Map.of("stepId", stepId, "status", "IN_PROGRESS"))));
         assertTrue(r.ok(), r.error());
+    }
+
+    /**
+     * 测试 fixture 直推:绕过 plan.update 的 dependsOn barrier 强制把前置 step 标为 COMPLETED,
+     * 这样后续测试逻辑能直接 markInProgress 后面的 step。仅在 setUp 用,真实调用路径必须走
+     * plan.update。
+     */
+    private void forceCompleted(String... stepIds) {
+        for (String id : stepIds) {
+            runPlanStore.find(runId).orElseThrow()
+                    .find(id).orElseThrow()
+                    .updateStatus(PlanStatus.COMPLETED);
+        }
     }
 
     private ToolCallOutcome successfulArtifactOutcome(String toolName, String summary, String markdown) throws Exception {

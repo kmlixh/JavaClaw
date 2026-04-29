@@ -173,6 +173,11 @@ public class JiutianLlmProvider implements LlmProvider {
             if (content.isBlank()) {
                 content = firstChoice.path("message").path("content").asText("");
             }
+            // 九天的 thinking 模型也用 reasoning_content 字段(与 OpenAI 兼容口径)
+            String reasoningContent = delta.path("reasoning_content").asText("");
+            if (reasoningContent.isBlank()) {
+                reasoningContent = firstChoice.path("message").path("reasoning_content").asText("");
+            }
             String finishReason = firstChoice.path("finish_reason").asText("");
             JsonNode toolCalls = delta.path("tool_calls");
 
@@ -199,19 +204,17 @@ public class JiutianLlmProvider implements LlmProvider {
                 return List.of(new LlmStreamEvent("tool_call_delta", objectMapper.writeValueAsString(payload)));
             }
 
-            if (!content.isBlank() && !finishReason.isBlank()) {
-                return List.of(
-                        new LlmStreamEvent("token", content),
-                        new LlmStreamEvent("finish", finishReason)
-                );
+            List<LlmStreamEvent> out = new java.util.ArrayList<>();
+            if (!reasoningContent.isBlank()) {
+                out.add(new LlmStreamEvent("thinking", reasoningContent));
             }
             if (!content.isBlank()) {
-                return List.of(new LlmStreamEvent("token", content));
+                out.add(new LlmStreamEvent("token", content));
             }
             if (!finishReason.isBlank()) {
-                return List.of(new LlmStreamEvent("finish", finishReason));
+                out.add(new LlmStreamEvent("finish", finishReason));
             }
-            return List.of();
+            return out;
         } catch (Exception error) {
             return List.of(new LlmStreamEvent("error", "invalid llm stream chunk: " + error.getMessage()));
         }

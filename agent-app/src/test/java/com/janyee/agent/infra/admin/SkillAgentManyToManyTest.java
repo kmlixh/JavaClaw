@@ -63,7 +63,8 @@ class SkillAgentManyToManyTest {
                 "prompt body",
                 "{}",
                 "[]",
-                true
+                true,
+                null, null, null, null
         );
         SkillDefinitionView saved = adminCatalogService.saveSkillDefinition(cmd);
         createdSkillId = saved.id();
@@ -85,7 +86,8 @@ class SkillAgentManyToManyTest {
         String skillName = "skill.m2m.rewrite." + UUID.randomUUID();
         SkillDefinitionView first = adminCatalogService.saveSkillDefinition(new SkillDefinitionCommand(
                 null, null, List.of("dev-agent", "ops-agent"),
-                skillName, "initial", "prompt", "{}", "[]", true
+                skillName, "initial", "prompt", "{}", "[]", true,
+                null, null, null, null
         ));
         createdSkillId = first.id();
         assertEquals(Set.of("dev-agent", "ops-agent"), Set.copyOf(first.agentIds()));
@@ -93,7 +95,8 @@ class SkillAgentManyToManyTest {
         // 第二次保存只挂 dev-agent,ops-agent 应被移除
         SkillDefinitionView second = adminCatalogService.saveSkillDefinition(new SkillDefinitionCommand(
                 first.id(), null, List.of("dev-agent"),
-                skillName, "updated", "prompt", "{}", "[]", true
+                skillName, "updated", "prompt", "{}", "[]", true,
+                null, null, null, null
         ));
         assertEquals(Set.of("dev-agent"), Set.copyOf(second.agentIds()),
                 "绑定集合缩减时 ops-agent 的 binding 必须被删掉,不是累加");
@@ -109,7 +112,8 @@ class SkillAgentManyToManyTest {
         String skillName = "skill.m2m.list." + UUID.randomUUID();
         SkillDefinitionView saved = adminCatalogService.saveSkillDefinition(new SkillDefinitionCommand(
                 null, null, List.of("ops-agent"),
-                skillName, "ops-only", "prompt", "{}", "[]", true
+                skillName, "ops-only", "prompt", "{}", "[]", true,
+                null, null, null, null
         ));
         createdSkillId = saved.id();
 
@@ -127,7 +131,8 @@ class SkillAgentManyToManyTest {
         String skillName = "skill.m2m.delete." + UUID.randomUUID();
         SkillDefinitionView saved = adminCatalogService.saveSkillDefinition(new SkillDefinitionCommand(
                 null, null, List.of("dev-agent", "ops-agent"),
-                skillName, "to delete", "prompt", "{}", "[]", true
+                skillName, "to delete", "prompt", "{}", "[]", true,
+                null, null, null, null
         ));
         String skillId = saved.id();
         assertEquals(2, bindingRepository.findBySkillId(skillId).size());
@@ -145,7 +150,8 @@ class SkillAgentManyToManyTest {
         String skillName = "skill.m2m.legacy." + UUID.randomUUID();
         SkillDefinitionView saved = adminCatalogService.saveSkillDefinition(new SkillDefinitionCommand(
                 null, "dev-agent", null,
-                skillName, "legacy client", "prompt", "{}", "[]", true
+                skillName, "legacy client", "prompt", "{}", "[]", true,
+                null, null, null, null
         ));
         createdSkillId = saved.id();
         assertEquals(List.of("dev-agent"), saved.agentIds(),

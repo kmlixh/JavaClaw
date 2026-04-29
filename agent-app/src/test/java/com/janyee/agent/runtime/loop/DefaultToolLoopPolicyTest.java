@@ -95,8 +95,13 @@ class DefaultToolLoopPolicyTest {
     void artifactMarkdownAllowedOnceRequiredPlanExists() {
         SkillGuard guard = buildCoverageGuard();
         ToolLoopContext context = newContext(guard);
-        context.runPlan().addStep(new PlanStep(
-                "report", "生成 markdown 报告", "artifact.markdown", ".md"));
+        PlanStep reportStep = new PlanStep(
+                "report", "生成 markdown 报告", "artifact.markdown", ".md");
+        // plan 推进守卫现在要求"调 artifact.* 时必须有 IN_PROGRESS step",对应真实运行时
+        // 顺序(plan.update IN_PROGRESS → 调工具)。手动推进到 IN_PROGRESS 模拟 LLM 已经
+        // 走完前置 plan.update。
+        reportStep.updateStatus(PlanStatus.IN_PROGRESS);
+        context.runPlan().addStep(reportStep);
 
         ToolCallRequest req = new ToolCallRequest(
                 UUID.randomUUID().toString(),
@@ -175,7 +180,10 @@ class DefaultToolLoopPolicyTest {
                 List.of(),                         // sqlTemplatesNoFilter
                 null,                               // reportSection
                 "",                                 // jdbcUrl
-                List.of()                           // requiredTables
+                List.of(),                         // requiredTables
+                List.of(),                         // dependsOn
+                false,                              // dependsOnDeclared
+                PlanStepRule.Acceptance.NONE
         );
         return new SkillGuard(
                 java.util.Set.of("xmap.layer_wy_5g_cell_info_section_yn"),

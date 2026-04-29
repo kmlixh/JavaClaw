@@ -181,6 +181,13 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
             if (content.isBlank()) {
                 content = firstChoice.path("message").path("content").asText("");
             }
+            // o1 / DeepSeek-R1 / Qwen-thinking 等推理模型在 delta 上额外吐 reasoning_content,
+            // 它跟 content 是独立通道,代表"思考链"。前端 / orchestrator 单独处理:不要混进
+            // fullText 里(否则会被当成普通输出 echo 给用户),也不要丢掉(用户希望看到推理过程)。
+            String reasoningContent = delta.path("reasoning_content").asText("");
+            if (reasoningContent.isBlank()) {
+                reasoningContent = firstChoice.path("message").path("reasoning_content").asText("");
+            }
             String finishReason = firstChoice.path("finish_reason").asText("");
             JsonNode toolCalls = delta.path("tool_calls");
 
@@ -207,19 +214,19 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
                 return List.of(new LlmStreamEvent("tool_call_delta", objectMapper.writeValueAsString(payload)));
             }
 
-            if (!content.isBlank() && !finishReason.isBlank()) {
-                return List.of(
-                        new LlmStreamEvent("token", content),
-                        new LlmStreamEvent("finish", finishReason)
-                );
+            // thinking 跟 content 可能同时出现(reasoning 模型边想边产中间结论),也可能各自单独
+            // 出现。先 emit thinking,再 emit token,顺序更接近"模型先思考再说话"的语义。
+            List<LlmStreamEvent> out = new java.util.ArrayList<>();
+            if (!reasoningContent.isBlank()) {
+                out.add(new LlmStreamEvent("thinking", reasoningContent));
             }
             if (!content.isBlank()) {
-                return List.of(new LlmStreamEvent("token", content));
+                out.add(new LlmStreamEvent("token", content));
             }
             if (!finishReason.isBlank()) {
-                return List.of(new LlmStreamEvent("finish", finishReason));
+                out.add(new LlmStreamEvent("finish", finishReason));
             }
-            return List.of();
+            return out;
         } catch (Exception error) {
             return List.of(new LlmStreamEvent("error", "invalid llm stream chunk: " + error.getMessage()));
         }

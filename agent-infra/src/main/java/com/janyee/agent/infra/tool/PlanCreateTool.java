@@ -129,6 +129,7 @@ public class PlanCreateTool implements AgentTool {
 
             plan.setTitle(title);
             int idx = 0;
+            String previousStepId = null;
             for (JsonNode s : stepsNode) {
                 String id = autoRenamed ? proposedStepIds.get(idx) : s.path("id").asText("");
                 String stepTitle = s.path("title").asText("");
@@ -136,7 +137,10 @@ public class PlanCreateTool implements AgentTool {
                 String expectedOutput = s.path("expectedOutput").asText("");
                 PlanStep step = new PlanStep(id, stepTitle, toolHint, expectedOutput);
                 materializeFromRule(step, guard);
+                // 应用 dependsOn:同 SkillPlanSeeder,rule 声明优先,否则隐式串行依赖前一 step。
+                applyDependsOnFallback(step, guard, previousStepId);
                 plan.addStep(step);
+                previousStepId = id;
                 idx++;
             }
             log.info("plan.create runId={}, steps={}, autoRenamed={}",
@@ -167,6 +171,24 @@ public class PlanCreateTool implements AgentTool {
     }
 
     /**
+     * Apply default-serial dep fallback the same way SkillPlanSeeder does — rule 声明 deps
+     * 时用 rule 的;否则给当前 step 打上 [previousStepId]。
+     */
+    private void applyDependsOnFallback(PlanStep step, SkillGuard guard, String previousStepId) {
+        // 用 OWN 规则:reuseStep 不该把当前 step 的 dependsOn 屏蔽成 reuse 目标的。
+        PlanStepRule rule = guard == null || guard.isEmpty()
+                ? null
+                : guard.stepRuleOwn(step.id()).orElse(null);
+        if (rule != null && rule.dependsOnDeclared()) {
+            step.setDependsOn(rule.dependsOn());
+            return;
+        }
+        if (previousStepId != null) {
+            step.setDependsOn(List.of(previousStepId));
+        }
+    }
+
+    /**
      * Copy the skill's per-step rule details (tableAllowList, sqlTemplates, reportSection)
      * onto the freshly created PlanStep. This way the LLM sees "which tables / which SQL /
      * which heading" directly in the rendered plan, instead of having to remember skill
@@ -176,7 +198,8 @@ public class PlanCreateTool implements AgentTool {
         if (guard == null || guard.isEmpty()) {
             return;
         }
-        PlanStepRule rule = guard.stepRule(step.id()).orElse(null);
+        // OWN 规则:weak_grid 这种 reuseStep step 必须保留自己的 reportSection / sqlTemplates。
+        PlanStepRule rule = guard.stepRuleOwn(step.id()).orElse(null);
         if (rule == null || rule.isEmpty()) {
             return;
         }

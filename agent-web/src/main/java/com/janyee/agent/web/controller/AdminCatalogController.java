@@ -70,7 +70,11 @@ public class AdminCatalogController {
                 request.chatPath(),
                 request.stream(),
                 request.enabled(),
-                request.defaultConfig()
+                request.defaultConfig(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -96,7 +100,11 @@ public class AdminCatalogController {
                 request.contentType(),
                 request.source(),
                 request.tagsJson(),
-                request.enabled()
+                request.enabled(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -124,7 +132,11 @@ public class AdminCatalogController {
                 request.toolType(),
                 request.configJson(),
                 request.enabled(),
-                request.approvalRequired()
+                request.approvalRequired(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -153,7 +165,11 @@ public class AdminCatalogController {
                 request.promptTemplate(),
                 request.configJson(),
                 request.triggerKeywords(),
-                request.enabled()
+                request.enabled(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -179,7 +195,11 @@ public class AdminCatalogController {
                 request.password(),
                 request.dialect(),
                 request.description(),
-                request.enabled()
+                request.enabled(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -232,7 +252,11 @@ public class AdminCatalogController {
                 request.systemPrompt(),
                 request.agentMarkdown(),
                 request.memoryMarkdown(),
-                request.enabled()
+                request.enabled(),
+                request.scopeType(),
+                request.scopeTenantId(),
+                request.appId(),
+                request.scopeUserId()
         )));
     }
 
@@ -246,7 +270,8 @@ public class AdminCatalogController {
         return new AgentDefinitionAdminResponse(
                 view.agentId(), view.displayName(), view.description(),
                 view.systemPrompt(), view.agentMarkdown(), view.memoryMarkdown(),
-                view.enabled(), view.createdAt(), view.updatedAt()
+                view.enabled(), view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 
@@ -261,7 +286,8 @@ public class AdminCatalogController {
     private KnowledgeEntryResponse toKnowledgeResponse(KnowledgeEntryView view) {
         return new KnowledgeEntryResponse(
                 view.id(), view.agentId(), view.title(), view.content(), view.contentType(), view.source(),
-                view.tagsJson(), view.enabled(), view.version(), view.createdAt(), view.updatedAt()
+                view.tagsJson(), view.enabled(), view.version(), view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 
@@ -269,7 +295,8 @@ public class AdminCatalogController {
         return new LlmConfigAdminResponse(
                 view.id(), view.provider(), view.displayName(), view.model(), view.modelMappingJson(),
                 view.baseUrl(), view.apiKey(),
-                view.chatPath(), view.stream(), view.enabled(), view.defaultConfig(), view.createdAt(), view.updatedAt()
+                view.chatPath(), view.stream(), view.enabled(), view.defaultConfig(), view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 
@@ -277,7 +304,8 @@ public class AdminCatalogController {
         return new ToolDefinitionResponse(
                 view.id(), view.agentId(), view.toolName(), view.displayName(), view.description(), view.schemaJson(),
                 view.toolType(), view.configJson(), view.enabled(), view.approvalRequired(), view.version(),
-                view.createdAt(), view.updatedAt()
+                view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 
@@ -285,14 +313,16 @@ public class AdminCatalogController {
         return new SkillDefinitionResponse(
                 view.id(), view.agentId(), view.agentIds(), view.skillName(), view.description(),
                 view.promptTemplate(), view.configJson(), view.triggerKeywords(),
-                view.enabled(), view.version(), view.createdAt(), view.updatedAt()
+                view.enabled(), view.version(), view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 
     private DatasourceAdminResponse toDatasourceResponse(DatasourceView view) {
         return new DatasourceAdminResponse(
                 view.id(), view.displayName(), view.jdbcUrl(), view.username(), view.passwordSet(),
-                view.dialect(), view.description(), view.enabled(), view.createdAt(), view.updatedAt()
+                view.dialect(), view.description(), view.enabled(), view.createdAt(), view.updatedAt(),
+                view.scopeType(), view.scopeTenantId(), view.appId(), view.scopeUserId()
         );
     }
 }

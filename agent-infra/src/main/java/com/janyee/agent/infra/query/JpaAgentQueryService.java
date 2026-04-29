@@ -58,23 +58,14 @@ public class JpaAgentQueryService implements AgentQueryService {
 
     @Override
     public List<SessionSummaryView> listSessions(String agentId) {
-        // P3:按 permission 分层可见性
-        //   session.read.all     → 不过滤(系统管理员跨租户看)
-        //   session.read.tenant  → tenant_id == 当前租户(租户 admin)
-        //   session.read.own     → user_id == 当前 user(普通用户,默认)
-        // 匿名期 SUPER_ADMIN 默认拥有 read.all,老行为不变。
         com.janyee.agent.infra.auth.AuthPrincipal principal =
                 com.janyee.agent.infra.auth.SecurityContextHolder.current();
-        java.util.Set<String> perms = principal.permissions();
-        boolean readAll = principal.anonymous() || perms.contains("session.read.all");
-        boolean readTenant = readAll || perms.contains("session.read.tenant");
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(principal);
         List<SessionEntity> sessions = agentId == null || agentId.isBlank()
                 ? sessionRepository.findTop20ByOrderByUpdatedAtDesc()
                 : sessionRepository.findTop20ByAgentIdOrderByUpdatedAtDesc(agentId);
         return sessions.stream()
-                .filter(s -> readAll
-                        || (readTenant && java.util.Objects.equals(s.getTenantId(), principal.tenantId()))
-                        || (!readTenant && java.util.Objects.equals(s.getUserId(), principal.userId())))
+                .filter(s -> v.canRead(s.getTenantId(), s.getUserId()))
                 .map(this::toSessionSummary)
                 .toList();
     }
@@ -82,7 +73,15 @@ public class JpaAgentQueryService implements AgentQueryService {
     @Override
     public SessionDetailView getSession(String sessionId) {
         SessionEntity session = sessionRepository.findById(sessionId)
-                .orElseThrow(() -> new IllegalArgumentException("session not found: " + sessionId));
+                .orElseThrow(() -> new com.janyee.agent.infra.auth.AuthService.AuthException(
+                        "NOT_FOUND", "session not found: " + sessionId));
+        // 越权防御:按 listSessions 同套规则判定 —— readAll(sysadmin) / readTenant(租户admin) /
+        // readOwn(普通用户)。不通过抛 SecurityException → AuthExceptionAdvice 转 403。
+        // 之前缺这条,任何登录用户拿到 sessionId 就能读 session 全文(含所有消息)。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        if (!v.canRead(session.getTenantId(), session.getUserId())) {
+            throw new SecurityException("no permission to read session " + sessionId);
+        }
         List<SessionMessageView> messages = sessionMessageRepository.findBySessionIdOrderBySeqNoAsc(sessionId).stream()
                 .map(this::toSessionMessage)
                 .toList();
@@ -109,8 +108,14 @@ public class JpaAgentQueryService implements AgentQueryService {
     @Override
     public RunDetailView getRun(String runId) {
         RunRecordEntity run = runRecordRepository.findById(runId)
-                .orElseThrow(() -> new IllegalArgumentException("run not found: " + runId));
-        // 如果 DB 还挂着 in-progress 但服务端没有活跃执行 —— 写回 FAILED 并用修正后的 entity 生成 view。
+                .orElseThrow(() -> new com.janyee.agent.infra.auth.AuthService.AuthException(
+                        "NOT_FOUND", "run not found: " + runId));
+        // 越权防御:run 是 session 派生的,按 run.tenantId/userId 校验。
+        // RunDetailView 里有 planJson + tool 调用 + 产物,泄露代价更高。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        if (!v.canRead(run.getTenantId(), run.getUserId())) {
+            throw new SecurityException("no permission to read run " + runId);
+        }
         staleRunReconciler.reconcileIfStale(run);
         return toRunDetail(run);
     }
@@ -120,9 +125,13 @@ public class JpaAgentQueryService implements AgentQueryService {
         if (sessionId == null || sessionId.isBlank()) {
             return List.of();
         }
+        // session 不可读 → 直接返空,不暴露 run id 列表。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        SessionEntity session = sessionRepository.findById(sessionId).orElse(null);
+        if (session == null || !v.canRead(session.getTenantId(), session.getUserId())) {
+            return List.of();
+        }
         List<RunRecordEntity> runs = runRecordRepository.findBySessionId(sessionId);
-        // 逐条经过 reconciler —— 任何 DB 还挂着 in-progress 但 registry 没登记的都会被改写成 FAILED。
-        // 这样前端拿到的 status 和"server 是否真的在跑"完全同步，不再依赖 event 流推断。
         return runs.stream()
                 .map(run -> {
                     staleRunReconciler.reconcileIfStale(run);
@@ -143,6 +152,12 @@ public class JpaAgentQueryService implements AgentQueryService {
         if (sessionId == null || sessionId.isBlank()) {
             return Optional.empty();
         }
+        // session 不可读 → 当作没有 active run,避免外人用 sessionId 探测他人是否在跑任务。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        SessionEntity session = sessionRepository.findById(sessionId).orElse(null);
+        if (session == null || !v.canRead(session.getTenantId(), session.getUserId())) {
+            return Optional.empty();
+        }
         return runRecordRepository.findFirstBySessionIdAndStatusInOrderByUpdatedAtDesc(
                         sessionId,
                         List.of("RECEIVED", "CONTEXT_BUILT", "MODEL_RUNNING", "TOOL_REQUESTED", "TOOL_EXECUTING", "TOOL_RESULT_APPENDED", "WAITING_APPROVAL")
@@ -150,6 +165,10 @@ public class JpaAgentQueryService implements AgentQueryService {
                 .filter(run -> !"service restarted before run completed".equals(run.getDetail()))
                 .filter(run -> !staleRunReconciler.reconcileIfStale(run))
                 .map(this::toRunDetail);
+    }
+
+    private com.janyee.agent.infra.auth.SessionVisibility visibilityFor(com.janyee.agent.infra.auth.AuthPrincipal principal) {
+        return com.janyee.agent.infra.auth.SessionVisibility.forPrincipal(principal);
     }
 
     private RunDetailView toRunDetail(RunRecordEntity run) {
@@ -183,14 +202,26 @@ public class JpaAgentQueryService implements AgentQueryService {
 
     @Override
     public List<MemoryNoteView> listMemoryNotes(String agentId) {
+        // memory note 落 user_id/tenant_id 跟 session 一样,用同一套可见性。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
         return memoryNoteRepository.findTop20ByAgentIdOrderByCreatedAtDesc(agentId).stream()
+                .filter(e -> v.canRead(e.getScopeTenantId(), e.getScopeUserId()))
                 .map(this::toMemoryNote)
                 .toList();
     }
 
     @Override
     public List<SessionMessageView> searchMessages(String query, String sessionId) {
-        return sessionMessageRepository.searchByContent(query, blankToNull(sessionId)).stream()
+        // 全表搜索若不过滤会跨租户跨用户搜到他人对话内容。先按 sessionId 拉出 session,
+        // 再按 visibility 决定是否返回。无 sessionId 限定时,按 session 一一过滤。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        java.util.List<SessionMessageEntity> raw = sessionMessageRepository.searchByContent(query, blankToNull(sessionId));
+        java.util.Map<String, Boolean> sessionAccessCache = new java.util.HashMap<>();
+        return raw.stream()
+                .filter(m -> sessionAccessCache.computeIfAbsent(m.getSessionId(), sid -> {
+                    SessionEntity s = sessionRepository.findById(sid).orElse(null);
+                    return s != null && v.canRead(s.getTenantId(), s.getUserId());
+                }))
                 .limit(20)
                 .map(this::toSessionMessage)
                 .toList();
@@ -198,13 +229,21 @@ public class JpaAgentQueryService implements AgentQueryService {
 
     @Override
     public List<MemoryNoteView> searchMemoryNotes(String agentId, String query) {
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
         return memoryNoteRepository.findTop20ByAgentIdAndContentContainingIgnoreCaseOrderByCreatedAtDesc(agentId, query).stream()
+                .filter(e -> v.canRead(e.getScopeTenantId(), e.getScopeUserId()))
                 .map(this::toMemoryNote)
                 .toList();
     }
 
     @Override
     public List<ArtifactView> searchArtifacts(String runId, String query) {
+        // 看 runId 对应 run 是否对当前用户可见。不可见 → 返空。
+        com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        RunRecordEntity run = runRecordRepository.findById(runId).orElse(null);
+        if (run == null || !v.canRead(run.getTenantId(), run.getUserId())) {
+            return List.of();
+        }
         return artifactFileRepository.findTop20ByRunIdAndNameContainingIgnoreCaseOrderByIdDesc(runId, query).stream()
                 .map(this::toArtifact)
                 .toList();

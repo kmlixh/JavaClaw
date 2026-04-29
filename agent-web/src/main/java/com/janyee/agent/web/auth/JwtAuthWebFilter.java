@@ -104,23 +104,25 @@ public class JwtAuthWebFilter implements WebFilter {
     }
 
     private String extractToken(ServerWebExchange exchange) {
-        // Authorization: Bearer <token>  (外部应用 OAuth 路径)
+        String path = exchange.getRequest().getPath().pathWithinApplication().value();
+        // 1) Authorization: Bearer (任何路径优先级最高)
         String auth = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
         if (auth != null && auth.startsWith(BEARER_PREFIX)) {
             return auth.substring(BEARER_PREFIX.length()).trim();
         }
-        // Cookie: AGENT_TOKEN (网页 session 路径)
-        HttpCookie cookie = exchange.getRequest().getCookies().getFirst(AuthController.COOKIE_NAME);
-        if (cookie != null && cookie.getValue() != null && !cookie.getValue().isBlank()) {
-            return cookie.getValue();
-        }
-        // ?access_token= (WebSocket 不能设 header,只能走 URL query)
-        String path = exchange.getRequest().getPath().pathWithinApplication().value();
+        // 2) ?access_token= 必须放在 cookie 之前 ——
+        //    iframe 同源场景下,浏览器会自动给 WS 上行带 cookie AGENT_TOKEN(可能是宿主页里
+        //    内部用户的 cookie),如果先读 cookie 就会冒充成"内部用户",让外部 OAuth token 失效。
         if (path != null && path.startsWith("/ws/")) {
             String queryToken = exchange.getRequest().getQueryParams().getFirst("access_token");
             if (queryToken != null && !queryToken.isBlank()) {
                 return queryToken.trim();
             }
+        }
+        // 3) Cookie AGENT_TOKEN (主控台 session 路径)
+        HttpCookie cookie = exchange.getRequest().getCookies().getFirst(AuthController.COOKIE_NAME);
+        if (cookie != null && cookie.getValue() != null && !cookie.getValue().isBlank()) {
+            return cookie.getValue();
         }
         return null;
     }

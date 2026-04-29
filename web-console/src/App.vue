@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import MarkdownBlock from "./components/MarkdownBlock.vue";
+import ScopeEditor from "./components/ScopeEditor.vue";
 import {
   approve,
   cancelRun,
@@ -50,6 +51,10 @@ import {
   logout as apiLogout,
   switchTenant as apiSwitchTenant,
   changePassword as apiChangePassword,
+  setEmbedAccessToken,
+  getEmbedAccessToken,
+  isEmbedMode,
+  exchangeOauthToSession,
   // P4-B 管理后台
   adminListUsers,
   adminCreateUser,
@@ -78,6 +83,16 @@ import {
 const agents = ref([]);
 const llms = ref([]);
 const approvals = ref([]);
+
+// embed 模式标志:URL 带 ?embed=1 立即生效,渲染前就决定了 → 不会闪左栏
+const embedMode = computed(() => route.query.embed === "1");
+const embedReady = ref(false);
+
+// embed 模式:宿主侧(xmap-ol-front)经 SDK postMessage 注册过来的"可调方法名"列表。
+// 每次发送 chat 都会把这个列表当作 host_methods.json 附件塞进去,LLM 看了知道能调啥。
+const embedHostMethods = ref([]);
+// /ws/bridge 单例 —— 首条消息发出后(session 创建好)开一次,用于把 LLM 的 host.invoke 转发给宿主。
+let embedBridgeSocket = null;
 
 // P2 Auth state. 首次 mount 调 whoami 填进来;anonymous=true 时现有 UX 不变,
 // 用户主动点登录才会跳 /login 换成真身份。P3 开启强鉴权时加路由守卫。
@@ -264,6 +279,9 @@ const state = reactive({
   liveAssistant: {
     runId: "",
     content: "",
+    // thinking:推理类模型(o1/R1/qwen-thinking)在正式回答前 / 边想边产时吐出的
+    // reasoning_content 累积文本。跟 content 平行展示,前端单独区块(可折叠)。
+    thinking: "",
     // 当前流式文字属于第几个 tool loop iteration。step 变化时要把上一 step 冻成独立气泡,
     // 否则下一 step 的 overwrite 会把自检 / 过渡说明 / 优化后报告等中间 turn 的内容全部吃掉。
     step: null
@@ -284,8 +302,7 @@ const state = reactive({
   session: null,
   run: null,
   // 会话内所有 run 的权威状态（由 /api/sessions/{id}/runs 提供，已经过 StaleRunReconciler 修正）。
-  // isRunTerminalByEvents 除了看 RUN_COMPLETED/RUN_FAILED 事件，还会看这里 —— 因为历史 run 失败时
-  // 前端并不一定有 WebSocket 流可以收到事件，必须用 DB 权威状态兜底。
+  // 历史/僵尸 run 在前端没有 WebSocket 流，要靠这份 DB 状态兜底显示完成/失败状态。
   runsByRunId: {},
   memories: [],
   search: {
@@ -362,6 +379,10 @@ const llmProviderOptions = [
   "ollama",
   "custom"
 ];
+// 通用 scope 默认值:新建资源时如果 admin 不显式选,后端 service 会按 principal 推断;
+// 编辑时 editXxx() 会用资源现有 scope 覆盖。
+const DEFAULT_SCOPE = Object.freeze({ scopeType: "PUBLIC", scopeTenantId: "", appId: "", scopeUserId: "" });
+
 const llmForm = reactive({
   id: "",
   provider: "openai-compatible",
@@ -373,12 +394,13 @@ const llmForm = reactive({
   chatPath: "/chat/completions",
   stream: true,
   enabled: true,
-  defaultConfig: false
+  defaultConfig: false,
+  scope: { ...DEFAULT_SCOPE }
 });
 const llmModelRows = ref([]);
 const lastSentRequest = ref(null);
-const knowledgeForm = reactive({ id: "", title: "", content: "", contentType: "markdown", source: "database", tagsJson: "[]", enabled: true });
-const toolForm = reactive({ id: "", toolName: "", displayName: "", description: "", schemaJson: "{}", toolType: "builtin", configJson: "{}", enabled: true, approvalRequired: false });
+const knowledgeForm = reactive({ id: "", title: "", content: "", contentType: "markdown", source: "database", tagsJson: "[]", enabled: true, scope: { ...DEFAULT_SCOPE } });
+const toolForm = reactive({ id: "", toolName: "", displayName: "", description: "", schemaJson: "{}", toolType: "builtin", configJson: "{}", enabled: true, approvalRequired: false, scope: { ...DEFAULT_SCOPE } });
 const skillForm = reactive({
   id: "",
   agentIds: [],
@@ -387,9 +409,28 @@ const skillForm = reactive({
   promptTemplate: "",
   configJson: "{}",
   triggerKeywords: "[]",
-  enabled: true
+  enabled: true,
+  scope: { ...DEFAULT_SCOPE }
 });
-const datasourceForm = reactive({ id: "", displayName: "", jdbcUrl: "", username: "", password: "", dialect: "postgresql", description: "", enabled: true });
+const datasourceForm = reactive({ id: "", displayName: "", jdbcUrl: "", username: "", password: "", dialect: "postgresql", description: "", enabled: true, scope: { ...DEFAULT_SCOPE } });
+
+// 把后端 view/response 里的 scope 4 字段提到 form.scope 上;反过来 submit 时拍平回 4 字段。
+function readScopeFromView(item) {
+  return {
+    scopeType: item?.scopeType || "PUBLIC",
+    scopeTenantId: item?.scopeTenantId || "",
+    appId: item?.appId || "",
+    scopeUserId: item?.scopeUserId || ""
+  };
+}
+function flattenScopeForRequest(scope) {
+  return {
+    scopeType: scope?.scopeType || null,
+    scopeTenantId: scope?.scopeTenantId || null,
+    appId: scope?.appId || null,
+    scopeUserId: scope?.scopeUserId || null
+  };
+}
 
 const transcriptMessages = computed(() => {
   const persisted = state.session?.messages || [];
@@ -420,9 +461,46 @@ const hasAvailableLlms = computed(() => llms.value.length > 0);
 const selectedRuntimeLlm = computed(() => llms.value.find((item) => item.configId === form.llmConfigId) || null);
 const selectedRuntimeLlmModels = computed(() => parseLlmModelMappings(selectedRuntimeLlm.value?.modelMappingJson, selectedRuntimeLlm.value?.model));
 const chatRunBusy = computed(() => loading.sending || !!currentStream.value || isActiveRunStatus(state.run?.status));
-const llmWarning = computed(() => hasAvailableLlms.value
-  ? ""
-  : "后端当前没有加载到任何可用 LLM。请确认 agent-app 使用了正确的 profile，并且 llm_provider_config 表中存在 enabled=true 的配置。");
+
+// 把 llms × 每个 llm.modelMappingJson 里的 models 数组展平成"LLM-模型"扁平列表,
+// 给单一下拉用。option.value 用 "configId|apiModel" 拼接,display 用 "LLM 名 - 模型名"。
+// 没配置 modelMappingJson 时退回到 llm.model 单条。
+const llmModelOptions = computed(() => {
+  const out = [];
+  for (const llm of llms.value || []) {
+    const models = parseLlmModelMappings(llm.modelMappingJson, llm.model);
+    if (!models.length) {
+      out.push({
+        key: `${llm.configId}|`,
+        configId: llm.configId,
+        apiModel: "",
+        label: llm.displayName || llm.configId,
+        defaultConfig: !!llm.defaultConfig
+      });
+      continue;
+    }
+    for (const m of models) {
+      out.push({
+        key: `${llm.configId}|${m.apiModel}`,
+        configId: llm.configId,
+        apiModel: m.apiModel,
+        label: `${llm.displayName || llm.configId} - ${m.displayName || m.apiModel}`,
+        defaultConfig: !!llm.defaultConfig
+      });
+    }
+  }
+  return out;
+});
+const selectedLlmModelKey = computed({
+  get() {
+    return `${form.llmConfigId || ""}|${form.llmModel || ""}`;
+  },
+  set(value) {
+    const [configId, apiModel] = String(value || "").split("|");
+    form.llmConfigId = configId || "";
+    form.llmModel = apiModel || "";
+  }
+});
 const mapCenterWorld = computed(() => projectLatLng(mapModal.center.lat, mapModal.center.lng, mapModal.zoom));
 const mapOriginWorld = computed(() => ({
   x: mapCenterWorld.value.x - mapViewport.width / 2,
@@ -713,11 +791,9 @@ function pickSingleFinalResultBlock(blocks) {
 }
 
 function isRunTerminalByEvents(runId) {
-  // 1) 优先看实时事件流（RUN_COMPLETED/RUN_FAILED）—— 当前正在跑的 run 以此为准
   if (state.events.some((event) => event.runId === runId && (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED"))) {
     return true;
   }
-  // 2) 退回 DB 权威状态 —— 历史/僵尸 run 走这条，避免前端把"server 早就 FAIL 了"的 run 一直显示为"任务执行中"
   const dbStatus = state.runsByRunId?.[runId]?.status;
   if (dbStatus === "COMPLETED" || dbStatus === "FAILED") {
     return true;
@@ -789,17 +865,21 @@ const groupedRunTimeline = computed(() => {
       runMap.set(runId, []);
       orderedRuns.push(runId);
     }
-    if (shouldShowTimelineEvent(event)) {
-      if (event.type === "TOOL_COMPLETED" && toolEventRenderPayload(event)) {
-        const renderMessage = toolEventRenderMessage(event, runId);
-        if (renderMessage && !hasRenderableToolMessageForRun(runId)) {
-          runMap.get(runId).push({
-            kind: "message",
-            key: `event-render-${event.id}`,
-            message: renderMessage
-          });
-        }
+    // TOOL_COMPLETED 带渲染负载时,如果 transcript 里还没刷出对应的 tool message
+    // (session refresh 有 250ms 延迟),立即把 event 转成临时 render message 显示出来,
+    // 避免渲染结果"晚一拍才出现"。这条路径独立于 shouldShowTimelineEvent,
+    // 不受时间线事件过滤影响。
+    if (event.type === "TOOL_COMPLETED" && toolEventRenderPayload(event)) {
+      const renderMessage = toolEventRenderMessage(event, runId);
+      if (renderMessage && !hasRenderableToolMessageForRun(runId)) {
+        runMap.get(runId).push({
+          kind: "message",
+          key: `event-render-${event.id}`,
+          message: renderMessage
+        });
       }
+    }
+    if (shouldShowTimelineEvent(event)) {
       runMap.get(runId).push({
         kind: "event",
         key: event.id,
@@ -808,7 +888,9 @@ const groupedRunTimeline = computed(() => {
     }
   }
 
-  if (state.liveAssistant.runId && state.liveAssistant.content) {
+  // 即使 content 为空,只要有 thinking,也要展示 live 气泡(推理模型在 reasoning 阶段
+  // content 为空、reasoning_content 有内容,这种情况要让用户看到思考)
+  if (state.liveAssistant.runId && (state.liveAssistant.content || state.liveAssistant.thinking)) {
     if (!runMap.has(state.liveAssistant.runId)) {
       runMap.set(state.liveAssistant.runId, []);
       orderedRuns.push(state.liveAssistant.runId);
@@ -816,24 +898,36 @@ const groupedRunTimeline = computed(() => {
     runMap.get(state.liveAssistant.runId).push({
       kind: "live",
       key: `live-${state.liveAssistant.runId}`,
-      content: state.liveAssistant.content
+      content: state.liveAssistant.content,
+      thinking: state.liveAssistant.thinking
     });
   }
 
   return orderedRuns.map((runId) => {
     const blocks = runMap.get(runId) || [];
     const userBlocks = blocks.filter((block) => isUserBlock(block));
-    const finalResultBlock = pickSingleFinalResultBlock(blocks);
     const runTerminal = isRunTerminalByEvents(runId);
-    if (finalResultBlock) {
-      return {
-        runId,
-        blocks: [...userBlocks, finalResultBlock]
-      };
+
+    // run 已结束 → 坍缩为 [user, finalResult] 干净视图(渲染块 / 有内容的 assistant 气泡)。
+    // run 进行中 → 展开完整时间线,让 MODEL_OUTPUT / MODEL_THINKING / 后续工具调用都能流式可见,
+    //              避免一旦先生成 artifact.markdown 后续 AI 修正/继续输出被吞掉看起来"冻结"。
+    if (runTerminal) {
+      const finalResultBlock = pickSingleFinalResultBlock(blocks);
+      if (finalResultBlock) {
+        return {
+          runId,
+          blocks: [...userBlocks, finalResultBlock]
+        };
+      }
+    } else if (blocks.some((block) => !isUserBlock(block))) {
+      return { runId, blocks };
     }
 
-    // 不再挂 makeWaitingBlock "任务执行中..." —— 顶部的 live-status 横幅已经显式在说"思考中 / 数据库查询 / ..."
-    // 当前阶段，时间线里再冒一个冗余的"任务执行中"就是噪音，也就是用户看到的"两个奇怪的执行步骤"。
+    // run 进行中但还没任何中间内容(用户刚发完消息),fallback 链给个"在动"的提示:
+    //   1) 最近一条带渲染负载的 TOOL_COMPLETED 事件
+    //   2) liveAssistant 当前内容/思考
+    //   3) 最近一条值得展示的进度事件
+    //   4) 啥都没有 → 只显示用户气泡
     const latestRenderableEvent = [...state.events]
       .reverse()
       .find((event) => event.runId === runId && event.type === "TOOL_COMPLETED" && !!toolEventRenderPayload(event));
@@ -854,7 +948,7 @@ const groupedRunTimeline = computed(() => {
       }
     }
 
-    if (state.liveAssistant.runId === runId && state.liveAssistant.content) {
+    if (state.liveAssistant.runId === runId && (state.liveAssistant.content || state.liveAssistant.thinking)) {
       return {
         runId,
         blocks: [
@@ -862,7 +956,8 @@ const groupedRunTimeline = computed(() => {
           {
             kind: "live",
             key: `latest-live-${runId}`,
-            content: state.liveAssistant.content
+            content: state.liveAssistant.content,
+            thinking: state.liveAssistant.thinking
           }
         ]
       };
@@ -1643,6 +1738,14 @@ function toOverlayRegion(region) {
 }
 
 function openMapModal() {
+  // 在 xmap 的 iframe 里,优先走 xmap 真实地图的 draw 方法 ——
+  // 用户在 xmap 上画完图直接回传到聊天附件,体验比内嵌 canvas 流畅得多。
+  if (embedMode.value && embedHostMethods.value.includes("draw")) {
+    embedDrawPicker.visible = true;
+    embedDrawPicker.busy = false;
+    embedDrawPicker.error = "";
+    return;
+  }
   mapModal.regions = [];
   mapModal.draftRegion = null;
   mapModal.center = { lat: 35, lng: 105 };
@@ -1654,6 +1757,120 @@ function openMapModal() {
   mapModal.hoverLatLng = null;
   mapModal.visible = true;
   nextTick(() => updateMapViewport());
+}
+
+// embed 模式下的小型类型选择器:用户挑形状 → 调 xmap.draw → 拿 result → 进附件。
+// 不复用 mapModal 是因为 xmap 本身就是地图,没必要再叠一层 canvas;只需一个轻量的
+// "选哪种形状"的弹层就够了。
+const embedDrawPicker = reactive({
+  visible: false,
+  busy: false,
+  busyType: "",
+  error: ""
+});
+
+function closeEmbedDrawPicker() {
+  embedDrawPicker.visible = false;
+  embedDrawPicker.busy = false;
+  embedDrawPicker.busyType = "";
+  embedDrawPicker.error = "";
+}
+
+async function embedDrawShape(type) {
+  if (embedDrawPicker.busy) return;
+  embedDrawPicker.busy = true;
+  embedDrawPicker.busyType = type;
+  embedDrawPicker.error = "";
+  // 选完形状后聊天面板让位 —— 用户需要在 xmap 真实地图上画图,聊天 panel 占着右侧
+  // 1/3 屏会挡视野。draw 完(成功/失败/取消)再恢复显示。
+  let chatHidden = false;
+  try {
+    if (window.parent) {
+      window.parent.postMessage({ type: "jc.embed.hide" }, "*");
+      chatHidden = true;
+    }
+    // 调 xmap 的 draw 方法。这条 Promise 会等用户在真实地图上把形状画完才 resolve。
+    // xmap.draw 返回 { type, wktString, geoJSON } —— geoJSON 是 GeoJSON geometry。
+    const result = await hostInvoke("draw", { type });
+    const attachment = embedDrawResultToAttachment(result, type);
+    form.attachments.push(attachment);
+    appendComposerToken(attachment.displayLabel);
+    closeEmbedDrawPicker();
+  } catch (error) {
+    console.error("[App.embed] draw failed:", error);
+    embedDrawPicker.error = String(error?.message || error || "绘制失败");
+    embedDrawPicker.busy = false;
+    embedDrawPicker.busyType = "";
+  } finally {
+    // 无论成功失败都恢复聊天面板,不要把用户卡在隐藏状态
+    if (chatHidden && window.parent) {
+      window.parent.postMessage({ type: "jc.embed.show" }, "*");
+    }
+  }
+}
+
+// 把 xmap.draw 返回的 {type, wktString, geoJSON} 转成跟内置 mapModal 相同的附件结构,
+// 后端 / LLM 那侧不需要分支 —— 都是 application/vnd.java-claw.map-regions+json,内含
+// 一个 region 数组。这样后续逻辑(geometry 提取、空间过滤等)零改动。
+function embedDrawResultToAttachment(result, requestedType) {
+  const data = result?.data || result || {};
+  const geom = data.geoJSON || data.geometry || null;
+  const wkt = data.wktString || "";
+  const xmapType = data.type || requestedType;
+
+  // xmap 的 type 是中文,统一映射成内部 geometryType
+  const geometryTypeMap = {
+    "点": "point",
+    "圆形": "circle",
+    "矩形": "rectangle",
+    "多边形": "polygon"
+  };
+  const geometryType = geometryTypeMap[xmapType] || "polygon";
+
+  // 从 GeoJSON geometry 提取 polygon coords + bounds(xmap 已把 Circle 转成 Polygon)
+  let polygon = [];
+  let bounds = null;
+  if (geom && Array.isArray(geom.coordinates)) {
+    if (geom.type === "Polygon" && Array.isArray(geom.coordinates[0])) {
+      polygon = geom.coordinates[0].map((p) => [Number(p[0]), Number(p[1])]);
+    } else if (geom.type === "Point") {
+      polygon = [[Number(geom.coordinates[0]), Number(geom.coordinates[1])]];
+    }
+    if (polygon.length) {
+      const xs = polygon.map((p) => p[0]);
+      const ys = polygon.map((p) => p[1]);
+      bounds = {
+        minLng: Math.min(...xs),
+        maxLng: Math.max(...xs),
+        minLat: Math.min(...ys),
+        maxLat: Math.max(...ys)
+      };
+    }
+  }
+
+  const region = {
+    id: `xmap-${Date.now()}`,
+    name: "区域1",
+    geometryType,
+    srid: 4326,
+    geometry: geom,
+    wkt,
+    bounds,
+    polygon,
+    source: "xmap.draw"
+  };
+  const payload = {
+    type: "map-regions",
+    generatedAt: new Date().toISOString(),
+    source: "xmap.draw",
+    regions: [region]
+  };
+  return {
+    name: `map-regions-${Date.now()}.json`,
+    displayLabel: nextAttachmentDisplayLabel("map"),
+    contentType: "application/vnd.java-claw.map-regions+json",
+    content: JSON.stringify(payload, null, 2)
+  };
 }
 
 function closeMapModal() {
@@ -1900,14 +2117,120 @@ function approvalForEvent(event) {
   return approvals.value.find((item) => approvalKey(item) === id) || null;
 }
 
+// 下拉选项的本地缓存:agents / llms 两个列表都按 tenant 分键缓存到 localStorage,
+// TTL 7 天。bootstrap 启动 / refresh 时:
+//   1) 先用缓存值立即把 agents.value / llms.value 填上 —— UI 不会出现下拉空 → 按钮
+//      disabled → 用户什么也点不动的死锁;
+//   2) 再异步发请求拉最新数据;
+//      - 成功 → 用最新数据覆盖 + 写回 localStorage;
+//      - 失败 → 不改 .value,继续用缓存,等下次自然刷新重试。
+// 之前因为按钮的 chatRunBusy / hasAvailableLlms 联动,只要 listAgents 一时抖动就让
+// "重新发送上一条请求""发送"按钮全部 disabled,用户被卡住没出路。缓存兜底解决这个。
+const DROPDOWN_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
+function dropdownCacheKey(kind) {
+  const tenant = authUser.activeTenantId || "default";
+  return `javaclaw.cache.${tenant}.${kind}`;
+}
+function readDropdownCache(kind) {
+  try {
+    const raw = window.localStorage.getItem(dropdownCacheKey(kind));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!Array.isArray(parsed.value)) return null;
+    if (typeof parsed.savedAt !== "number") return null;
+    if (Date.now() - parsed.savedAt > DROPDOWN_CACHE_TTL_MS) return null;
+    return parsed.value;
+  } catch (error) {
+    return null;
+  }
+}
+function writeDropdownCache(kind, value) {
+  try {
+    if (!Array.isArray(value)) return;
+    window.localStorage.setItem(dropdownCacheKey(kind), JSON.stringify({
+      savedAt: Date.now(),
+      value
+    }));
+  } catch (error) {
+    // localStorage 满 / 隐私模式禁用 → 静默忽略,缓存只是 UX 优化不是必需。
+  }
+}
+function clearDropdownCache() {
+  try {
+    for (const kind of ["agents", "llms"]) {
+      window.localStorage.removeItem(dropdownCacheKey(kind));
+    }
+  } catch (error) { /* ignore */ }
+}
+
+// 最近一次访问的 session id 也按 tenant 分键缓存。bootstrap 完毕后如果 form.sessionId
+// 仍空,优先用这个缓存值自动恢复 —— 用户重开 iframe / 刷主控台时直接落到上次的会话上,
+// 不用每次从空白开始。
+function lastSessionCacheKey() {
+  const tenant = authUser.activeTenantId || "default";
+  return `javaclaw.cache.${tenant}.lastSession`;
+}
+function readLastSessionId() {
+  try {
+    const raw = window.localStorage.getItem(lastSessionCacheKey());
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.sessionId !== "string" || !parsed.sessionId) return null;
+    if (typeof parsed.savedAt !== "number") return null;
+    if (Date.now() - parsed.savedAt > DROPDOWN_CACHE_TTL_MS) return null;
+    return { sessionId: parsed.sessionId, agentId: parsed.agentId || "" };
+  } catch (error) { return null; }
+}
+function writeLastSessionId(sessionId, agentId) {
+  if (!sessionId) return;
+  try {
+    window.localStorage.setItem(lastSessionCacheKey(), JSON.stringify({
+      savedAt: Date.now(),
+      sessionId,
+      agentId: agentId || ""
+    }));
+  } catch (error) { /* ignore */ }
+}
+function clearLastSessionId() {
+  try { window.localStorage.removeItem(lastSessionCacheKey()); } catch (error) { /* ignore */ }
+}
+
 async function bootstrap() {
-  agents.value = await listAgents();
-  llms.value = await listLlms();
+  // 步骤 1: 立刻从 localStorage 读缓存填进 agents.value / llms.value。
+  // 即使后续 listAgents / listLlms 失败,UI 也不会出现下拉为空 → 按钮全 disabled
+  // → 用户被锁死的情况(典型场景:listAgents 一时 401 / 瞬时网络抖,bootstrap 跑完
+  // agents.value 是空数组,顶部 agent 下拉显示"自动路由"但其它选项缺失,而依赖
+  // hasAvailableLlms / chatRunBusy 的"重新发送"按钮也同样不可点)。
+  const cachedAgents = readDropdownCache("agents");
+  const cachedLlms = readDropdownCache("llms");
+  if (cachedAgents && agents.value.length === 0) agents.value = cachedAgents;
+  if (cachedLlms && llms.value.length === 0) llms.value = cachedLlms;
+
+  // 步骤 2: 用 allSettled 把两条请求隔离,任何一条失败不影响另一条。
+  // 成功的那条覆盖 .value 并写回缓存;失败的那条保持缓存值不动,下次自然重试。
+  const [agentsResult, llmsResult] = await Promise.allSettled([
+    listAgents(),
+    listLlms()
+  ]);
+  if (agentsResult.status === "fulfilled") {
+    agents.value = agentsResult.value;
+    writeDropdownCache("agents", agentsResult.value);
+  } else {
+    console.warn("[bootstrap] listAgents failed:", agentsResult.reason);
+  }
+  if (llmsResult.status === "fulfilled") {
+    llms.value = llmsResult.value;
+    writeDropdownCache("llms", llmsResult.value);
+  } else {
+    console.warn("[bootstrap] listLlms failed:", llmsResult.reason);
+  }
   if (!form.agentId && agents.value.length > 0) {
     form.agentId = agents.value[0].agentId;
     searchForm.agentId = agents.value[0].agentId;
   }
-  if (!form.llmConfigId) {
+  if (!form.llmConfigId && llms.value.length > 0) {
     form.llmConfigId = llms.value.find((item) => item.defaultConfig)?.configId || llms.value[0]?.configId || "";
   }
   syncSelectedRuntimeModel();
@@ -1964,8 +2287,25 @@ const isPlanPanelVisible = computed(() => {
   // 但 trigger-gated skill 激活后,大量请求(简单聊天、不命中关键词的指令)根本不会走
   // plan.create —— 如果沿用旧逻辑,这些请求也会空转一个"准备中…"面板直到 run 结束,
   // 变成无意义弹窗。现在改成:拿到 PLAN_UPDATED 事件、有实际 step 后才展示。
+  // embed 模式下另有内嵌方式(挂在用户消息下方),不再用顶部独立面板。
+  if (embedMode.value) return false;
   return Array.isArray(state.runPlan.steps) && state.runPlan.steps.length > 0;
 });
+
+// embed 模式下 plan 不再走顶部横条,而是内嵌到 conversation timeline 里、紧跟用户
+// 消息显示。判定:仅 embed + 当前 run 跟 plan 关联 + 仍有未 COMPLETED/SKIPPED step。
+// plan 全部 step 完成后自动隐藏(用户已经在主气泡看到完整报告,plan 信息冗余)。
+function shouldShowInlinePlan(runId) {
+  if (!embedMode.value) return false;
+  if (!runId || state.runPlan.runId !== runId) return false;
+  const steps = state.runPlan.steps;
+  if (!Array.isArray(steps) || !steps.length) return false;
+  return steps.some((step) => step.status !== "COMPLETED" && step.status !== "SKIPPED");
+}
+function firstUserBlockOf(group) {
+  if (!group || !Array.isArray(group.blocks)) return null;
+  return group.blocks.find((b) => isUserBlock(b)) || null;
+}
 
 const planProgressLabel = computed(() => {
   const steps = state.runPlan.steps;
@@ -2068,21 +2408,28 @@ function pushEvent(event) {
       const streamed = stripRunStatusPrefix(raw).trim();
       if (streamed) {
         const evtRunId = normalized.runId || state.currentRunId;
-        // 从 content 里抽 step 编号(后端 RUN_STATUS 格式是 "step=N phase=MODEL_OUTPUT ...")。
-        // 一个 run 会经历多个 tool loop iteration,每次 iteration 都会发自己的 MODEL_OUTPUT 累积流。
-        // 如果 step 变了,说明上一轮 LLM 输出已收尾(后端已经或即将发起 tool 调用 / 进入下一轮),
-        // 必须把当前 live 文字冻成一个独立 assistant 气泡再开新一轮,否则下一轮的 overwrite 会
-        // 把自检 / 过渡说明 / 优化后报告等中间 turn 的内容全部吃掉。
+        // 中间状态输出走"替换式":只有一个 live bubble,新 step 的 MODEL_OUTPUT 直接
+        // 覆盖上一 step 残留的 content/thinking,不再冻结成独立气泡堆叠。每个 step 自检
+        // / 过渡说明 / 中间分析的实时可见性由这个 live bubble 提供;真正的最终交付物
+        // 由 artifact.markdown 等渲染工具落成 transcript message 永久保留。
         const stepMatch = raw.match(/\bstep=(\d+)\b/);
         const nextStep = stepMatch ? parseInt(stepMatch[1], 10) : null;
         const prevStep = state.liveAssistant.step;
         const sameRun = state.liveAssistant.runId === evtRunId;
-        if (sameRun && prevStep !== null && nextStep !== null && nextStep !== prevStep && state.liveAssistant.content) {
-          commitLiveAssistantAsBubble(evtRunId, prevStep, state.liveAssistant.content);
+        if (sameRun && prevStep !== null && nextStep !== null && nextStep !== prevStep) {
+          state.liveAssistant.thinking = "";
         }
         state.liveAssistant.runId = evtRunId;
         state.liveAssistant.content = streamed;
         if (nextStep !== null) state.liveAssistant.step = nextStep;
+      }
+    } else if (phase === "MODEL_THINKING") {
+      // 推理模型的 reasoning_content 累积流,跟 MODEL_OUTPUT 平行,前端单独显示(可折叠)。
+      const streamed = stripRunStatusPrefix(raw).trim();
+      if (streamed) {
+        const evtRunId = normalized.runId || state.currentRunId;
+        state.liveAssistant.runId = evtRunId;
+        state.liveAssistant.thinking = streamed;
       }
     } else if (phase === "MODEL_RETRY") {
       // 超时重试会重新从头流，如果不清掉前一次的半截文本，UI 看起来是“字退回又往前涨”，
@@ -2149,6 +2496,7 @@ function pushEvent(event) {
     delete state.renderCompletionHintByRun[completedRunId];
     state.liveAssistant.runId = "";
     state.liveAssistant.content = "";
+    state.liveAssistant.thinking = "";
     state.liveAssistant.step = null;
   }
 
@@ -2156,6 +2504,7 @@ function pushEvent(event) {
     delete state.renderCompletionHintByRun[normalized.runId];
     state.liveAssistant.runId = "";
     state.liveAssistant.content = "";
+    state.liveAssistant.thinking = "";
     state.liveAssistant.step = null;
   }
 
@@ -2196,6 +2545,12 @@ function pushEvent(event) {
 
   if (["RUN_STATUS", "TOOL_COMPLETED", "RUN_COMPLETED", "RUN_FAILED"].includes(normalized.type)) {
     scheduleRunRefresh(250);
+  }
+  // RUN_STARTED 之后给 SimpleAgentRunner 留点时间种 plan + RunPlanPersister.sync 落 plan_json,
+  // 然后从 run_record 把 plan_json 拉过来 hydrate。这是"PLAN_UPDATED 事件链路有问题"的兜底:
+  // 哪怕 ws 事件丢了 / 被某层过滤吃了,前端也能从 DB 拉到 plan 显示出来。
+  if (normalized.type === "RUN_STARTED") {
+    scheduleRunRefresh(800);
   }
 }
 
@@ -2331,6 +2686,10 @@ function navigateToMenu(menu, options = {}) {
   const agentId = options.agentId ?? state.resolvedAgentId ?? form.agentId;
   if (agentId) {
     query.agentId = agentId;
+  }
+  // 关键:embed=1 必须跨导航保留 —— 任何子路由跳走丢了它,embedMode 立刻变 false,左栏就回来。
+  if (route.query.embed) {
+    query.embed = route.query.embed;
   }
   if (menu === "chat") {
     router.push({
@@ -2694,9 +3053,15 @@ function scheduleRunRefresh(delay = 300) {
 }
 
 async function executeChatRequest(payload) {
+  // 之前这里见到 llms.value 是空就直接弹"后端没加载到 LLM"阻断发送 —— 太死板:很多时候
+  // 是 listLlms 那条请求暂时失败导致前端误判。这里先尝试主动刷一次 LLM 列表,真不行再
+  // 让请求带空 llmConfigId 走后端的 default 解析,后端自己会从 DB 找 enabled=true 的兜底。
   if (!hasAvailableLlms.value) {
-    state.error = llmWarning.value;
-    return;
+    try {
+      const fresh = await listLlms();
+      llms.value = fresh;
+      writeDropdownCache("llms", fresh);
+    } catch { /* swallow, continue */ }
   }
   if (currentStream.value) {
     state.error = "当前会话已有运行中的任务，请等待完成后再发送。";
@@ -2723,6 +3088,18 @@ async function executeChatRequest(payload) {
     const outgoingMessage = payload.message;
     const outgoingReferences = cloneTransportItems(payload.references || []);
     const outgoingAttachments = cloneTransportItems(payload.attachments || []);
+    // embed 模式 + 宿主注册过方法 → 自动追加 host_methods.json 让 LLM 看见可调方法清单
+    if (embedMode.value && embedHostMethods.value.length) {
+      outgoingAttachments.push({
+        name: "host_methods.json",
+        contentType: "application/json",
+        content: JSON.stringify({
+          channel: "host.invoke",
+          usage: "Call host.invoke({method, payload}) to invoke any of these host methods.",
+          methods: embedHostMethods.value
+        })
+      });
+    }
     const accepted = await sendChat({
       sessionId: payload.sessionId || undefined,
       userId: payload.userId || undefined,
@@ -2740,6 +3117,10 @@ async function executeChatRequest(payload) {
     };
 
     form.sessionId = accepted.sessionId;
+    // session 一拿到就开桥 socket,后续 LLM 调 host.invoke 才能传回浏览器执行
+    if (embedMode.value) {
+      ensureEmbedBridge(accepted.sessionId);
+    }
     if (!payload.preserveComposer) {
       form.message = "";
       form.references = [];
@@ -3018,10 +3399,11 @@ async function refreshRun() {
 
 function hydrateRunPlanFromDetail(run) {
   if (!run || !run.planJson) return;
-  if (state.runPlan.runId === run.runId && Array.isArray(state.runPlan.steps) && state.runPlan.steps.length > 0) {
-    // 已经从 PLAN_UPDATED 实时事件拿到过 snapshot,不要被 DB 快照覆盖回旧状态
-    return;
-  }
+  // 总用 DB plan_json 覆盖。之前这里有"已经从 PLAN_UPDATED 拿到 snapshot 就不覆盖"
+  // 的保护,但实际上 preflight 自动把 wave-0 step 跑成 COMPLETED 并 RunPlanPersister.sync
+  // 到 DB,**没再 emit PLAN_UPDATED**;再加上 embed 模式下 ws 事件偶发丢失,
+  // 这条保护反而让前端永远卡在最初 seed 的 PENDING 状态。RunPlanPersister.sync 同样会
+  // 在每次 plan.update 后同步,DB 不会落后于事件。直接覆盖最稳。
   try {
     const snapshot = JSON.parse(run.planJson);
     if (snapshot && Array.isArray(snapshot.steps)) {
@@ -3202,7 +3584,8 @@ const agentEditor = reactive({
   systemPrompt: "",
   agentMarkdown: "",
   memoryMarkdown: "",
-  enabled: true
+  enabled: true,
+  scope: { ...DEFAULT_SCOPE }
 });
 
 function openAgentEditor(existing) {
@@ -3215,6 +3598,7 @@ function openAgentEditor(existing) {
     agentEditor.agentMarkdown = existing.agentMarkdown || "";
     agentEditor.memoryMarkdown = existing.memoryMarkdown || "";
     agentEditor.enabled = existing.enabled;
+    agentEditor.scope = readScopeFromView(existing);
   } else {
     agentEditor.isNew = true;
     agentEditor.agentId = "";
@@ -3224,6 +3608,7 @@ function openAgentEditor(existing) {
     agentEditor.agentMarkdown = "";
     agentEditor.memoryMarkdown = "";
     agentEditor.enabled = true;
+    agentEditor.scope = { ...DEFAULT_SCOPE };
   }
   agentEditor.visible = true;
 }
@@ -3245,7 +3630,8 @@ async function submitAgentEditor() {
       systemPrompt: agentEditor.systemPrompt,
       agentMarkdown: agentEditor.agentMarkdown,
       memoryMarkdown: agentEditor.memoryMarkdown,
-      enabled: agentEditor.enabled
+      enabled: agentEditor.enabled,
+      ...flattenScopeForRequest(agentEditor.scope)
     });
     closeAgentEditor();
     await refreshCatalog();
@@ -3335,6 +3721,55 @@ const recentSessionsDrawer = reactive({ open: false });
 function openRecentSessionsDrawer() { recentSessionsDrawer.open = true; }
 function closeRecentSessionsDrawer() { recentSessionsDrawer.open = false; }
 function toggleRecentSessionsDrawer() { recentSessionsDrawer.open = !recentSessionsDrawer.open; }
+
+// 顶部工具栏的"刷新下拉"按钮:用户主动触发,绕过 localStorage 缓存重拉 agents+llms。
+// 失败的请求保持现有 .value,成功的覆盖并写回缓存。loadingDropdownRefresh 让按钮在
+// 请求过程中显示 loading 态,避免用户连点抖。
+const dropdownRefreshing = ref(false);
+async function refreshDropdownLists() {
+  if (dropdownRefreshing.value) return;
+  dropdownRefreshing.value = true;
+  try {
+    const [a, l] = await Promise.allSettled([listAgents(), listLlms()]);
+    if (a.status === "fulfilled") {
+      agents.value = a.value;
+      writeDropdownCache("agents", a.value);
+    } else {
+      console.warn("[dropdown.refresh.agents_failed]", a.reason);
+    }
+    if (l.status === "fulfilled") {
+      llms.value = l.value;
+      writeDropdownCache("llms", l.value);
+    } else {
+      console.warn("[dropdown.refresh.llms_failed]", l.reason);
+    }
+  } finally {
+    dropdownRefreshing.value = false;
+  }
+}
+
+// embed 浮动面板里"跳转到主控台当前会话"按钮:embed 浮动面板 UI 极简,
+// 用户经常想跳到完整 web-console 看完整 timeline / artifacts / approvals。
+// 这个按钮只在 embed 模式下出现(非 embed 用户已经在主控台,没必要跳)。
+//
+// 凭证传递:embed iframe 用的是 OAuth access_token(Bearer),主控台原本靠 cookie
+// AGENT_TOKEN 登录 —— 不一定有,即使有也是另一个用户的。所以把当前的 OAuth token
+// 作为 URL query "token=" 带过去,主控台 onMounted 检测后调 setEmbedAccessToken
+// 让所有请求都带 Bearer,身份就跟 iframe 内一致。token 用完后立刻从 URL 清掉,
+// 防 history/书签泄漏。
+function openCurrentSessionInConsole() {
+  const sessionId = form.sessionId;
+  const agentId = form.agentId || state.resolvedAgentId || "";
+  const token = getEmbedAccessToken();
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (agentId) params.set("agentId", agentId);
+  if (token) params.set("token", token);
+  const query = params.toString();
+  const href = `${window.location.origin}/chat${query ? "?" + query : ""}`;
+  // embed 模式新窗口打开,不替换 iframe 自身。非 embed 不显示按钮,这个分支不会走到。
+  window.open(href, "_blank", "noopener,noreferrer");
+}
 function openSessionFromDrawer(session) {
   closeRecentSessionsDrawer();
   openSession(session);
@@ -3389,6 +3824,46 @@ const oauthClientForm = reactive({
 function openCreateUserModal() {
   Object.assign(userForm, { username: "", email: "", displayName: "", preferredTenantId: "" });
   openAdminModal("user");
+}
+
+// 编辑已有用户:displayName / email / status / preferredTenantId(仅 sysadmin 改租户)。
+// 跟"新建"独立一个 modal type,因为编辑里 username 不可改 + 多了 status/原值预填。
+const userEditForm = reactive({
+  id: "",
+  username: "",
+  displayName: "",
+  email: "",
+  status: "ACTIVE",
+  preferredTenantId: "",
+  passwordMustChange: false
+});
+function openEditUserModal(user) {
+  if (!user) return;
+  Object.assign(userEditForm, {
+    id: user.id,
+    username: user.username || "",
+    displayName: user.displayName || "",
+    email: user.email || "",
+    status: user.status || "ACTIVE",
+    preferredTenantId: user.preferredTenantId || "",
+    passwordMustChange: !!user.passwordMustChange
+  });
+  openAdminModal("userEdit");
+}
+async function submitUserEdit() {
+  if (!userEditForm.id) return;
+  try {
+    await adminUpdateUser(userEditForm.id, {
+      displayName: userEditForm.displayName.trim() || null,
+      email: userEditForm.email.trim() || null,
+      status: userEditForm.status || null,
+      preferredTenantId: userEditForm.preferredTenantId.trim() || null
+    });
+    closeAdminModal();
+    await refreshAdminCatalog();
+  } catch (error) {
+    state.error = error.message;
+  }
 }
 
 async function submitUserCreate() {
@@ -3939,7 +4414,8 @@ async function refreshWhoami() {
   }
   // P4: 后端关掉匿名以后,匿名用户进任何非 /login 路由都自动跳登录页。
   // 已经在 /login 上就别再 push 了,免得 router 报 navigation duplicated。
-  if (authUser.anonymous && route.name !== "login") {
+  // embed 模式下不跳登录(父 SDK 用 OAuth token 换的身份,不能跳走父页面)。
+  if (authUser.anonymous && route.name !== "login" && !embedMode.value) {
     router.replace({ name: "login" });
   }
 }
@@ -3955,6 +4431,13 @@ async function submitLogin() {
     await apiLogin(loginForm.username.trim(), loginForm.password);
     await refreshWhoami();
     loginForm.password = "";
+    // 登录成功后必须显式 bootstrap —— router.replace 不会重新触发 onMounted,
+    // 之前的 bug 是登录路径下 agents/llms 永远是初始空数组,UI 直接弹"没有可用 LLM"。
+    // 直接进 /chat (有效 cookie) 那条路径在 onMounted 里已经跑过 initAfterAuth,
+    // 但走登录拿到 cookie 这条路径必须在这儿补上一次。
+    if (!authUser.anonymous) {
+      await initAfterAuth();
+    }
     // 模板首先按 route.name === 'login' 判断;不跳走的话改密页永远不会渲染。
     // 一律 replace 到 /chat —— 改密 shell 由 passwordMustChange 自己接管。
     router.replace({ name: "chat" });
@@ -3967,6 +4450,10 @@ async function submitLogin() {
 
 async function submitLogout() {
   await apiLogout();
+  // 登出清掉所有下拉缓存,避免下个用户首屏看到上一个账号能看到的 LLM/agent 列表。
+  // 同时清掉 lastSession,下个账号不要被自动加载到上一个用户的会话上。
+  clearDropdownCache();
+  clearLastSessionId();
   await refreshWhoami();
   router.replace({ name: "login" });
 }
@@ -4000,12 +4487,212 @@ async function submitChangePassword() {
     await refreshWhoami();
     passwordChangeForm.oldPassword = "";
     passwordChangeForm.newPassword = "";
+    // 首次登录 passwordMustChange=true 的用户改完密后跳 chat,如果 onMounted 当时
+    // 是匿名分支 return 的(没跑过 bootstrap),这里必须显式补一次,否则 agents/llms
+    // 列表全空,UI 弹"没有可用 LLM"。idempotent,即使已经初始化过也安全。
+    if (!authUser.anonymous) {
+      await initAfterAuth();
+    }
     router.replace({ name: "chat" });
   } catch (error) {
     passwordChangeForm.error = error?.message || String(error);
   } finally {
     passwordChangeForm.submitting = false;
   }
+}
+
+// embed 模式下"关闭"按钮点击 —— 通过 postMessage 通知父 SDK 收起浮动容器。
+// 不能在模板里直接写 window.parent.postMessage(),Vue template scope 看不到 window。
+function hideEmbedPanel() {
+  if (typeof window !== "undefined" && window.parent) {
+    window.parent.postMessage({ type: "jc.embed.hide" }, "*");
+  }
+}
+
+// embed 模式 host.invoke 桥:LLM 调 host.invoke 工具 → 后端 ExternalBridgeGateway 经 /ws/bridge
+// 把 invoke 推给我们 → 我们 postMessage 给宿主 → 宿主执行后回 jc.embed.invoke.result → 我们送回 socket。
+function ensureEmbedBridge(sessionId) {
+  console.log("[App.bridge] ensureEmbedBridge called", { sessionId, embedMode: embedMode.value });
+  if (!embedMode.value || !sessionId) return;
+  if (embedBridgeSocket && embedBridgeSocket.readyState === WebSocket.OPEN) {
+    console.log("[App.bridge] already open, skip");
+    return;
+  }
+  if (embedBridgeSocket && embedBridgeSocket.readyState === WebSocket.CONNECTING) {
+    console.log("[App.bridge] already connecting, skip");
+    return;
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams({ sessionId });
+  const tok = getEmbedAccessToken();
+  if (tok) params.set("access_token", tok);
+  const url = `${protocol}//${window.location.host}/ws/bridge?${params.toString()}`;
+  console.log("[App.bridge] connecting", url);
+  const socket = new WebSocket(url);
+  embedBridgeSocket = socket;
+  socket.onopen = () => console.log("[App.bridge] OPEN", sessionId);
+  socket.onmessage = (event) => {
+    console.log("[App.bridge] raw msg from server", event.data);
+    let payload = null;
+    try { payload = JSON.parse(event.data); } catch (e) {
+      console.warn("[App.bridge] non-JSON message dropped");
+      return;
+    }
+    if (payload?.type !== "invoke") {
+      console.log("[App.bridge] non-invoke msg dropped", payload?.type);
+      return;
+    }
+    console.log("[App.bridge] forwarding invoke to parent SDK", payload);
+    if (window.parent) {
+      window.parent.postMessage({
+        type: "jc.embed.invoke",
+        // 把当前 sessionId 一并带过去 —— SDK 后续通过 HTTP /api/bridge/invoke-result
+        // 回写时要拿来对账。这条 invoke 是从 sessionId 这条 bridge socket 里来的,
+        // 所以这里的 sessionId 一定是 LLM 当前期待的会话。
+        sessionId: sessionId,
+        method: payload.method,
+        payload: payload.payload,
+        requestId: payload.requestId,
+        timeoutMs: payload.timeoutMs
+      }, "*");
+    }
+  };
+  socket.onclose = (e) => {
+    console.log("[App.bridge] CLOSE", e.code, e.reason);
+    embedBridgeSocket = null;
+  };
+  socket.onerror = (error) => {
+    console.warn("[App.bridge] ERROR", error);
+  };
+}
+
+// embed 模式:监听父 SDK 投来的 jc.embed.init,拿 token + agent/userId 等后正式 bootstrap。
+// 后续也接 jc.embed.send(从父页面主动发消息)。host.invoke / methods 列表先记下,留给后面接桥。
+// hostInvoke:iframe 内部代码主动调用宿主(xmap-ol-front 注册到 window.AI 的)方法。
+// 跟 LLM 那条 host.invoke 工具调用是两条独立路径 —— 这里 iframe 自己发起、自己拿 result,
+// 不经服务端 bridge。requestId 用来在 iframe 这一侧对账多个并发调用。
+const hostInvokePending = new Map();
+function hostInvoke(method, payload) {
+  return new Promise((resolve, reject) => {
+    if (!embedMode.value) {
+      reject(new Error("hostInvoke 仅在 embed 模式下可用"));
+      return;
+    }
+    if (!window.parent) {
+      reject(new Error("没有 window.parent,无法 host invoke"));
+      return;
+    }
+    const requestId = `host-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const timer = setTimeout(() => {
+      if (hostInvokePending.has(requestId)) {
+        hostInvokePending.delete(requestId);
+        reject(new Error(`hostInvoke timeout: ${method}`));
+      }
+    }, 120000); // 给 2 分钟,绘制类操作要等用户在地图上点
+    hostInvokePending.set(requestId, { resolve, reject, timer });
+    window.parent.postMessage({
+      type: "jc.embed.host_invoke",
+      requestId,
+      method,
+      payload: payload || {}
+    }, "*");
+  });
+}
+
+function setupEmbedListener() {
+  window.addEventListener("message", async (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object" || !data.type) return;
+    if (data.type === "jc.embed.host_invoke.result") {
+      // hostInvoke 的回应,按 requestId 找到 pending 的 Promise 解开
+      const entry = hostInvokePending.get(data.requestId);
+      if (!entry) return;
+      hostInvokePending.delete(data.requestId);
+      clearTimeout(entry.timer);
+      if (data.success) entry.resolve(data.result);
+      else entry.reject(new Error(data.error || "host invoke failed"));
+      return;
+    }
+    if (data.type === "jc.embed.init") {
+      const payload = data.payload || {};
+      const token = payload.accessToken || "";
+      if (!token) {
+        console.warn("[App] embed init received without accessToken; cannot bootstrap");
+        return;
+      }
+      setEmbedAccessToken(token);
+      if (payload.agentId) {
+        form.agentId = payload.agentId;
+        state.resolvedAgentId = payload.agentId;
+      }
+      if (payload.userId) {
+        form.userId = payload.userId;
+      }
+      // init 时 SDK 已经把第一批方法名一起带过来(xmap-ol-front 注册了 34 个),先存上
+      if (Array.isArray(payload.methods)) {
+        embedHostMethods.value = payload.methods.map((m) => String(m || "").trim()).filter(Boolean);
+      }
+      try {
+        await refreshWhoami();
+        if (authUser.anonymous) {
+          console.warn("[App] embed token rejected by whoami, see backend log");
+          return;
+        }
+        await bootstrap();
+        await refreshMemories();
+        await refreshCatalog();
+        await refreshActiveRuns();
+        embedReady.value = true;
+        // 通知父页面我们准备好了 —— 带 sessionId,父 SDK 拿它后面 HTTP 回写 invoke_result 要用
+        window.parent?.postMessage({ type: "jc.embed.ready", initialized: true, sessionId: form.sessionId || "" }, "*");
+      } catch (error) {
+        console.error("[App] embed bootstrap failed:", error);
+        window.parent?.postMessage({ type: "jc.embed.error", payload: { message: String(error?.message || error) } }, "*");
+      }
+      return;
+    }
+    if (data.type === "jc.embed.send") {
+      const text = data.payload?.message || "";
+      if (text) {
+        form.message = text;
+        await runChat();
+      }
+      return;
+    }
+    if (data.type === "jc.embed.registerMethods") {
+      // 宿主每次扩充方法都会再投一次完整列表,直接覆盖
+      const list = data.payload?.methods;
+      embedHostMethods.value = Array.isArray(list)
+        ? list.map((m) => String(m || "").trim()).filter(Boolean)
+        : [];
+      console.log("[App] embed host methods registered:", embedHostMethods.value.length);
+      return;
+    }
+    if (data.type === "jc.embed.parent_visible") {
+      // 父 SDK 把 iframe 重新显示出来时投这条 —— 利用机会把 LLM/agents 列表
+      // 刷新一遍。宿主在 iframe 隐藏期间可能新建/禁用过 LLM 配置,用户重新打开
+      // 应该看到最新视图,而不是上次离开时的快照。成功的请求顺手写一遍 localStorage
+      // 缓存,下次再起 iframe 即便瞬时网络抖也不会下拉空。
+      if (authUser.loaded && !authUser.anonymous) {
+        try {
+          const [a, l] = await Promise.allSettled([listAgents(), listLlms()]);
+          if (a.status === "fulfilled") {
+            agents.value = a.value;
+            writeDropdownCache("agents", a.value);
+          }
+          if (l.status === "fulfilled") {
+            llms.value = l.value;
+            writeDropdownCache("llms", l.value);
+          }
+        } catch (error) {
+          console.warn("[embed.parent_visible.refresh_failed]", error?.message || error);
+        }
+      }
+      return;
+    }
+  });
+  // 第一拉手:告诉父 SDK 我已经挂载好,等 init
+  window.parent?.postMessage({ type: "jc.embed.ready", initialized: false, sessionId: "" }, "*");
 }
 
 // 任何 fetch 收到 401 都走这里 —— 立刻清掉认证态,跳到 /login。
@@ -4027,31 +4714,97 @@ function handleUnauthorized() {
   }
 }
 
-onMounted(async () => {
-  window.addEventListener("auth:unauthorized", handleUnauthorized);
-  syncStateFromRoute();
-  await refreshWhoami();
-  // 匿名 + 强制登录场景下,refreshWhoami 已经把路由 replace 到 /login 了;
-  // 这里直接 return,不要再启动 bootstrap / 轮询,免得在登录页就把后端打 401 一遍。
-  if (authUser.anonymous) {
-    return;
-  }
+// 登录成功后(走 onMounted 直进或走 submitLogin)都要跑这套初始化:
+// bootstrap (agents+llms) → 会话/审批/记忆/目录/活跃 run → 起 4s 轮询 → 滚动到底。
+// idempotent: 重复调用不会重复设 setInterval、不会叠加 click listener。
+let initAfterAuthDone = false;
+async function initAfterAuth() {
   await bootstrap();
+  // 没显式带 sessionId 进来(URL query 没传)时,看 localStorage 里有没有上次访问的会话。
+  // 有就自动恢复 —— 用户重开 iframe / 刷主控台不用每次从空白起步。会话不存在(被删了
+  // 等)时 refreshSession 会失败,catch 一下清掉缓存避免下次仍然尝试。
+  if (!form.sessionId) {
+    const cachedSession = readLastSessionId();
+    if (cachedSession?.sessionId) {
+      form.sessionId = cachedSession.sessionId;
+      if (cachedSession.agentId && !form.agentId) {
+        form.agentId = cachedSession.agentId;
+      }
+      searchForm.sessionId = cachedSession.sessionId;
+    }
+  }
   if (form.sessionId) {
-    await refreshSession();
-    await refreshApprovals();
-    await recoverActiveRunForSession();
+    try {
+      await refreshSession();
+      await refreshApprovals();
+      await recoverActiveRunForSession();
+    } catch (error) {
+      console.warn("[initAfterAuth.lastSession_load_failed]", error?.message || error);
+      // 缓存的 sessionId 已不可用(被删除/跨租户等),清掉防止下次再尝试,form.sessionId 也复原。
+      clearLastSessionId();
+      form.sessionId = "";
+    }
   }
   await refreshMemories();
   await refreshCatalog();
   await refreshActiveRuns();
-  // Poll every 4s — cheap (just the list endpoint) and keeps the dock honest.
-  activeRunsTimer = setInterval(refreshActiveRuns, 4000);
-  window.addEventListener("click", closeContextMenu);
+  if (!activeRunsTimer) {
+    activeRunsTimer = setInterval(refreshActiveRuns, 4000);
+  }
+  if (!initAfterAuthDone) {
+    window.addEventListener("click", closeContextMenu);
+    initAfterAuthDone = true;
+  }
   syncComposerEditor();
-  // 首次挂载完,把会话流滚到底部 —— 历史消息列表默认停在最新一条,用户进来就看到当前对话。
   await nextTick();
   scrollConversationToBottom({ force: true });
+}
+
+onMounted(async () => {
+  window.addEventListener("auth:unauthorized", handleUnauthorized);
+  // embed 模式:URL 带 ?embed=1 → 等父 SDK postMessage 的 jc.embed.init 把 token 灌过来,
+  // 之后才 refreshWhoami + bootstrap;路由强制留在 /chat,不参与正常的登录流。
+  if (embedMode.value) {
+    setupEmbedListener();
+    syncStateFromRoute();
+    if (route.name !== "chat") {
+      router.replace({ name: "chat" });
+    }
+    return;
+  }
+  // 非 embed 入口:URL 上若带 ?token=xxx,说明是从 iframe 浮动面板"跳转到主控台"按钮
+  // 投过来的,token 是 OAuth Bearer。
+  //
+  // 关键:之前直接 setEmbedAccessToken 把 token 塞进 JS 内存变量,刷新就丢 → 跳回登录页。
+  // 现在改成调 /api/auth/exchange-oauth 让后端用同一个 user/tenant/app 签一个 session JWT
+  // 写 AGENT_TOKEN cookie。cookie 是 HttpOnly + maxAge,刷新页面后浏览器自动带回,后端
+  // JwtAuthWebFilter 照常解析,身份跨刷新持续有效。
+  //
+  // 兜底:exchange 失败(网络 / token 过期 / 后端没起)时退回到旧的 Bearer 内存模式,
+  // 至少当前会话能用,只是刷新就丢 —— 比没法登录强。
+  const incomingToken = typeof route.query.token === "string" ? route.query.token : "";
+  if (incomingToken) {
+    try {
+      await exchangeOauthToSession(incomingToken);
+      // cookie 已写,后续所有 authedFetch 走同源 cookie 路径,不再需要 embedAccessToken。
+    } catch (error) {
+      console.warn("[onMounted.exchange_oauth_failed]", error?.message || error);
+      // 兜底用旧路径,Bearer 模式撑住当前会话,刷新仍会丢登录态。
+      setEmbedAccessToken(incomingToken);
+    }
+    const cleanQuery = { ...route.query };
+    delete cleanQuery.token;
+    await router.replace({ name: "chat", query: cleanQuery });
+  }
+  syncStateFromRoute();
+  await refreshWhoami();
+  // 匿名 + 强制登录场景下,refreshWhoami 已经把路由 replace 到 /login 了;
+  // 这里直接 return,不要再启动 bootstrap / 轮询,免得在登录页就把后端打 401 一遍。
+  // 登录页用户登录成功后由 submitLogin 显式调 initAfterAuth。
+  if (authUser.anonymous) {
+    return;
+  }
+  await initAfterAuth();
 });
 
 // 新消息 / 流式字幕增量 / 新事件 任一触发,都按"用户在底部附近就跟"的策略自动滚动。
@@ -4145,6 +4898,16 @@ watch(
   { deep: true }
 );
 
+// form.sessionId 一变就写 localStorage(非空时),用户切会话/发新消息后下次重开会自动落回此会话。
+// 空值不清缓存 —— "用户主动新建会话" form.sessionId 暂时为空,但缓存里仍是上次的,下次自然回到那条;
+// 显式登出时由 clearLastSessionId 才清。
+watch(
+  () => form.sessionId,
+  (next) => {
+    if (next) writeLastSessionId(next, form.agentId || state.resolvedAgentId || "");
+  }
+);
+
 // 切会话时必须清干净的 session 维度 state —— 以前漏了 events / runPlan / liveStatus /
 // runsByRunId / renderCompletionHintByRun,打开新会话时左下方还能看到上个会话的计划面板、
 // 状态横幅、timeline 事件,非常混乱。统一放这里,openSession / createNewSession 都调用,
@@ -4213,17 +4976,18 @@ function resetLlmForm() {
     chatPath: "/chat/completions",
     stream: true,
     enabled: true,
-    defaultConfig: false
+    defaultConfig: false,
+    scope: { ...DEFAULT_SCOPE }
   });
   llmModelRows.value = [];
 }
 
 function resetKnowledgeForm() {
-  Object.assign(knowledgeForm, { id: "", title: "", content: "", contentType: "markdown", source: "database", tagsJson: "[]", enabled: true });
+  Object.assign(knowledgeForm, { id: "", title: "", content: "", contentType: "markdown", source: "database", tagsJson: "[]", enabled: true, scope: { ...DEFAULT_SCOPE } });
 }
 
 function resetToolForm() {
-  Object.assign(toolForm, { id: "", toolName: "", displayName: "", description: "", schemaJson: "{}", toolType: "builtin", configJson: "{}", enabled: true, approvalRequired: false });
+  Object.assign(toolForm, { id: "", toolName: "", displayName: "", description: "", schemaJson: "{}", toolType: "builtin", configJson: "{}", enabled: true, approvalRequired: false, scope: { ...DEFAULT_SCOPE } });
 }
 
 function resetSkillForm() {
@@ -4235,7 +4999,8 @@ function resetSkillForm() {
     promptTemplate: "",
     configJson: "{}",
     triggerKeywords: "[]",
-    enabled: true
+    enabled: true,
+    scope: { ...DEFAULT_SCOPE }
   });
 }
 
@@ -4260,7 +5025,7 @@ function createLlm() {
 
 function editLlm(item) {
   const modelMappingJson = normalizeModelMappingJsonInput(item.modelMappingJson, item.model, true);
-  Object.assign(llmForm, item, { modelMappingJson });
+  Object.assign(llmForm, item, { modelMappingJson, scope: readScopeFromView(item) });
   llmModelRows.value = jsonToModelRows(modelMappingJson);
   if (!llmModelRows.value.length) {
     addLlmModelRow();
@@ -4279,11 +5044,13 @@ async function submitLlm() {
     await saveAdminLlm({
       ...llmForm,
       model: primaryModel,
-      modelMappingJson: normalizedMappingJson
+      modelMappingJson: normalizedMappingJson,
+      ...flattenScopeForRequest(llmForm.scope)
     });
     resetLlmForm();
     closeCatalogModal();
     llms.value = await listLlms();
+    writeDropdownCache("llms", llms.value);
     await refreshCatalog();
   } catch (error) {
     state.error = error.message;
@@ -4445,6 +5212,7 @@ async function removeLlm(id) {
   try {
     await deleteAdminLlm(id);
     llms.value = await listLlms();
+    writeDropdownCache("llms", llms.value);
     if (form.llmConfigId === id) {
       form.llmConfigId = "";
       form.llmModel = "";
@@ -4461,13 +5229,17 @@ function createKnowledge() {
 }
 
 function editKnowledge(item) {
-  Object.assign(knowledgeForm, item);
+  Object.assign(knowledgeForm, item, { scope: readScopeFromView(item) });
   openCatalogModal("knowledge", "edit");
 }
 
 async function submitKnowledge() {
   try {
-    await saveKnowledgeEntry({ ...knowledgeForm, agentId: state.resolvedAgentId || form.agentId });
+    await saveKnowledgeEntry({
+      ...knowledgeForm,
+      agentId: state.resolvedAgentId || form.agentId,
+      ...flattenScopeForRequest(knowledgeForm.scope)
+    });
     resetKnowledgeForm();
     closeCatalogModal();
     await refreshCatalog();
@@ -4491,13 +5263,17 @@ function createTool() {
 }
 
 function editTool(item) {
-  Object.assign(toolForm, item);
+  Object.assign(toolForm, item, { scope: readScopeFromView(item) });
   openCatalogModal("tools", "edit");
 }
 
 async function submitTool() {
   try {
-    await saveToolDefinition({ ...toolForm, agentId: state.resolvedAgentId || form.agentId });
+    await saveToolDefinition({
+      ...toolForm,
+      agentId: state.resolvedAgentId || form.agentId,
+      ...flattenScopeForRequest(toolForm.scope)
+    });
     resetToolForm();
     closeCatalogModal();
     await refreshCatalog();
@@ -4533,7 +5309,8 @@ function editSkill(item) {
     promptTemplate: item.promptTemplate || "",
     configJson: item.configJson || "{}",
     triggerKeywords: item.triggerKeywords || "[]",
-    enabled: item.enabled !== false
+    enabled: item.enabled !== false,
+    scope: readScopeFromView(item)
   });
   openCatalogModal("skills", "edit");
 }
@@ -4556,7 +5333,8 @@ async function submitSkill() {
     await saveSkillDefinition({
       ...skillForm,
       agentIds,
-      agentId: agentIds[0] || null
+      agentId: agentIds[0] || null,
+      ...flattenScopeForRequest(skillForm.scope)
     });
     resetSkillForm();
     closeCatalogModal();
@@ -4584,7 +5362,8 @@ function resetDatasourceForm() {
     password: "",
     dialect: "postgresql",
     description: "",
-    enabled: true
+    enabled: true,
+    scope: { ...DEFAULT_SCOPE }
   });
 }
 
@@ -4602,14 +5381,18 @@ function editDatasource(item) {
     password: "",
     dialect: item.dialect || "",
     description: item.description || "",
-    enabled: item.enabled
+    enabled: item.enabled,
+    scope: readScopeFromView(item)
   });
   openCatalogModal("datasources", "edit");
 }
 
 async function submitDatasource() {
   try {
-    await saveDatasource({ ...datasourceForm });
+    await saveDatasource({
+      ...datasourceForm,
+      ...flattenScopeForRequest(datasourceForm.scope)
+    });
     resetDatasourceForm();
     closeCatalogModal();
     await refreshCatalog();
@@ -4657,30 +5440,14 @@ function eventTone(type) {
 
 function shouldShowTimelineEvent(eventOrType) {
   const type = typeof eventOrType === "string" ? eventOrType : eventOrType?.type;
-  const content = typeof eventOrType === "string" ? "" : eventOrType?.content;
-  if (type === "RUN_STATUS" && isModelOutputStatus(content)) {
-    return false;
-  }
-  // 隐藏后端工具的 TOOL_REQUESTED / TOOL_STARTED / TOOL_COMPLETED 事件 ——
-  // 聊天流式 timeline 不该展示 "tool=db.schema.inspect ..." 这类条目。
-  if (
-    (type === "TOOL_REQUESTED" || type === "TOOL_STARTED" || type === "TOOL_COMPLETED")
-    && typeof content === "string"
-    && /\btool=(\S+)/.test(content)
-  ) {
-    const match = content.match(/\btool=(\S+)/);
-    if (match && isHiddenBackendTool(match[1])) {
-      return false;
-    }
-  }
-  return [
-    "RUN_STATUS",
-    "TOOL_REQUESTED",
-    "TOOL_STARTED",
-    "TOOL_COMPLETED",
-    "APPROVAL_REQUIRED",
-    "RUN_FAILED"
-  ].includes(type);
+  // 主时间线只放需要用户行动 / 关注的关键事件:
+  //   - APPROVAL_REQUIRED:需要点同意/拒绝
+  //   - RUN_FAILED:错误现场,要看 detail
+  // RUN_STATUS / TOOL_REQUESTED / TOOL_STARTED / TOOL_COMPLETED 全部不展示为
+  // 独立卡片 —— 它们是过程态:RUN_STATUS 由顶部 live-status 横幅+流式 live bubble
+  // 表达;工具调用由 transcript 里的 tool message (含渲染负载)永久承载。再单独
+  // 冒一张"执行步骤""工具已选定""工具完成"卡片就是冗余噪音。
+  return type === "APPROVAL_REQUIRED" || type === "RUN_FAILED";
 }
 
 function formatTimelineEventContent(event) {
@@ -4741,8 +5508,8 @@ function formatTimelineEventContent(event) {
     </div>
   </div>
 
-  <div v-else class="workspace-shell">
-    <aside class="left-rail">
+  <div v-else class="workspace-shell" :class="{ 'embed-mode': embedMode }">
+    <aside v-if="!embedMode" class="left-rail">
       <div class="brand-block brand-block--compact">
         <h1 class="brand-title">JavaClaw</h1>
         <!-- Auth indicator / tenant switcher / logout —— 匿名状态显示"登录",登录后显示用户信息 -->
@@ -4863,7 +5630,7 @@ function formatTimelineEventContent(event) {
         <div class="chat-control-deck">
           <div class="chat-topbar">
             <div class="chat-title-block">
-              <strong class="chat-title">{{ currentSessionTitle }}</strong>
+              <strong class="chat-title">{{ embedMode ? 'AI 助手' : currentSessionTitle }}</strong>
               <span class="chat-subtitle">围绕当前会话直接补充材料、框定区域并连续追问</span>
             </div>
             <div class="chat-config-bar floating">
@@ -4875,28 +5642,33 @@ function formatTimelineEventContent(event) {
                   </option>
                 </select>
               </label>
+              <!-- 合并 LLM + 模型成一个下拉。option 是"LLM 名 - 模型名"格式,
+                   v-model 同步写入 form.llmConfigId 和 form.llmModel(用 "configId|apiModel" 拼接 key 解。 -->
               <label class="bar-field bar-field-plain">
-                <select v-model="form.llmConfigId" data-testid="llm-select">
-                  <option value="">自动默认</option>
-                  <option v-for="llm in llms" :key="llm.configId" :value="llm.configId">
-                    {{ llm.displayName }}
+                <select v-model="selectedLlmModelKey" data-testid="llm-model-select">
+                  <option value="|">自动默认</option>
+                  <option v-for="opt in llmModelOptions" :key="opt.key" :value="opt.key">
+                    {{ opt.label }}
                   </option>
                 </select>
               </label>
-              <label class="bar-field bar-field-plain">
-                <select v-model="form.llmModel" data-testid="llm-model-select" :disabled="!selectedRuntimeLlmModels.length">
-                  <option v-if="!selectedRuntimeLlmModels.length" value="">无可用模型</option>
-                  <option v-for="item in selectedRuntimeLlmModels" :key="item.apiModel" :value="item.apiModel">
-                    {{ item.displayName || item.apiModel }}
-                  </option>
-                </select>
-              </label>
-              <label class="bar-field bar-field-compact bar-field-plain">
+              <!-- embed 模式下默认 WebSocket,不让用户切传输方式 -->
+              <label v-if="!embedMode" class="bar-field bar-field-compact bar-field-plain">
                 <select v-model="transport">
                   <option value="sse">SSE</option>
                   <option value="websocket">WebSocket</option>
                 </select>
               </label>
+              <!-- 刷新下拉:绕过 localStorage 缓存重拉 agents+llms,用户主动触发的兜底 -->
+              <button
+                type="button"
+                class="recent-drawer-trigger icon-only"
+                :disabled="dropdownRefreshing"
+                @click="refreshDropdownLists"
+                :title="dropdownRefreshing ? '刷新中…' : '刷新 Agents / LLM 列表'"
+              >
+                {{ dropdownRefreshing ? "⟳" : "↻" }}
+              </button>
               <button
                 type="button"
                 class="recent-drawer-trigger"
@@ -4905,12 +5677,33 @@ function formatTimelineEventContent(event) {
               >
                 ☰ 最近会话
               </button>
+              <!-- 跳转到主控台对应会话页面:仅在 embed 模式下显示(非 embed 用户本来就在主控台)。
+                   点击会带上当前 OAuth access_token,主控台拿到后用 Bearer 模式访问,
+                   身份与 iframe 保持一致。 -->
+              <button
+                v-if="embedMode"
+                type="button"
+                class="recent-drawer-trigger icon-only"
+                @click="openCurrentSessionInConsole"
+                title="在新窗口打开主控台查看当前会话"
+              >
+                ↗
+              </button>
+              <!-- embed 模式独有:隐藏按钮放在按钮组末尾,点了通知父 SDK 收起浮动面板 -->
+              <button
+                v-if="embedMode"
+                type="button"
+                class="recent-drawer-trigger embed-hide-inline"
+                title="隐藏 AI 助手"
+                @click="hideEmbedPanel"
+              >
+                ✕ 关闭
+              </button>
             </div>
           </div>
 
         </div>
 
-        <p v-if="llmWarning" class="error">{{ llmWarning }}</p>
         <p v-if="state.error" class="error">{{ state.error }}</p>
 
         <div class="conversation-panel chat-panel">
@@ -4929,7 +5722,17 @@ function formatTimelineEventContent(event) {
                     <strong>{{ block.message.role }}</strong>
                     <span>{{ block.message.messageType }} · #{{ block.message.seqNo }}</span>
                   </div>
-                  <p v-if="shouldShowMessageText(block.message, group.runId)">{{ displayMessageContent(block.message, group.runId) }}</p>
+                  <template v-if="shouldShowMessageText(block.message, group.runId)">
+                    <!-- assistant 文本默认按 markdown 渲染(表格/列表/code/标题等),
+                         别的角色(user/tool/system)继续走 plain 文本,避免被注入。 -->
+                    <MarkdownBlock
+                      v-if="block.message.role === 'assistant'"
+                      class="markdown-preview bubble-markdown"
+                      :markdown="displayMessageContent(block.message, group.runId)"
+                      :to-html="markdownToHtml"
+                    />
+                    <p v-else>{{ displayMessageContent(block.message, group.runId) }}</p>
+                  </template>
                   <div v-if="block.message.toolName || block.message.toolResultJson" class="inline-tool">
                     <span v-if="block.message.toolName">tool: {{ block.message.toolName }}</span>
                   </div>
@@ -4980,7 +5783,23 @@ function formatTimelineEventContent(event) {
                     <strong>assistant</strong>
                     <span>streaming</span>
                   </div>
-                  <p>{{ block.content }}</p>
+                  <!-- thinking 块:推理模型(o1/R1/qwen-thinking 等)的 reasoning_content。
+                       默认折叠,点头部展开。跟下面的正文是平行流。 -->
+                  <details v-if="block.thinking" class="thinking-block" open>
+                    <summary class="thinking-summary">
+                      <span class="thinking-icon">🧠</span>
+                      <span>思考过程</span>
+                      <span class="thinking-len">{{ block.thinking.length }} 字</span>
+                    </summary>
+                    <div class="thinking-content">{{ block.thinking }}</div>
+                  </details>
+                  <!-- 正文流式 markdown 渲染 -->
+                  <MarkdownBlock
+                    v-if="block.content"
+                    class="markdown-preview bubble-markdown"
+                    :markdown="block.content"
+                    :to-html="markdownToHtml"
+                  />
                 </article>
                 <article
                   v-else
@@ -5064,6 +5883,39 @@ function formatTimelineEventContent(event) {
                   </template>
                   <p v-else>{{ formatTimelineEventContent(block.event) }}</p>
                 </article>
+                <!-- embed 模式下 plan 内嵌到 timeline:紧跟该 run 的第一条 user 消息显示。
+                     v-for 每次循环都判断"当前 block 是不是 firstUserBlock",只在那一次循环
+                     的 article 之后渲染 plan-inline,DOM 顺序正好是 user→plan→其它。
+                     plan 全部 step COMPLETED 后 shouldShowInlinePlan 返回 false,自动隐藏。 -->
+                <div
+                  v-if="block === firstUserBlockOf(group) && shouldShowInlinePlan(group.runId)"
+                  class="run-plan-inline"
+                  :class="{ collapsed: state.runPlan.collapsed }"
+                >
+                  <header class="run-plan-inline-head">
+                    <span class="run-plan-dot" aria-hidden="true"></span>
+                    <strong class="run-plan-inline-title">{{ state.runPlan.title || "任务计划" }}</strong>
+                    <span class="run-plan-inline-meta">{{ planProgressLabel || "进行中…" }}</span>
+                    <button
+                      type="button"
+                      class="run-plan-inline-toggle"
+                      @click="state.runPlan.collapsed = !state.runPlan.collapsed"
+                    >{{ state.runPlan.collapsed ? "展开" : "收起" }}</button>
+                  </header>
+                  <ol v-if="!state.runPlan.collapsed" class="run-plan-inline-steps">
+                    <li
+                      v-for="step in state.runPlan.steps"
+                      :key="step.id"
+                      :class="['run-plan-inline-step', planStepClass(step)]"
+                    >
+                      <span class="run-plan-step-badge">{{ planStepBadge(step) }}</span>
+                      <span class="run-plan-inline-step-title">
+                        <span class="run-plan-inline-step-id">{{ step.id }}</span>
+                        <span class="run-plan-inline-step-text">{{ step.title }}</span>
+                      </span>
+                    </li>
+                  </ol>
+                </div>
               </template>
             </section>
             <section v-if="!transcriptMessages.length && state.events.some((event) => !['RUN_STATUS', 'RUN_COMPLETED', 'TOOL_REQUESTED', 'TOOL_STARTED', 'TOOL_COMPLETED'].includes(event.type))" class="run-group">
@@ -5408,6 +6260,7 @@ function formatTimelineEventContent(event) {
             <input type="checkbox" v-model="agentEditor.enabled" />
             <span>启用（disabled 时不会出现在 agent 下拉选择里）</span>
           </label>
+          <ScopeEditor v-model="agentEditor.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitAgentEditor">保存</button>
             <button @click="closeAgentEditor">取消</button>
@@ -5549,6 +6402,7 @@ function formatTimelineEventContent(event) {
                 <span>{{ item.updatedAt }}</span>
               </div>
               <div class="catalog-row-actions">
+                <button @click="openEditUserModal(item)">编辑</button>
                 <button @click="assignUserRolesHandler(item)">分配角色</button>
                 <button @click="resetUserPasswordHandler(item.id)">重置密码</button>
                 <button @click="deleteUserHandler(item.id)" :disabled="item.id === 'admin'">删除</button>
@@ -5770,6 +6624,7 @@ function formatTimelineEventContent(event) {
           <h3>
             {{
               adminModal.type === 'user' ? '新建用户'
+              : adminModal.type === 'userEdit' ? '编辑用户'
               : adminModal.type === 'import' ? '批量导入用户'
               : adminModal.type === 'tenant' ? (tenantForm.id ? '编辑租户' : '新建租户')
               : adminModal.type === 'role' ? (roleForm.id ? '编辑角色' : '新建角色')
@@ -5801,6 +6656,49 @@ function formatTimelineEventContent(event) {
           <p class="modal-copy">创建后会生成一次性临时密码。首次登录后被强制改密。</p>
           <div class="dock-actions">
             <button class="primary" @click="submitUserCreate">创建</button>
+            <button @click="closeAdminModal">取消</button>
+          </div>
+        </template>
+
+        <!-- 用户:编辑(displayName / email / status / preferredTenantId) -->
+        <template v-if="adminModal.type === 'userEdit'">
+          <label>
+            <span>用户名</span>
+            <input :value="userEditForm.username" disabled />
+          </label>
+          <label>
+            <span>用户 id</span>
+            <input :value="userEditForm.id" disabled />
+          </label>
+          <label>
+            <span>显示名</span>
+            <input v-model="userEditForm.displayName" placeholder="如:张三" />
+          </label>
+          <label>
+            <span>email</span>
+            <input v-model="userEditForm.email" placeholder="可选" />
+          </label>
+          <label>
+            <span>状态</span>
+            <select v-model="userEditForm.status">
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="DISABLED">DISABLED</option>
+              <option value="LOCKED">LOCKED</option>
+            </select>
+          </label>
+          <label>
+            <span>默认租户 id（仅系统管理员可改）</span>
+            <input
+              v-model="userEditForm.preferredTenantId"
+              placeholder="如 system / xmap"
+              :disabled="!authUser.permissions.includes('session.read.all')"
+            />
+          </label>
+          <p v-if="userEditForm.passwordMustChange" class="modal-copy">
+            ⚠ 该用户标记为"首次登录强制改密"。
+          </p>
+          <div class="dock-actions">
+            <button class="primary" @click="submitUserEdit">保存</button>
             <button @click="closeAdminModal">取消</button>
           </div>
         </template>
@@ -6081,6 +6979,7 @@ function formatTimelineEventContent(event) {
             </div>
           </div>
           <label><span>API Key</span><textarea v-model="llmForm.apiKey" rows="4"></textarea></label>
+          <ScopeEditor v-model="llmForm.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitLlm">保存 LLM</button>
             <button @click="closeCatalogModal">取消</button>
@@ -6095,6 +6994,7 @@ function formatTimelineEventContent(event) {
             <label><span>Tags JSON</span><input v-model="knowledgeForm.tagsJson" /></label>
           </div>
           <label><span>Content</span><textarea v-model="knowledgeForm.content" rows="10"></textarea></label>
+          <ScopeEditor v-model="knowledgeForm.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitKnowledge">保存知识</button>
             <button @click="closeCatalogModal">取消</button>
@@ -6111,6 +7011,7 @@ function formatTimelineEventContent(event) {
           <label><span>Description</span><textarea v-model="toolForm.description" rows="4"></textarea></label>
           <label><span>Schema JSON</span><textarea v-model="toolForm.schemaJson" rows="8"></textarea></label>
           <label><span>Config JSON</span><textarea v-model="toolForm.configJson" rows="6"></textarea></label>
+          <ScopeEditor v-model="toolForm.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitTool">保存工具</button>
             <button @click="closeCatalogModal">取消</button>
@@ -6151,6 +7052,7 @@ function formatTimelineEventContent(event) {
           <label><span>Config JSON（whitelistTables / planStepIds / planStepRules / strict）</span>
             <textarea v-model="skillForm.configJson" rows="6"></textarea>
           </label>
+          <ScopeEditor v-model="skillForm.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitSkill">保存 Skill</button>
             <button @click="closeCatalogModal">取消</button>
@@ -6186,11 +7088,45 @@ function formatTimelineEventContent(event) {
             </label>
           </div>
           <label><span>说明</span><textarea v-model="datasourceForm.description" rows="3" placeholder="这个数据源做什么用，skill 如何引用"></textarea></label>
+          <ScopeEditor v-model="datasourceForm.scope" />
           <div class="dock-actions">
             <button class="primary" @click="submitDatasource">保存数据源</button>
             <button @click="closeCatalogModal">取消</button>
           </div>
         </template>
+      </div>
+    </div>
+
+    <!-- embed 模式下走 xmap 真实地图绘制 —— 这是个轻量"挑形状"选择器,
+         用户挑完直接调 host xmap.draw,xmap 那边激活地图绘制工具,等用户画完再回传 -->
+    <div v-if="embedDrawPicker.visible" class="modal-backdrop" @click.self="closeEmbedDrawPicker">
+      <div class="modal-card" style="width:380px;max-width:90vw;">
+        <div class="modal-head">
+          <h3>在地图上绘制区域</h3>
+          <button @click="closeEmbedDrawPicker" :disabled="embedDrawPicker.busy">关闭</button>
+        </div>
+        <div style="padding:16px 20px;font-size:14px;color:#374151;line-height:1.6;">
+          <p v-if="!embedDrawPicker.busy && !embedDrawPicker.error" style="margin:0 0 12px;">
+            选择形状后,请在地图上画 ——
+            完成后会自动作为附件附到当前消息。
+          </p>
+          <p v-if="embedDrawPicker.busy" style="margin:0 0 12px;color:#2563eb;">
+            正在等待你在 xmap 地图上绘制 <strong>{{ embedDrawPicker.busyType }}</strong> ……
+          </p>
+          <p v-if="embedDrawPicker.error" style="margin:0 0 12px;color:#b91c1c;">
+            出错:{{ embedDrawPicker.error }}
+          </p>
+          <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;">
+            <button
+              v-for="t in ['多边形', '矩形', '圆形', '点']"
+              :key="t"
+              class="primary"
+              style="padding:10px 0;"
+              :disabled="embedDrawPicker.busy"
+              @click="embedDrawShape(t)"
+            >{{ embedDrawPicker.busyType === t ? '等待绘制…' : t }}</button>
+          </div>
+        </div>
       </div>
     </div>
 

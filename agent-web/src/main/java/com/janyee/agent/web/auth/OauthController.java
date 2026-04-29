@@ -6,7 +6,9 @@ import com.janyee.agent.infra.auth.SecurityContextHolder;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
 
 import java.net.URI;
 import java.net.URLEncoder;
@@ -73,41 +75,57 @@ public class OauthController {
         }
     }
 
+    /**
+     * WebFlux 下 @RequestParam 对 form-urlencoded body 的绑定不像 MVC 那样自动,
+     * 实际接收的是 query string 部分;form body 不会进 RequestParam。这里显式
+     * 用 ServerWebExchange.getFormData() 拿,query 也兜一份(优先 form body)。
+     */
     @PostMapping(value = "/token",
             consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<?> token(
-            @RequestParam(value = "grant_type", required = false) String grantType,
-            @RequestParam(value = "code", required = false) String code,
-            @RequestParam(value = "client_id", required = false) String clientId,
-            @RequestParam(value = "client_secret", required = false) String clientSecret,
-            @RequestParam(value = "redirect_uri", required = false) String redirectUri,
-            // client_credentials 模式可选传宿主侧的最终用户身份 —— 不存在就自动建
-            @RequestParam(value = "user_id", required = false) String userId,
-            @RequestParam(value = "user_name", required = false) String userName
+    public Mono<ResponseEntity<?>> token(
+            org.springframework.web.server.ServerWebExchange exchange
     ) {
-        try {
-            OauthProviderService.TokenResponse token;
-            if ("authorization_code".equalsIgnoreCase(grantType)) {
-                token = oauth.exchangeCode(code, clientId, clientSecret, redirectUri);
-            } else if ("client_credentials".equalsIgnoreCase(grantType)) {
-                // 第三方系统直接换 token,不走用户跳转。SDK 嵌入场景就走这条。
-                token = oauth.clientCredentialsToken(clientId, clientSecret, userId, userName);
-            } else {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "error", "unsupported_grant_type",
-                        "error_description", "only authorization_code and client_credentials are supported"));
+        return exchange.getFormData().map(formData -> {
+            MultiValueMap<String, String> queryParams = exchange.getRequest().getQueryParams();
+            String grantType   = pick(formData, queryParams, "grant_type");
+            String code        = pick(formData, queryParams, "code");
+            String clientId    = pick(formData, queryParams, "client_id");
+            String clientSecret= pick(formData, queryParams, "client_secret");
+            String redirectUri = pick(formData, queryParams, "redirect_uri");
+            // client_credentials 模式可选传宿主侧的最终用户身份 —— 不存在就自动建
+            String userId      = pick(formData, queryParams, "user_id");
+            String userName    = pick(formData, queryParams, "user_name");
+            try {
+                OauthProviderService.TokenResponse token;
+                if ("authorization_code".equalsIgnoreCase(grantType)) {
+                    token = oauth.exchangeCode(code, clientId, clientSecret, redirectUri);
+                } else if ("client_credentials".equalsIgnoreCase(grantType)) {
+                    token = oauth.clientCredentialsToken(clientId, clientSecret, userId, userName);
+                } else {
+                    return ResponseEntity.badRequest().<Object>body(Map.of(
+                            "error", "unsupported_grant_type",
+                            "error_description", "only authorization_code and client_credentials are supported"));
+                }
+                return ResponseEntity.<Object>ok(Map.of(
+                        "access_token", token.accessToken(),
+                        "token_type", token.tokenType(),
+                        "expires_in", token.expiresInSeconds(),
+                        "scope", token.scope()
+                ));
+            } catch (OauthProviderService.OauthException error) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).<Object>body(Map.of(
+                        "error", error.code().toLowerCase(),
+                        "error_description", error.getMessage()));
             }
-            return ResponseEntity.ok(Map.of(
-                    "access_token", token.accessToken(),
-                    "token_type", token.tokenType(),
-                    "expires_in", token.expiresInSeconds(),
-                    "scope", token.scope()
-            ));
-        } catch (OauthProviderService.OauthException error) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
-                    "error", error.code().toLowerCase(),
-                    "error_description", error.getMessage()));
-        }
+        });
+    }
+
+    private static String pick(MultiValueMap<String, String> formData,
+                                MultiValueMap<String, String> queryParams,
+                                String key) {
+        String v = formData != null ? formData.getFirst(key) : null;
+        if (v != null && !v.isBlank()) return v;
+        return queryParams != null ? queryParams.getFirst(key) : null;
     }
 }

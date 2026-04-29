@@ -1,5 +1,6 @@
 package com.janyee.agent.runtime.loop;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -29,14 +30,29 @@ public final class NextActionHint {
         if (inProgress != null) {
             return Optional.of(describeInProgress(inProgress));
         }
-        PlanStep nextPending = plan.steps().stream()
+        // 优先返回"deps 已全部 COMPLETED 的下一个 PENDING" —— 跳过被 wave barrier 阻塞的 step,
+        // 不然 hint 会告诉 LLM 推进一个还需要等的 step,LLM 调 plan.update 又会被 PlanUpdateTool 拒,
+        // 白白浪费一轮 iteration。
+        PlanStep nextReady = plan.steps().stream()
+                .filter(step -> step.status() == PlanStatus.PENDING)
+                .filter(plan::isReady)
+                .findFirst()
+                .orElse(null);
+        if (nextReady != null) {
+            return Optional.of(describePendingStart(nextReady));
+        }
+        // 没有 ready 的 PENDING 但还有 PENDING(被 deps 卡)→ 提示用户哪条 dep 链没动。
+        PlanStep blockedPending = plan.steps().stream()
                 .filter(step -> step.status() == PlanStatus.PENDING)
                 .findFirst()
                 .orElse(null);
-        if (nextPending == null) {
-            return Optional.empty();
+        if (blockedPending != null) {
+            List<String> unmet = plan.unmetDependencies(blockedPending);
+            return Optional.of("Next pending step '" + blockedPending.id()
+                    + "' is blocked by dependencies " + unmet
+                    + ". Finish each predecessor (mark COMPLETED via plan.update) before starting this one.");
         }
-        return Optional.of(describePendingStart(nextPending));
+        return Optional.empty();
     }
 
     /**

@@ -58,14 +58,30 @@ public class ChatController {
     }
 
     @PostMapping("/send")
-    public ChatSendResponse send(@Valid @RequestBody ChatSendRequest request) {
+    public ChatSendResponse send(
+            @Valid @RequestBody ChatSendRequest request,
+            org.springframework.web.server.ServerWebExchange exchange
+    ) {
         log.info("chat.send.received sessionId={}, userId={}, requestedAgentId={}, llmConfigId={}, messageLength={}",
                 request.sessionId(), request.userId(), request.agentId(), request.llmConfigId(),
                 request.message() != null ? request.message().length() : 0);
+        // 跟 stream 一样:从 exchange attribute 取 JwtAuthWebFilter 已解析好的 principal,
+        // 显式 setCurrent 保证 createAcceptedRun 拿到正确的 tenant/app/user (而不是
+        // ThreadLocal 跨线程丢失后的 anonymousSystemAdmin)。userId 也优先用 principal 的,
+        // 跟 app_user 表的字符串主键 ext:tenant:xxx 对齐。
+        com.janyee.agent.infra.auth.AuthPrincipal principal =
+                (com.janyee.agent.infra.auth.AuthPrincipal) exchange.getAttributes()
+                        .get(com.janyee.agent.web.auth.JwtAuthWebFilter.PRINCIPAL_ATTR);
+        if (principal != null) {
+            com.janyee.agent.infra.auth.SecurityContextHolder.setCurrent(principal);
+        }
         String sessionId = request.sessionId() != null && !request.sessionId().isBlank()
                 ? request.sessionId()
                 : UUID.randomUUID().toString();
-        String userId = request.userId() != null && !request.userId().isBlank() ? request.userId() : "anonymous";
+        String userId = principal != null && !principal.anonymous()
+                && principal.userId() != null && !principal.userId().isBlank()
+                ? principal.userId()
+                : (request.userId() != null && !request.userId().isBlank() ? request.userId() : "anonymous");
         AgentBinding binding = agentRouter.route(new AgentRouteRequest("web", userId, sessionId, request.agentId()));
         String agentId = binding.agentId();
         LlmConfigDescriptor llmConfig = applyModelOverride(
@@ -126,7 +142,8 @@ public class ChatController {
             @RequestParam(value = "llmConfigId", required = false) String llmConfigId,
             @RequestParam(value = "llmModel", required = false) String llmModel,
             @RequestParam(value = "userId", required = false, defaultValue = "anonymous") String userId,
-            @RequestParam("message") String message
+            @RequestParam("message") String message,
+            org.springframework.web.server.ServerWebExchange exchange
     ) {
         log.info("chat.stream.open requestedRunId={}, sessionId={}, userId={}, requestedAgentId={}, llmConfigId={}, messageLength={}",
                 runId, sessionId, userId, agentId, llmConfigId, message != null ? message.length() : 0);
@@ -171,17 +188,35 @@ public class ChatController {
                 effectiveRunId, sessionId, resolvedAgentId,
                 llmConfig != null ? llmConfig.configId() : null,
                 llmConfig != null ? llmConfig.model() : null);
+        // 把请求线程上 JwtAuthWebFilter 已经塞进 exchange attribute 的 principal 取出来,
+        // 显式带进 RunRequest。下游 SimpleAgentRunner.run() 会在 boundedElastic 调度器
+        // 线程上用它重建 SecurityContextHolder —— 否则 ThreadLocal 跨线程丢失,session/run
+        // 的 tenant_id/user_id 全部 fallback 到 anonymousSystemAdmin (system / admin)。
+        com.janyee.agent.infra.auth.AuthPrincipal principal =
+                (com.janyee.agent.infra.auth.AuthPrincipal) exchange.getAttributes()
+                        .get(com.janyee.agent.web.auth.JwtAuthWebFilter.PRINCIPAL_ATTR);
+        // 优先用真实身份的 userId(OAuth 解析的 ext:tenant:xxx),前端 form.userId 只在
+        // 匿名时兜底。这一致性必须在 controller 层就对齐 —— request body 里的 userId 在
+        // embed 模式下是 SDK 注入的宿主侧 ID(数字 "1" 等),跟 app_user 表里的字符串主键
+        // 对不上,会导致 listSessions 用 principal.userId 过滤时永远 match 不到。
+        String effectiveUserId = principal != null && !principal.anonymous()
+                && principal.userId() != null && !principal.userId().isBlank()
+                ? principal.userId()
+                : userId;
         RunRequest runRequest = new RunRequest(
                 effectiveRunId,
                 sessionId,
                 resolvedAgentId,
-                userId,
+                effectiveUserId,
                 effectiveMessage,
                 false,
                 llmConfig != null ? llmConfig.configId() : null,
                 llmConfig != null ? llmConfig.model() : null,
                 pending != null ? pending.references() : java.util.List.of(),
-                pending != null ? pending.attachments() : java.util.List.of()
+                pending != null ? pending.attachments() : java.util.List.of(),
+                principal != null ? principal.userId() : null,
+                principal != null ? principal.tenantId() : null,
+                principal != null ? principal.appId() : null
         );
         return agentRunner.run(runRequest)
                 .doOnNext(event -> log.debug("chat.stream.event runId={}, type={}, content={}",

@@ -11,6 +11,10 @@ public record LlmConfigAdminRequest(
         String chatPath,
         boolean stream,
         boolean enabled,
-        boolean defaultConfig
+        boolean defaultConfig,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

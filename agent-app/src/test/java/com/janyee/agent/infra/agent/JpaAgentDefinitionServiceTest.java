@@ -68,7 +68,7 @@ class JpaAgentDefinitionServiceTest {
         AgentDefinitionView created = adminCatalogService.saveAgentDefinition(new AgentDefinitionCommand(
                 newId, "Junit Agent", "test-only agent",
                 "You are a junit agent.", "# Junit\nUsed only in tests.", "Remember: tests.",
-                true));
+                true, null, null, null, null));
         assertEquals(newId, created.agentId());
         assertEquals("Junit Agent", created.displayName());
 
@@ -82,7 +82,7 @@ class JpaAgentDefinitionServiceTest {
         AgentDefinitionView edited = adminCatalogService.saveAgentDefinition(new AgentDefinitionCommand(
                 newId, "Junit Agent v2", "edited",
                 "You are a junit agent v2.", "# Junit v2", "Remember v2.",
-                true));
+                true, null, null, null, null));
         assertEquals("Junit Agent v2", edited.displayName());
         assertNotNull(edited.updatedAt(),
                 "edit 后 updated_at 必须刷新");
@@ -103,7 +103,8 @@ class JpaAgentDefinitionServiceTest {
         String newId = "disabled-junit-" + UUID.randomUUID().toString().substring(0, 6);
         seededIds.add(newId);
         adminCatalogService.saveAgentDefinition(new AgentDefinitionCommand(
-                newId, "Disabled", "test", "DISABLED PROMPT", "# D", "", false));
+                newId, "Disabled", "test", "DISABLED PROMPT", "# D", "", false,
+                null, null, null, null));
         AgentDefinition def = agentDefinitionService.getAgent(newId);
         // DB disabled → fallback 从文件读（新 agent 没文件 → 默认系统提示）
         assertFalse(def.systemPrompt().contains("DISABLED PROMPT"),

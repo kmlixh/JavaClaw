@@ -80,15 +80,25 @@ public class InMemorySessionService implements SessionService {
         SessionEntity session = new SessionEntity();
         session.setId(sessionId);
         session.setAgentId(agentId);
-        session.setUserId(userId);
-        session.setChannel("web");
-        session.setStatus("ACTIVE");
-        // P3:从当前认证上下文读 tenant/app 写进新 session。匿名期默认 SYSTEM + system-default,
-        // 和 V24 backfill 的老数据口径一致。
+        // P3:从当前认证上下文读 tenant/app/user 写进新 session。
+        // ⚠ user_id 必须以 principal 为准:之前直接信任前端传的 userId 字段,
+        // embed 模式下 SDK init 会塞 form.userId 进来,跟 OAuth token 解析的真实
+        // principal.userId 对不上 —— 导致 listSessions 用 principal.userId 过滤
+        // 时永远 match 不到,xmap embed 的"最近会话"列表始终为空。
+        // 只有匿名(没 token)时才退回到前端 userId,保留旧行为兜底。
         com.janyee.agent.infra.auth.AuthPrincipal principal =
                 com.janyee.agent.infra.auth.SecurityContextHolder.current();
-        session.setTenantId(principal.tenantId());
-        session.setAppId(principal.appId());
+        String resolvedUserId = principal != null && !principal.anonymous()
+                && principal.userId() != null && !principal.userId().isBlank()
+                ? principal.userId()
+                : (userId == null || userId.isBlank() ? "anonymous" : userId);
+        session.setUserId(resolvedUserId);
+        session.setChannel("web");
+        session.setStatus("ACTIVE");
+        if (principal != null) {
+            session.setTenantId(principal.tenantId());
+            session.setAppId(principal.appId());
+        }
         return sessionRepository.save(session);
     }
 

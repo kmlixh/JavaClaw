@@ -42,7 +42,16 @@ public class JpaRunRecordService implements RunRecordService {
         entity.setId(runId);
         entity.setSessionId(sessionId);
         entity.setAgentId(agentId);
-        entity.setUserId(userId);
+        // user_id 以 principal 为准,避免前端传的 userId 跟 OAuth token 真实身份不一致
+        // (跟 InMemorySessionService.createSession 保持同一口径,确保 listSessions 按
+        // principal.userId 过滤时能对得上)。匿名时退回到 controller 传的 userId。
+        com.janyee.agent.infra.auth.AuthPrincipal principal =
+                com.janyee.agent.infra.auth.SecurityContextHolder.current();
+        String resolvedUserId = principal != null && !principal.anonymous()
+                && principal.userId() != null && !principal.userId().isBlank()
+                ? principal.userId()
+                : (userId == null || userId.isBlank() ? "anonymous" : userId);
+        entity.setUserId(resolvedUserId);
         entity.setLlmConfigId(llmConfigId);
         entity.setLlmProvider(llmProvider);
         entity.setLlmModel(llmModel);
@@ -52,10 +61,10 @@ public class JpaRunRecordService implements RunRecordService {
         entity.setRequestReferencesJson(writeJson(references));
         entity.setRequestAttachmentsJson(writeJson(attachments));
         // P3:同 session,run 也带上 tenant+app 便于事后筛选。
-        com.janyee.agent.infra.auth.AuthPrincipal principal =
-                com.janyee.agent.infra.auth.SecurityContextHolder.current();
-        entity.setTenantId(principal.tenantId());
-        entity.setAppId(principal.appId());
+        if (principal != null) {
+            entity.setTenantId(principal.tenantId());
+            entity.setAppId(principal.appId());
+        }
         runRecordRepository.save(entity);
         return runId;
     }

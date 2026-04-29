@@ -53,6 +53,20 @@ public class ToolDefinitionEntity {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
+    // ===== 通用 scope:跟 skill_definition / knowledge_entry / db_datasource 对齐 =====
+    // scope_type:SYSTEM | PUBLIC | TENANT | APP | USER
+    @Column(name = "scope_type", length = 32, nullable = false)
+    private String scopeType;
+
+    @Column(name = "scope_tenant_id", length = 64)
+    private String scopeTenantId;
+
+    @Column(name = "scope_user_id", length = 64)
+    private String scopeUserId;
+
+    @Column(name = "app_id", length = 64)
+    private String appId;
+
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
     public String getAgentId() { return agentId; }
@@ -77,12 +91,23 @@ public class ToolDefinitionEntity {
     public void setVersion(int version) { this.version = version; }
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
+    public String getScopeType() { return scopeType; }
+    public void setScopeType(String scopeType) { this.scopeType = scopeType; }
+    public String getScopeTenantId() { return scopeTenantId; }
+    public void setScopeTenantId(String scopeTenantId) { this.scopeTenantId = scopeTenantId; }
+    public String getScopeUserId() { return scopeUserId; }
+    public void setScopeUserId(String scopeUserId) { this.scopeUserId = scopeUserId; }
+    public String getAppId() { return appId; }
+    public void setAppId(String appId) { this.appId = appId; }
 
     @PrePersist
     void onCreate() {
         Instant now = Instant.now();
         createdAt = now;
         updatedAt = now;
+        if (scopeType == null || scopeType.isBlank()) {
+            scopeType = "SYSTEM";
+        }
     }
 
     @PreUpdate

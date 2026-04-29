@@ -112,6 +112,33 @@ public class ToolLoopContext {
         }
         if (!runPlan.isEmpty()) {
             prompt.append("\n\n[Plan]\n").append(runPlan.renderCompact());
+            // Plan 监督:让 LLM 每一轮都看到"下一步具体做什么",别盯着已 COMPLETED 的 step
+            // 重新发工具调用。preflight 把 wave-0 的 db.query 全跑完后,如果不显式提示,
+            // LLM 经常会重复发同样的查询(它没意识到 plan 里 [COMPLETED] 标签的含义)。
+            NextActionHint.suggest(runPlan).ifPresent(hint ->
+                    prompt.append("\n\n[Next Action]\n").append(hint));
+            // 兜底硬约束:任何在 [COMPLETED] 状态的 step 不要再发对应的工具调用 ——
+            // 数据已经在 [Completed Queries] 里,直接用即可。这条配合 NextActionHint
+            // 一起,把"先 plan.update IN_PROGRESS → 执行工作工具 → plan.update COMPLETED"
+            // 这条标准节奏强行钉死,避免 LLM 自由发挥。
+            prompt.append("\n[Plan Discipline] ")
+                  .append("Do NOT re-issue a tool call for any step already marked [COMPLETED] — its outputs ")
+                  .append("are in [Completed Queries] above, read from there. ")
+                  .append("Advance plan strictly via plan.update: PENDING → IN_PROGRESS → COMPLETED. ")
+                  .append("Only one step IN_PROGRESS at a time; finish it before starting the next.")
+                  // Wave barrier 提示:每个 step 在 [Plan] 渲染里带 deps=[A,B] 列表,标识它依赖
+                  // 谁。LLM 不准跳过 PENDING 的兄弟 step 直接启动下游 —— 如果一组数据 step
+                  // 是兄弟(共同依赖一个根),它们可以并行进 IN_PROGRESS(实际目前只允许 1 个),
+                  // 但下游 report step 必须等所有兄弟 step 都 COMPLETED 才能启动。
+                  // PlanUpdateTool 会拒掉违规转换并告诉你具体哪个 dep 没满足。
+                  .append(" DEPENDENCY BARRIER: each step lists its prerequisite step IDs as deps=[...] in the [Plan] view. ")
+                  .append("Do NOT mark a downstream step IN_PROGRESS while any of its dependencies is still PENDING/IN_PROGRESS — ")
+                  .append("finish every parallel sibling first, even if one of them already returned the data you wanted. ")
+                  // Scope-mismatch 防呆:preflight 在没有 GeoJSON 时会跑全省级 SQL 并把
+                  // step 标 COMPLETED,note=scope=NO_FILTER。LLM 之前会把这些数字直接当成
+                  // 用户问的"西山区/某城市"答案写进报告 —— 这条规则强制要求 LLM 看到
+                  // scope=NO_FILTER 时必须先重查再写报告,而不是"COMPLETED 就用"。
+                  .append("SCOPE CHECK: if a [COMPLETED] step's note contains 'scope=NO_FILTER' AND the user asked about a specific city / district / area / map attachment ({地图N}), those preflight numbers are SCOPE-MISMATCHED — you MUST issue a new db.query restricted to the user's region before writing those values into any artifact.*; do not copy NO_FILTER aggregates into a region-specific report.");
         }
         if (!completedToolSummaries.isEmpty()) {
             prompt.append("\n\n[Completed Queries]\n").append(renderCompletedSummaries());
@@ -137,6 +164,19 @@ public class ToolLoopContext {
                     .append(" | rows=").append(s.rowCount());
             if (s.stepId() != null && !s.stepId().isBlank()) {
                 builder.append(" | step=").append(s.stepId());
+                // 把对应 step 的 resultNote 里的 scope 标签贴到这行。LLM 之前只在 [Plan]
+                // 里看到 note=scope=NO_FILTER,在 [Completed Queries] 里却看不出每条数字的范围,
+                // 复制粘贴时就漏过了。每行 summary 自己带 scope 标签,LLM 想忽略都难。
+                runPlan.find(s.stepId()).ifPresent(step -> {
+                    String note = step.resultNote();
+                    if (note != null && !note.isBlank()) {
+                        int sep = note.indexOf(" | ");
+                        String scopeFragment = sep > 0 ? note.substring(0, sep) : note;
+                        if (scopeFragment.startsWith("scope=")) {
+                            builder.append(" | ").append(scopeFragment);
+                        }
+                    }
+                });
             }
             if (s.summary() != null && !s.summary().isBlank()) {
                 String summary = s.summary();

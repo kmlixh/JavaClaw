@@ -16,6 +16,10 @@ public record SkillDefinitionCommand(
         String promptTemplate,
         String configJson,
         String triggerKeywords,
-        boolean enabled
+        boolean enabled,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

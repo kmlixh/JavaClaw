@@ -85,7 +85,9 @@ public class SimplePromptAssembler implements PromptAssembler {
                 : skills.stream()
                         .map(skill -> "## " + skill.skillName() + "\n"
                                 + (skill.description() == null || skill.description().isBlank() ? "" : skill.description() + "\n")
-                                + truncate(skill.promptTemplate(), 1200))
+                                // 4000 字够 xmap 那种"列出 30+ 方法"的 skill 一次性塞下;旧的 1200 会把方法清单
+                                // 拦腰斩掉,LLM 看到一半就照葫芦画瓢编 shell.exec
+                                + truncate(skill.promptTemplate(), 4000))
                         .collect(Collectors.joining("\n\n"));
         String explicitReferenceSection = renderExplicitReferences(request.references());
         String attachmentSection = renderAttachments(request.attachments());
@@ -102,6 +104,16 @@ public class SimplePromptAssembler implements PromptAssembler {
                 [系统时间]
                 当前服务器本地时间：%s（精确到秒）。
                 当报告 / artifact / assistant 文本需要填写"生成时间""报告时间""数据截止时间"等字段时，**必须使用这个时间戳**（可以按需写成 "YYYY-MM-DD HH:mm:ss" 或 "YYYY年M月D日 HH:mm" 等可读形式），不要写"2026 年"这种粗粒度占位，也不要从你自己的训练数据推断时间。
+
+                [迭代完善规则]
+                生成 artifact.markdown / artifact.word / artifact.excel / artifact.ppt 这类产物 **不等于** 任务结束。如果你回头审视刚生成的产物时发现以下任一情况：
+                - 数据缺失或样本量明显不足
+                - 结论与已查询数据不一致 / 自相矛盾
+                - 结构性章节(背景 / 方法 / 数据 / 结论 / 建议)有缺
+                - 图表/表格本应包含但被遗漏
+                **必须继续工作**：可以再次调 db.query / db.schema.inspect 取数据，或再次调 artifact.markdown 重新生成更完整的版本（同名直接覆盖）。
+                只有当你确认产物已完整、结论站得住、且没有更优补充时，才以一段简短的中文 assistant 文本收尾（例如"报告已完成,以下是要点:..."），并不再发起任何工具调用。
+                给用户的进度文本（每一轮迭代你说的话）会被前端实时显示，用户能看到你的思考过程,所以**继续输出推理 / 评估 / 自我修正 是被鼓励的**,不要因为已生成 artifact 就闭嘴。
 
                 Agent: %s
                 Workspace: %s

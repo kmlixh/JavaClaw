@@ -11,6 +11,10 @@ public record AgentDefinitionView(
         String memoryMarkdown,
         boolean enabled,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

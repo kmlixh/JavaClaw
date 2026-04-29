@@ -1,12 +1,16 @@
 package com.janyee.agent.runtime.skill;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.janyee.agent.runtime.loop.CompletedToolSummary;
 import com.janyee.agent.runtime.loop.PlanStep;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Stateless evaluator that converts a {@link PlanStepRule} plus a step's accumulated tool
@@ -18,6 +22,8 @@ import java.util.Optional;
  * and DefaultToolLoopOrchestrator (on run-end gate) can call it without coupling.
  */
 public final class PlanStepRuleEvaluator {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private PlanStepRuleEvaluator() {
     }
@@ -92,6 +98,38 @@ public final class PlanStepRuleEvaluator {
             }
         }
 
+        // Acceptance:基于 step 累积的每条 db.query summary 的 firstRowJson 做字段级校验。
+        // 这是 user 明确要求的"step 完成前要校验工作结果是否真完成"——之前 requiredTables 只
+        // 保证了"查了哪几张表",没有保证"查回来的字段对不对、值是不是全 0"。
+        PlanStepRule.Acceptance acceptance = rule.acceptance();
+        if (acceptance != null && !acceptance.isEmpty()) {
+            List<JsonNode> rowNodes = parseFirstRows(summaries);
+            if (!acceptance.requiredColumns().isEmpty()) {
+                Set<String> seenColumns = collectColumnNames(rowNodes);
+                List<String> missingCols = new ArrayList<>();
+                for (String col : acceptance.requiredColumns()) {
+                    if (col == null || col.isBlank()) continue;
+                    if (!seenColumns.contains(col.toLowerCase(Locale.ROOT).trim())) {
+                        missingCols.add(col);
+                    }
+                }
+                if (!missingCols.isEmpty()) {
+                    violations.add("step '" + step.id() + "' acceptance failed: required columns "
+                            + missingCols + " not present in any successful db.query result. "
+                            + "Re-run with a SELECT list that includes these columns by name (the report needs them).");
+                }
+            }
+            if (acceptance.requireNonZeroData()) {
+                if (!hasAnyNonZeroNumeric(rowNodes)) {
+                    violations.add("step '" + step.id() + "' acceptance failed: all numeric values "
+                            + "across this step's db.query results are zero/null. "
+                            + "Either the region filter produced an empty result set (re-query with a different filter "
+                            + "or mark this step SKIPPED with resultNote='no data in region'), or the SELECT list "
+                            + "is wrong (no aggregate column was returned). Do NOT propagate zeros into the artifact.");
+                }
+            }
+        }
+
         if (!rule.zeroRowsAllowed()) {
             boolean hasNonZero = summaries.stream()
                     .filter(s -> "db.query".equals(s.toolName()))
@@ -114,9 +152,25 @@ public final class PlanStepRuleEvaluator {
                         violations.add("step '" + step.id() + "' must produce an artifact whose content matches the skill's reportSection; no artifact content captured yet");
                     }
                 } else {
-                    if (!reportSection.heading().isBlank() && !latestArtifactContent.contains(reportSection.heading())) {
-                        violations.add("step '" + step.id() + "' artifact is missing required heading '"
-                                + reportSection.heading() + "' — follow the skill's markdown template exactly");
+                    // 校验前先 normalize:把双方所有空白字符(含中文全角空格 / NBSP)压平,
+                    // 这样 "2G扇区" / "2G 扇区" / "2G 扇区" 互相能命中。LLM 在中文/英文/数字
+                    // 之间加不加空格属于格式微差,不该让校验把整轮 run 卡住。
+                    String normalizedContent = normalizeForAnchorMatch(latestArtifactContent);
+                    if (!reportSection.heading().isBlank()) {
+                        // heading 校验有两层放宽:
+                        //   1) 整体 heading (含 "# " 前缀) normalize 后 contains;
+                        //   2) 退一步,只看 heading 去掉 markdown 前缀的纯文本是否被 content 包含 ——
+                        //      LLM 写更具体的 heading (如 "# 昆明市西山区综合覆盖分析报告") 包含
+                        //      skill 要求的关键词 "覆盖分析报告",应该视为合规。
+                        String normHeading = normalizeForAnchorMatch(reportSection.heading());
+                        String headingText = reportSection.heading().replaceFirst("^#+\\s*", "").trim();
+                        String normHeadingText = normalizeForAnchorMatch(headingText);
+                        boolean matched = (!normHeading.isEmpty() && normalizedContent.contains(normHeading))
+                                || (!normHeadingText.isEmpty() && normalizedContent.contains(normHeadingText));
+                        if (!matched) {
+                            violations.add("step '" + step.id() + "' artifact is missing required heading '"
+                                    + reportSection.heading() + "' — follow the skill's markdown template exactly");
+                        }
                     }
                     // Every declared placeholder label must appear somewhere in the artifact;
                     // this catches the classic "LLM only wrote 3 of 4 bullets" failure.
@@ -125,7 +179,9 @@ public final class PlanStepRuleEvaluator {
                         if (label == null || label.isBlank()) {
                             continue;
                         }
-                        if (!latestArtifactContent.contains(label)) {
+                        String normLabel = normalizeForAnchorMatch(label);
+                        if (normLabel.isEmpty()) continue;
+                        if (!normalizedContent.contains(normLabel)) {
                             violations.add("step '" + step.id() + "' artifact is missing required anchor '"
                                     + label + "' — skill's reportSection requires it");
                         }
@@ -151,5 +207,82 @@ public final class PlanStepRuleEvaluator {
         }
         List<String> violations = evaluateCompletion(step, rule);
         return violations.isEmpty() ? Optional.empty() : Optional.of(violations.get(0));
+    }
+
+    /**
+     * 字符串规范化用于锚点匹配:把所有 Java 空白字符(\\s) + 中文全角空格 \\u3000 +
+     * 不间断空格 \\u00A0 等都去掉。这样 "OTT 5G 弱覆盖" / "OTT5G弱覆盖" / "OTT 5G弱覆盖"
+     * 视为同一锚点,LLM 在排版上的格式微差不会让 run 卡死在 plan.update 校验循环里。
+     */
+    private static String normalizeForAnchorMatch(String raw) {
+        if (raw == null) return "";
+        return raw.replaceAll("[\\s\\u00A0\\u3000]+", "");
+    }
+
+    /**
+     * 把 step 的所有成功 db.query summary 的 firstRowJson 解析成 JsonNode list。解析失败 / 没
+     * firstRow 的 summary 跳过。结果只用于 acceptance 校验,不会影响其它流程。
+     */
+    private static List<JsonNode> parseFirstRows(List<CompletedToolSummary> summaries) {
+        List<JsonNode> rows = new ArrayList<>();
+        if (summaries == null || summaries.isEmpty()) {
+            return rows;
+        }
+        for (CompletedToolSummary s : summaries) {
+            if (s == null || !"db.query".equals(s.toolName())) continue;
+            String json = s.firstRowJson();
+            if (json == null || json.isBlank()) continue;
+            try {
+                JsonNode node = MAPPER.readTree(json);
+                if (node != null && node.isObject()) {
+                    rows.add(node);
+                }
+            } catch (Exception ignored) {
+                // 单条解析失败不阻塞整体,acceptance 是尽力而为的校验。
+            }
+        }
+        return rows;
+    }
+
+    /** 收集所有 row 的 key,统一小写化做大小写无关的列名比较。 */
+    private static Set<String> collectColumnNames(List<JsonNode> rows) {
+        Set<String> names = new LinkedHashSet<>();
+        for (JsonNode row : rows) {
+            row.fieldNames().forEachRemaining(name -> {
+                if (name != null && !name.isBlank()) {
+                    names.add(name.toLowerCase(Locale.ROOT).trim());
+                }
+            });
+        }
+        return names;
+    }
+
+    /**
+     * 检查每个 row 的所有数值字段(int/long/double/decimal):只要发现至少一个 > 0,就算通过。
+     * 字符串里的数字也尝试解析(LLM/JDBC 偶尔把数字当 text 返回)。null / 0 / 非数字字符串都
+     * 算"无数据信号"。
+     */
+    private static boolean hasAnyNonZeroNumeric(List<JsonNode> rows) {
+        for (JsonNode row : rows) {
+            var fields = row.fields();
+            while (fields.hasNext()) {
+                JsonNode value = fields.next().getValue();
+                if (value == null || value.isNull()) continue;
+                if (value.isNumber()) {
+                    if (value.doubleValue() > 0d) return true;
+                    continue;
+                }
+                if (value.isTextual()) {
+                    String text = value.asText("").trim();
+                    if (text.isEmpty()) continue;
+                    try {
+                        if (Double.parseDouble(text) > 0d) return true;
+                    } catch (NumberFormatException ignored) {
+                        // 非数字字符串忽略
+                    }
+                }
+            }
+        }
+        return false;
     }
 }

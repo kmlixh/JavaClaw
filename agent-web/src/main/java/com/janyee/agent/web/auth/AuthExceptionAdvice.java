@@ -20,10 +20,29 @@ public class AuthExceptionAdvice {
 
     @ExceptionHandler(AuthService.AuthException.class)
     public ResponseEntity<?> handleAuth(AuthService.AuthException error) {
-        HttpStatus status = isForbidden(error.code()) ? HttpStatus.FORBIDDEN : HttpStatus.UNAUTHORIZED;
+        HttpStatus status;
+        if ("NOT_FOUND".equalsIgnoreCase(error.code())) {
+            status = HttpStatus.NOT_FOUND;
+        } else if (isForbidden(error.code())) {
+            status = HttpStatus.FORBIDDEN;
+        } else {
+            status = HttpStatus.UNAUTHORIZED;
+        }
         return ResponseEntity.status(status).body(Map.of(
                 "code", error.code(),
                 "message", error.getMessage()
+        ));
+    }
+
+    /**
+     * service 层 RBAC 编辑权限不足时抛 SecurityException,这里统一转 403。
+     * (避免 service 直接 import spring-web 的 ResponseStatusException)。
+     */
+    @ExceptionHandler(SecurityException.class)
+    public ResponseEntity<?> handleForbidden(SecurityException error) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                "code", "forbidden",
+                "message", error.getMessage() == null ? "permission denied" : error.getMessage()
         ));
     }
 

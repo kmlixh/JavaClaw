@@ -54,6 +54,229 @@ p {
   overflow: hidden;
 }
 
+/* embed 模式:藏掉左栏,主区域单栏铺满 iframe */
+.workspace-shell.embed-mode {
+  grid-template-columns: 1fr;
+  gap: 0;
+  padding: 0;
+  background: transparent;
+}
+.workspace-shell.embed-mode .center-stage {
+  border-radius: 0;
+  border: none;
+  box-shadow: none;
+  height: 100vh;
+}
+
+/* embed 模式下 chat 内部的"宽屏专用"组件干掉:重复标题 / stage 顶栏。
+   chat-config-bar 留下来给 agent / LLM / 模型选择;只隐藏没意义的传输方式那一个下拉。
+   计划面板(run-plan-panel)曾经也在这里被 display:none —— 之所以隐藏是因为它默认
+   position:absolute + top/right:20px,在窄 iframe 里会挡住聊天主区。现在改成
+   保留显示,但走下面单独的紧凑样式,把它从浮窗改成顶部横条。 */
+.workspace-shell.embed-mode .chat-session-tag,
+.workspace-shell.embed-mode .chat-subtitle,
+.workspace-shell.embed-mode .stage-header {
+  display: none !important;
+}
+/* embed 模式 plan 现在不走顶部 .run-plan-panel,改用内嵌到对话流的 .run-plan-inline,
+   位置紧跟 user 消息。.run-plan-panel 在 isPlanPanelVisible 那侧被 v-if 阻止渲染,
+   这里不用再 display:none。 */
+
+/* embed 模式内嵌 plan 卡片:挂在用户消息正下方,样式跟 user bubble 区分但视觉风格一致。 */
+.run-plan-inline {
+  margin: 4px 0 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f8faff, #f3f6fc);
+  border: 1px solid #d8e0ee;
+  box-shadow: 0 2px 6px rgba(10, 25, 50, 0.04);
+  font-size: 12px;
+  color: #3b4d6e;
+  align-self: stretch;
+}
+.run-plan-inline.collapsed {
+  padding: 6px 12px;
+}
+.run-plan-inline-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.run-plan-inline-title {
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-plan-inline-meta {
+  color: #7a8196;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.run-plan-inline-toggle {
+  border: 1px solid #d8e0ee;
+  background: #ffffff;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: #3b4d6e;
+}
+.run-plan-inline-toggle:hover { background: #eef2fa; }
+.run-plan-inline-steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.run-plan-inline-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.7);
+  font-size: 12px;
+}
+.run-plan-inline-step.completed { color: #1f883d; background: rgba(31,136,61,0.06); }
+.run-plan-inline-step.in-progress { color: #1f6feb; background: rgba(31,111,235,0.08); font-weight: 600; }
+.run-plan-inline-step.failed { color: #b42318; background: rgba(180,35,24,0.06); }
+.run-plan-inline-step.skipped { color: #7a8196; }
+.run-plan-inline-step.pending { color: #6b7382; }
+.run-plan-inline-step-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+/* step.id 用等宽小字 + monospace 标识区分,避免 title 完全相同的 step
+   (如 coverage 和 weak_grid 都叫 "3. 覆盖率总览") 看起来重复。 */
+.run-plan-inline-step-id {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 10px;
+  color: #6b7382;
+  background: rgba(0,0,0,0.04);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.run-plan-inline-step-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* composer-dock 默认 align-self:end —— 在 flex column 容器里被解释成"沿水平方向贴右",
+   导致输入框只取内容宽度,字一变就忽宽忽窄。embed 模式强制 stretch + 100% 宽。 */
+.workspace-shell.embed-mode .composer-dock {
+  align-self: stretch !important;
+  width: 100% !important;
+}
+.workspace-shell.embed-mode .composer-main-field,
+.workspace-shell.embed-mode .composer-editor {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* embed 模式让 chat-topbar 纵向叠放:标题独占一行,按钮组下一行吃满整个宽度 */
+.workspace-shell.embed-mode .chat-topbar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.workspace-shell.embed-mode .chat-title-block {
+  flex: 0 0 auto;
+}
+
+/* config-bar 占满 topbar 宽度;解锁高度,允许换行兜底,但优先一排排开 */
+.workspace-shell.embed-mode .chat-config-bar {
+  width: 100%;
+  flex-wrap: nowrap;
+  gap: 4px;
+  max-height: none !important;
+  min-height: 0 !important;
+  overflow: visible !important;
+  justify-content: flex-start;
+}
+
+/* embed 模式下下拉宽度也要够,合并后的"LLM-模型" label 比单 LLM 名字长得多。
+   从 80 提到 140,把 chat-config-bar 设成 flex-wrap:wrap 兜底,窄屏下拉换行不挤压。 */
+.workspace-shell.embed-mode .chat-config-bar .bar-field select {
+  min-width: 140px !important;
+  max-width: 200px !important;
+  width: auto !important;
+  font-size: 11px;
+  padding: 0 8px;
+}
+.workspace-shell.embed-mode .chat-config-bar .bar-field {
+  flex: 0 0 auto;
+}
+.workspace-shell.embed-mode .chat-config-bar .recent-drawer-trigger {
+  height: 28px;
+  padding: 0 6px;
+  font-size: 11px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* 关闭按钮始终靠右 */
+.workspace-shell.embed-mode .chat-config-bar .embed-hide-inline {
+  margin-left: auto;
+}
+
+/* embed 模式"关闭"按钮:挂在 chat-config-bar 末尾,与"最近会话"同款样式,
+   靠 .embed-hide-inline 微调一下颜色提示这是关闭操作 */
+.workspace-shell.embed-mode .embed-hide-inline {
+  border-color: #f0c4c4;
+  color: #b42318;
+}
+.workspace-shell.embed-mode .embed-hide-inline:hover {
+  background: #fdecec;
+  color: #8b1a14;
+}
+
+/* chat-workspace 改成纵向 flex,conversation 占满高度 */
+.workspace-shell.embed-mode .chat-workspace {
+  display: flex !important;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+.workspace-shell.embed-mode .chat-control-deck {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+.workspace-shell.embed-mode .chat-topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.workspace-shell.embed-mode .chat-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.workspace-shell.embed-mode .conversation-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.workspace-shell.embed-mode .recent-drawer-trigger {
+  font-size: 12px;
+  height: 28px;
+}
+/* 工具栏右侧按钮组("最近会话"+图标按钮)紧跟前面的下拉框,不再被推到最右;
+   只有"关闭"按钮(.embed-hide-inline)保留 margin-left:auto 占据右端。 */
+
 .left-rail,
 .center-stage,
 .right-rail {
@@ -398,6 +621,24 @@ p {
   white-space: nowrap;
 }
 .recent-drawer-trigger:hover { background: #f1f4f8; }
+/* 仅图标的工具栏按钮(刷新 / 跳转): 收窄宽度,字符居中,跟"最近会话"同款边框 */
+.recent-drawer-trigger.icon-only {
+  padding: 0;
+  width: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+}
+.recent-drawer-trigger.icon-only:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+.workspace-shell.embed-mode .recent-drawer-trigger.icon-only {
+  width: 26px;
+  font-size: 12px;
+}
 .recent-drawer-backdrop {
   position: fixed;
   inset: 0;
@@ -703,8 +944,14 @@ p {
 
 .session-link {
   display: grid;
+  grid-template-rows: auto auto;
   gap: 4px;
   padding: 10px 12px;
+  /* 固定高度,避免长 title / 长 sessionId 把列表项撑高让整个抽屉视觉跳动。
+     58px = 上下 padding 20 + 两行内容(13px + 12px) + 4px gap + 安全余量。 */
+  height: 58px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .session-link-head {
@@ -713,6 +960,7 @@ p {
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  flex: 0 0 auto;
 }
 
 .session-link strong {
@@ -721,6 +969,7 @@ p {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  line-height: 1.4;
 }
 
 .session-link-time {
@@ -980,8 +1229,10 @@ textarea {
 }
 
 .bar-field select {
-  min-width: 0;
-  max-width: 180px;
+  /* 加宽 agent / LLM-模型 下拉,显示完整名字不截断;之前 max 180 在合并下拉
+     "九天大模型 - minimax-m2.7"这种长 label 会被裁。non-embed 用足空间。 */
+  min-width: 200px;
+  max-width: 280px;
   height: 32px;
   padding: 0 10px;
   border-radius: 6px;
@@ -1159,6 +1410,8 @@ textarea {
   border: 1px solid #dfe5ee;
   border-radius: 16px;
   background: linear-gradient(180deg, #ffffff, #fbfcfe);
+  /* 让 .live-status-banner 能 absolute 锚到 chat-panel 左下角 */
+  position: relative;
 }
 
 .status-hint {
@@ -1512,8 +1765,11 @@ textarea {
 }
 
 .composer-editor {
+  /* 输入框允许自动换行,内容增长时高度扩充直到 4 行,超过开始内部滚动。
+     line-height 1.55 + 14-16px font ≈ 24px/line,padding 上下各 10px,
+     4 行 ≈ 4*24 + 20 = 116;留点余量取 120 安全(避免末行被裁)。 */
   min-height: 44px;
-  max-height: 180px;
+  max-height: 120px;
   overflow-y: auto;
   border: 1px solid #d7dde5;
   border-radius: 10px;
@@ -2075,6 +2331,78 @@ textarea {
   color: #111827;
   font-size: 14px;
   line-height: 1.68;
+}
+
+/* thinking 块:推理模型的思考链。在 live / 普通 assistant 气泡里都用,默认折叠。
+   颜色比正文淡,字体小一号,跟正式回答有视觉区分。 */
+.thinking-block {
+  margin: 0 0 10px 0;
+  padding: 8px 12px;
+  background: #f1f5f9;
+  border-left: 3px solid #94a3b8;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #475569;
+}
+.thinking-summary {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.thinking-icon {
+  font-size: 14px;
+}
+.thinking-len {
+  margin-left: auto;
+  color: #94a3b8;
+  font-weight: normal;
+  font-size: 11px;
+}
+.thinking-content {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* assistant 文本气泡里直接渲染 markdown 时,bubble 自身已经是一张卡了,
+   再嵌一层 markdown-preview 卡片就是重影。bubble-markdown 把第二层卡的
+   padding/border/bg 全砍掉,只保留 markdown 本身的排版规则。 */
+.bubble .bubble-markdown.markdown-preview {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: inherit;
+  line-height: 1.65;
+  color: inherit;
+}
+.bubble .bubble-markdown.markdown-preview p:first-child,
+.bubble .bubble-markdown.markdown-preview h1:first-child,
+.bubble .bubble-markdown.markdown-preview h2:first-child,
+.bubble .bubble-markdown.markdown-preview h3:first-child,
+.bubble .bubble-markdown.markdown-preview ul:first-child,
+.bubble .bubble-markdown.markdown-preview ol:first-child,
+.bubble .bubble-markdown.markdown-preview table:first-child {
+  margin-top: 0;
+}
+.bubble .bubble-markdown.markdown-preview p:last-child,
+.bubble .bubble-markdown.markdown-preview ul:last-child,
+.bubble .bubble-markdown.markdown-preview ol:last-child,
+.bubble .bubble-markdown.markdown-preview table:last-child {
+  margin-bottom: 0;
+}
+/* 表格宽度比 bubble 略宽时允许横向滚动,不至于被压扁 */
+.bubble .bubble-markdown.markdown-preview table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
 }
 
 .markdown-preview h1,
@@ -2665,22 +2993,38 @@ textarea {
   font-style: italic;
 }
 .live-status-banner {
+  /* 浮动在消息列表的左下角,不参与流式布局,避免跟用户消息/输入框碰撞。
+     conversation-panel.chat-panel 是 position:relative 锚点,这里 absolute
+     钉到它的左下角。bottom 留够空间避免遮盖 composer 顶部的"添加图片/文件/地图"
+     工具栏按钮组(三个图标按钮在 composer-dock 顶端)。 */
+  position: absolute;
+  left: 14px;
+  bottom: 140px;
+  z-index: 5;
+  max-width: calc(100% - 28px);
   display: flex;
-  /* 文本换行后需要把圆点顶对齐而不是居中，否则两三行文本会把圆点推到中间看着别扭 */
+  /* 文本换行后需要把圆点顶对齐而不是居中,否则两三行文本会把圆点推到中间看着别扭 */
   align-items: flex-start;
   gap: 10px;
-  margin: 8px 0 12px;
+  margin: 0;
   padding: 8px 14px;
   border-radius: 10px;
-  background: linear-gradient(90deg, rgba(88, 115, 255, 0.08), rgba(88, 115, 255, 0.02));
-  border: 1px solid rgba(88, 115, 255, 0.18);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(88, 115, 255, 0.28);
+  box-shadow: 0 6px 18px rgba(10, 25, 50, 0.16);
   font-size: 12px;
   color: #3b4d6e;
   line-height: 1.5;
-  /* 关键：让 banner 自己受容器宽度约束，防止里面长文本把父级撑宽 */
+  /* 关键:让 banner 自己受容器宽度约束,防止里面长文本把父级撑宽 */
   min-width: 0;
-  max-width: 100%;
   overflow: hidden;
+}
+/* banner 浮动后,消息列表底部需要预留空间,避免最后一条消息被 banner 盖住。
+   bottom 提到 140 后给 padding 也跟着加,banner 单行约 36px + 余量 → 100px
+   够覆盖最大 2-3 行 banner 文本不挡末条消息。 */
+.conversation-stream {
+  padding-bottom: 100px;
 }
 .live-status-banner .live-status-dot,
 .live-status-banner .live-status-phase {

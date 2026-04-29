@@ -15,6 +15,11 @@ public record LlmConfigView(
         boolean enabled,
         boolean defaultConfig,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        // 通用 scope 4 字段:scopeType ∈ SYSTEM|PUBLIC|TENANT|APP|USER
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

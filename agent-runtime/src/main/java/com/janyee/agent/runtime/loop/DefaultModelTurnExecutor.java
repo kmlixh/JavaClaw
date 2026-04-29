@@ -84,8 +84,11 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
             }
             List<LlmStreamEvent> events = new ArrayList<>();
             StringBuilder visibleText = new StringBuilder();
+            StringBuilder visibleThinking = new StringBuilder();
             long[] lastEmitAt = {0L};
             int[] lastEmitLength = {0};
+            long[] lastThinkingEmitAt = {0L};
+            int[] lastThinkingEmitLength = {0};
             try {
                 // takeUntilOther(cancelSignal):用户按终止时,ToolLoopContext.requestCancel 会
                 // 往 sink 推一个值,这里的 stream 立刻 complete,blockLast 立即返回,不用等
@@ -97,10 +100,14 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
                             if ("token".equalsIgnoreCase(event.type()) && event.content() != null && !event.content().isBlank()) {
                                 visibleText.append(event.content());
                                 emitModelOutputProgress(context, visibleText, lastEmitAt, lastEmitLength, false);
+                            } else if ("thinking".equalsIgnoreCase(event.type()) && event.content() != null && !event.content().isBlank()) {
+                                visibleThinking.append(event.content());
+                                emitModelThinkingProgress(context, visibleThinking, lastThinkingEmitAt, lastThinkingEmitLength, false);
                             }
                         })
                         .blockLast();
                 emitModelOutputProgress(context, visibleText, lastEmitAt, lastEmitLength, true);
+                emitModelThinkingProgress(context, visibleThinking, lastThinkingEmitAt, lastThinkingEmitLength, true);
                 // Stream 被 cancel 信号掐断时也会走到这里(blockLast 正常返回),不要再把
                 // 半截 events 往外传,让 orchestrator 在下一轮起始的 cancel 检查里优雅收尾。
                 if (context.isCancelRequested()) {
@@ -172,6 +179,37 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
         context.emitEvent(
                 AgentEventType.RUN_STATUS,
                 "step=%d phase=MODEL_OUTPUT %s".formatted(context.iterationCount() + 1, truncate(text, 1200))
+        );
+    }
+
+    /**
+     * 推理类模型(o1 / R1 / qwen-thinking)边想边吐 reasoning_content 通道。这部分跟 MODEL_OUTPUT
+     * 是平行的:不是最终回答,但是用户希望看到"AI 在想什么"。和 MODEL_OUTPUT 走同样的 emit 节奏,
+     * 但 phase 标 MODEL_THINKING,前端单独区块渲染(可折叠)。
+     */
+    private void emitModelThinkingProgress(
+            ToolLoopContext context,
+            StringBuilder visibleThinking,
+            long[] lastEmitAt,
+            int[] lastEmitLength,
+            boolean force
+    ) {
+        String text = visibleThinking == null ? "" : visibleThinking.toString().trim();
+        if (text.isBlank()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        int length = text.length();
+        if (!force
+                && now - lastEmitAt[0] < MODEL_OUTPUT_EMIT_INTERVAL_MILLIS
+                && length - lastEmitLength[0] < MODEL_OUTPUT_EMIT_DELTA_CHARS) {
+            return;
+        }
+        lastEmitAt[0] = now;
+        lastEmitLength[0] = length;
+        context.emitEvent(
+                AgentEventType.RUN_STATUS,
+                "step=%d phase=MODEL_THINKING %s".formatted(context.iterationCount() + 1, truncate(text, 2000))
         );
     }
 

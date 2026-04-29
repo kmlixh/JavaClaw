@@ -45,14 +45,23 @@ public class SkillPlanSeeder {
         if (!plan.isEmpty()) {
             return false; // LLM already called plan.create; leave it alone
         }
+        String previousStepId = null;
         for (String stepId : guard.requiredPlanStepIds()) {
-            PlanStepRule rule = guard.stepRule(stepId).orElse(null);
-            String title = deriveTitle(stepId, rule);
-            String toolHint = deriveToolHint(stepId, rule);
-            String expectedOutput = deriveExpectedOutput(rule);
+            // 配置/装配场景用 own 规则:不跟随 reuseStep,确保 weak_grid 这种"借用 coverage
+            // 完成校验"的 step 仍能保留自己的 dependsOn / reportSection / title 派生源。
+            // 完成校验另走 stepRule()(仍跟随 reuseStep)。
+            PlanStepRule ownRule = guard.stepRuleOwn(stepId).orElse(null);
+            String title = deriveTitle(stepId, ownRule);
+            String toolHint = deriveToolHint(stepId, ownRule);
+            String expectedOutput = deriveExpectedOutput(ownRule);
             PlanStep step = new PlanStep(stepId, title, toolHint, expectedOutput);
             materializeFromRule(step, guard);
+            // 默认串行兜底:skill 没在 JSON 里写 dependsOn,就让当前 step 串行依赖前一个 step,
+            // 老 skill 不用动也能拿到"先 A 完再 B"的安全行为。Skill 想要并行的话,在 JSON 里
+            // 显式声明 dependsOn(可以是空数组,可以是更早的某个 step),覆盖这个默认值。
+            applyDependsOnFallback(step, ownRule, previousStepId);
             plan.addStep(step);
+            previousStepId = stepId;
         }
         // Keep title empty — skill author can override later if they want, but a blank title
         // is better than a generic "Auto-seeded plan" that pretends to describe intent.
@@ -104,13 +113,30 @@ public class SkillPlanSeeder {
     }
 
     /**
+     * 默认串行兜底:rule 没声明 dependsOn(dependsOnDeclared=false)且当前 step 不是第一个,
+     * 给它打上 [previousStepId] 这个隐式依赖。声明了 dependsOn 的 rule —— 哪怕是空数组 ——
+     * 都按 rule 自身值走,这是 skill 作者明确的"我是根 step"或"我依赖 A、B"的意思。
+     */
+    private void applyDependsOnFallback(PlanStep step, PlanStepRule rule, String previousStepId) {
+        if (rule != null && rule.dependsOnDeclared()) {
+            step.setDependsOn(rule.dependsOn());
+            return;
+        }
+        if (previousStepId != null) {
+            step.setDependsOn(java.util.List.of(previousStepId));
+        }
+    }
+
+    /**
      * Mirrors {@code PlanCreateTool.materializeFromRule} — copies the skill's per-step rule
      * details onto the freshly created PlanStep so the rendered plan carries SQL templates /
      * allowed tables / report heading directly, without the LLM having to dig through prompt
      * text to find them.
      */
     private void materializeFromRule(PlanStep step, SkillGuard guard) {
-        PlanStepRule rule = guard.stepRule(step.id()).orElse(null);
+        // 用 OWN 规则物化:reuseStep 只为了共享完成校验,不该把 weak_grid 自己的 reportSection
+        // / sqlTemplates / dependsOn 替换成 coverage 的。
+        PlanStepRule rule = guard.stepRuleOwn(step.id()).orElse(null);
         if (rule == null || rule.isEmpty()) {
             return;
         }

@@ -10,6 +10,10 @@ public record ToolDefinitionCommand(
         String toolType,
         String configJson,
         boolean enabled,
-        boolean approvalRequired
+        boolean approvalRequired,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

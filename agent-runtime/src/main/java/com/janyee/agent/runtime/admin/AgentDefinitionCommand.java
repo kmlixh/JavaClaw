@@ -7,6 +7,10 @@ public record AgentDefinitionCommand(
         String systemPrompt,
         String agentMarkdown,
         String memoryMarkdown,
-        Boolean enabled
+        Boolean enabled,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

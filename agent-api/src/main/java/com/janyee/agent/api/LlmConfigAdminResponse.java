@@ -15,6 +15,10 @@ public record LlmConfigAdminResponse(
         boolean enabled,
         boolean defaultConfig,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

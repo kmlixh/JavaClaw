@@ -92,14 +92,42 @@ public class JpaAdminCatalogService implements AdminCatalogService {
 
     @Override
     public List<LlmConfigView> listLlmConfigs() {
+        AuthPrincipal principal = SecurityContextHolder.current();
         return llmProviderConfigRepository.findAllByOrderByDisplayNameAsc().stream()
+                .filter(e -> principal.anonymous()
+                        || ResourceScopeFilter.matches(
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal))
                 .map(this::toLlmConfigView)
                 .toList();
+    }
+
+    /**
+     * RBAC 编辑权限校验:
+     *   - 系统管理员(tenantId='system'):全部资源都能编辑;
+     *   - 租户管理员(本租户内有 *.manage 权限):租户匹配 → 能编辑;
+     *   - 普通用户:只能编辑 owner 是自己的资源。
+     * 不通过抛 SecurityException,web 层 AuthExceptionAdvice 转 403。匿名期(anonymous=true)
+     * 出于兼容老 dev 行为放行 —— 新部署 anonymous-enabled=false 时进不来这条路径。
+     * 仅在"修改/删除已存在的资源"场景调用;新建场景由 inferScope 推断 owner 为当前用户。
+     */
+    private void requireCanEdit(String tenantId, String userId, String resourceLabel) {
+        AuthPrincipal p = SecurityContextHolder.current();
+        if (p == null || p.anonymous()) return;
+        if (!ResourceScopeFilter.canEdit(tenantId, userId, p)) {
+            throw new SecurityException("没有权限编辑该 " + resourceLabel
+                    + " (resource owner=" + (userId == null ? "-" : userId)
+                    + ", tenant=" + (tenantId == null ? "-" : tenantId) + ")");
+        }
     }
 
     @Override
     @Transactional
     public LlmConfigView saveLlmConfig(LlmConfigCommand command) {
+        // 修改场景:加载现有 entity 校验 owner 是否可编辑;新建场景跳过(inferScope 把 owner 设成自己)
+        if (command.id() != null && !command.id().isBlank()) {
+            llmProviderConfigRepository.findById(command.id()).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "LLM 配置"));
+        }
         LlmProviderConfigEntity entity = command.id() == null || command.id().isBlank()
                 ? new LlmProviderConfigEntity()
                 : llmProviderConfigRepository.findById(command.id()).orElseGet(LlmProviderConfigEntity::new);
@@ -128,6 +156,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         if (entity.isDefaultConfig()) {
             clearOtherDefaultFlags(entity.getId());
         }
+        applyScope(entity, command);
 
         return toLlmConfigView(llmProviderConfigRepository.save(entity));
     }
@@ -135,6 +164,8 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Override
     @Transactional
     public void deleteLlmConfig(String id) {
+        llmProviderConfigRepository.findById(id).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "LLM 配置"));
         llmProviderConfigRepository.deleteById(id);
     }
 
@@ -144,7 +175,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         return knowledgeEntryRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
                 .filter(e -> principal.anonymous()
                         || ResourceScopeFilter.matches(
-                                e.getScopeType(), e.getScopeTenantId(), e.getScopeUserId(), principal))
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal))
                 .map(this::toKnowledgeView)
                 .toList();
     }
@@ -152,6 +183,10 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Override
     @Transactional
     public KnowledgeEntryView saveKnowledgeEntry(KnowledgeEntryCommand command) {
+        if (command.id() != null && !command.id().isBlank()) {
+            knowledgeEntryRepository.findById(command.id()).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "知识条目"));
+        }
         KnowledgeEntryEntity entity = command.id() == null || command.id().isBlank()
                 ? new KnowledgeEntryEntity()
                 : knowledgeEntryRepository.findById(command.id()).orElseGet(KnowledgeEntryEntity::new);
@@ -168,46 +203,108 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         entity.setSource(defaultIfBlank(command.source(), "database"));
         entity.setTagsJson(command.tagsJson());
         entity.setEnabled(command.enabled());
-        applyScopeOnNew(entity);
+        applyScope(entity, command);
         return toKnowledgeView(knowledgeEntryRepository.save(entity));
     }
 
-    /** 仅当 entity 是新创建(scopeType 还为空)时按 principal 推断填入,编辑路径保留原值。 */
-    private void applyScopeOnNew(KnowledgeEntryEntity e) {
-        if (e.getScopeType() != null && !e.getScopeType().isBlank()) return;
-        InferredScope s = inferScope();
-        e.setScopeType(s.type); e.setScopeTenantId(s.tenantId); e.setScopeUserId(s.userId); e.setAppId(s.appId);
+    /**
+     * 根据 command 显式提供的 scope 字段 + 现有 entity 状态决定最终 scope。
+     * 优先级:command 显式指定 > entity 已有值 > principal 推断默认。
+     */
+    private static class TargetScope {
+        String type; String tenantId; String userId; String appId;
     }
-    private void applyScopeOnNew(SkillDefinitionEntity e) {
-        if (e.getScopeType() != null && !e.getScopeType().isBlank()) return;
+
+    private TargetScope resolveScope(
+            String cmdType, String cmdTenantId, String cmdAppId, String cmdUserId,
+            String existingType, String existingTenantId, String existingAppId, String existingUserId
+    ) {
+        TargetScope t = new TargetScope();
+        boolean cmdProvided = cmdType != null && !cmdType.isBlank();
+        if (cmdProvided) {
+            // 校验 command 自带的 scope 合法
+            String err = ResourceScopeFilter.validate(cmdType, cmdTenantId, cmdAppId, cmdUserId);
+            if (err != null) {
+                throw new IllegalArgumentException("scope invalid: " + err);
+            }
+            t.type = cmdType.toUpperCase();
+            t.tenantId = cmdTenantId; t.appId = cmdAppId; t.userId = cmdUserId;
+            return t;
+        }
+        boolean existingProvided = existingType != null && !existingType.isBlank();
+        if (existingProvided) {
+            t.type = existingType; t.tenantId = existingTenantId;
+            t.appId = existingAppId; t.userId = existingUserId;
+            return t;
+        }
         InferredScope s = inferScope();
-        e.setScopeType(s.type); e.setScopeTenantId(s.tenantId); e.setScopeUserId(s.userId); e.setAppId(s.appId);
+        t.type = s.type; t.tenantId = s.tenantId; t.userId = s.userId; t.appId = s.appId;
+        return t;
     }
-    private void applyScopeOnNew(DbDatasourceEntity e) {
-        if (e.getScopeType() != null && !e.getScopeType().isBlank()) return;
-        InferredScope s = inferScope();
-        e.setScopeType(s.type); e.setScopeTenantId(s.tenantId); e.setScopeUserId(s.userId); e.setAppId(s.appId);
+
+    private void applyScope(KnowledgeEntryEntity e, KnowledgeEntryCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
+    }
+    private void applyScope(SkillDefinitionEntity e, SkillDefinitionCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
+    }
+    private void applyScope(DbDatasourceEntity e, DatasourceCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
+    }
+    private void applyScope(ToolDefinitionEntity e, ToolDefinitionCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
+    }
+    private void applyScope(LlmProviderConfigEntity e, LlmConfigCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
+    }
+    private void applyScope(AgentDefinitionEntity e, AgentDefinitionCommand cmd) {
+        TargetScope t = resolveScope(
+                cmd.scopeType(), cmd.scopeTenantId(), cmd.appId(), cmd.scopeUserId(),
+                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId());
+        e.setScopeType(t.type); e.setScopeTenantId(t.tenantId);
+        e.setAppId(t.appId); e.setScopeUserId(t.userId);
     }
     private void applyScopeOnNew(MemoryNoteEntity e) {
         if (e.getScopeType() != null && !e.getScopeType().isBlank()) return;
         InferredScope s = inferScope();
         e.setScopeType(s.type); e.setScopeTenantId(s.tenantId); e.setScopeUserId(s.userId); e.setAppId(s.appId);
     }
-    private void applyScopeOnNew(AgentDefinitionEntity e) {
-        if (e.getVisibility() != null && !e.getVisibility().isBlank()) return;
-        InferredScope s = inferScope();
-        e.setVisibility(s.type); e.setScopeTenantId(s.tenantId); e.setScopeUserId(s.userId); e.setAppId(s.appId);
-    }
 
     @Override
     @Transactional
     public void deleteKnowledgeEntry(String id) {
+        knowledgeEntryRepository.findById(id).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "知识条目"));
         knowledgeEntryRepository.deleteById(id);
     }
 
     @Override
     public List<ToolDefinitionView> listToolDefinitions(String agentId) {
+        AuthPrincipal principal = SecurityContextHolder.current();
         return toolDefinitionRepository.findByAgentIdAndEnabledTrueOrderByUpdatedAtDesc(agentId).stream()
+                .filter(e -> principal.anonymous()
+                        || ResourceScopeFilter.matches(
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal))
                 .map(this::toToolView)
                 .toList();
     }
@@ -215,6 +312,10 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Override
     @Transactional
     public ToolDefinitionView saveToolDefinition(ToolDefinitionCommand command) {
+        if (command.id() != null && !command.id().isBlank()) {
+            toolDefinitionRepository.findById(command.id()).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "工具"));
+        }
         ToolDefinitionEntity entity = command.id() == null || command.id().isBlank()
                 ? new ToolDefinitionEntity()
                 : toolDefinitionRepository.findById(command.id()).orElseGet(ToolDefinitionEntity::new);
@@ -233,12 +334,15 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         entity.setConfigJson(command.configJson());
         entity.setEnabled(command.enabled());
         entity.setApprovalRequired(command.approvalRequired());
+        applyScope(entity, command);
         return toToolView(toolDefinitionRepository.save(entity));
     }
 
     @Override
     @Transactional
     public void deleteToolDefinition(String id) {
+        toolDefinitionRepository.findById(id).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "工具"));
         toolDefinitionRepository.deleteById(id);
     }
 
@@ -252,7 +356,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         return entities.stream()
                 .filter(e -> principal.anonymous()
                         || ResourceScopeFilter.matches(
-                                e.getScopeType(), e.getScopeTenantId(), e.getScopeUserId(), principal))
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal))
                 .map(this::toSkillView)
                 .toList();
     }
@@ -260,6 +364,10 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Override
     @Transactional
     public SkillDefinitionView saveSkillDefinition(SkillDefinitionCommand command) {
+        if (command.id() != null && !command.id().isBlank()) {
+            skillDefinitionRepository.findById(command.id()).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "Skill"));
+        }
         SkillDefinitionEntity entity = command.id() == null || command.id().isBlank()
                 ? new SkillDefinitionEntity()
                 : skillDefinitionRepository.findById(command.id()).orElseGet(SkillDefinitionEntity::new);
@@ -280,7 +388,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         entity.setConfigJson(command.configJson());
         entity.setTriggerKeywords(command.triggerKeywords());
         entity.setEnabled(command.enabled());
-        applyScopeOnNew(entity);
+        applyScope(entity, command);
         SkillDefinitionEntity saved = skillDefinitionRepository.save(entity);
 
         // 重置 binding:先删,再按新 agentIds 插入。用 deleteBySkillId 而不是级联,
@@ -297,6 +405,8 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Override
     @Transactional
     public void deleteSkillDefinition(String id) {
+        skillDefinitionRepository.findById(id).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "Skill"));
         // FK ON DELETE CASCADE 会连带清理 binding,但显式先删能避免依赖 DDL 的隐式行为。
         skillAgentBindingRepository.deleteBySkillId(id);
         skillDefinitionRepository.deleteById(id);
@@ -358,7 +468,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.isEnabled(),
                 entity.getVersion(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 
@@ -376,7 +490,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.isApprovalRequired(),
                 entity.getVersion(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 
@@ -396,7 +514,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.isEnabled(),
                 entity.getVersion(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 
@@ -418,7 +540,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.isEnabled(),
                 entity.isDefaultConfig(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 
@@ -553,7 +679,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         for (DbDatasourceEntity entity : all) {
             if (!principal.anonymous()
                     && !ResourceScopeFilter.matches(
-                            entity.getScopeType(), entity.getScopeTenantId(), entity.getScopeUserId(), principal)) {
+                            entity.getScopeType(), entity.getScopeTenantId(), entity.getAppId(), entity.getScopeUserId(), principal)) {
                 continue;
             }
             views.add(toDatasourceView(entity));
@@ -574,6 +700,10 @@ public class JpaAdminCatalogService implements AdminCatalogService {
             throw new IllegalArgumentException("username is required");
         }
         String id = isBlank(command.id()) ? UUID.randomUUID().toString() : command.id().trim();
+        if (!isBlank(command.id())) {
+            dbDatasourceRepository.findById(id).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "数据源"));
+        }
         DbDatasourceEntity entity = dbDatasourceRepository.findById(id).orElseGet(DbDatasourceEntity::new);
         boolean isNew = entity.getId() == null;
         entity.setId(id);
@@ -590,7 +720,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         entity.setDialect(isBlank(command.dialect()) ? null : command.dialect().trim());
         entity.setDescription(isBlank(command.description()) ? null : command.description());
         entity.setEnabled(command.enabled());
-        applyScopeOnNew(entity);
+        applyScope(entity, command);
         return toDatasourceView(dbDatasourceRepository.save(entity));
     }
 
@@ -599,7 +729,10 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         if (isBlank(id)) {
             return;
         }
-        dbDatasourceRepository.deleteById(id.trim());
+        String trimmed = id.trim();
+        dbDatasourceRepository.findById(trimmed).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "数据源"));
+        dbDatasourceRepository.deleteById(trimmed);
     }
 
     private DatasourceView toDatasourceView(DbDatasourceEntity entity) {
@@ -613,7 +746,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.getDescription(),
                 entity.isEnabled(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 
@@ -631,7 +768,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 .stream()
                 .filter(e -> principal.anonymous()
                         || ResourceScopeFilter.matches(
-                                e.getScopeType(), e.getScopeTenantId(), e.getScopeUserId(), principal))
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal))
                 .map(this::toMemoryNoteView)
                 .toList();
     }
@@ -641,6 +778,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     public MemoryNoteView saveMemoryNote(MemoryNoteCommand command) {
         if (command == null || command.content() == null || command.content().isBlank()) {
             throw new IllegalArgumentException("memory note content is required");
+        }
+        // 修改场景:加载现有 entity 校验 owner 是否可编辑;新建场景跳过(applyScopeOnNew 推断 owner 自己)
+        if (command.id() != null) {
+            memoryNoteRepository.findById(command.id()).ifPresent(existing ->
+                    requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "记忆笔记"));
         }
         MemoryNoteEntity entity = command.id() == null
                 ? new MemoryNoteEntity()
@@ -665,6 +807,8 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Transactional
     public void deleteMemoryNote(Long id) {
         if (id == null) return;
+        memoryNoteRepository.findById(id).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "记忆笔记"));
         memoryNoteRepository.deleteById(id);
     }
 
@@ -697,7 +841,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         return agentDefinitionRepository.findAllByOrderByDisplayNameAsc().stream()
                 .filter(e -> principal.anonymous()
                         || ResourceScopeFilter.matches(
-                                e.getVisibility(), e.getScopeTenantId(), e.getScopeUserId(), principal)
+                                e.getScopeType(), e.getScopeTenantId(), e.getAppId(), e.getScopeUserId(), principal)
                         || pinnedAgentIds.contains(e.getAgentId()))
                 .map(this::toAgentDefinitionView)
                 .toList();
@@ -710,7 +854,9 @@ public class JpaAdminCatalogService implements AdminCatalogService {
             throw new IllegalArgumentException("agentId is required");
         }
         String agentId = command.agentId().trim();
-        // agentId 作为主键不可变；update 时用 findById 保留 createdAt
+        // agentId 主键不可变,findById 已存在 = 修改场景,做 RBAC 编辑权限校验
+        agentDefinitionRepository.findById(agentId).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "Agent"));
         AgentDefinitionEntity entity = agentDefinitionRepository.findById(agentId)
                 .orElseGet(() -> {
                     AgentDefinitionEntity e = new AgentDefinitionEntity();
@@ -723,7 +869,7 @@ public class JpaAdminCatalogService implements AdminCatalogService {
         entity.setAgentMarkdown(command.agentMarkdown() == null ? "" : command.agentMarkdown());
         entity.setMemoryMarkdown(command.memoryMarkdown() == null ? "" : command.memoryMarkdown());
         entity.setEnabled(command.enabled() == null ? true : command.enabled());
-        applyScopeOnNew(entity);
+        applyScope(entity, command);
         return toAgentDefinitionView(agentDefinitionRepository.save(entity));
     }
 
@@ -731,6 +877,8 @@ public class JpaAdminCatalogService implements AdminCatalogService {
     @Transactional
     public void deleteAgentDefinition(String agentId) {
         if (agentId == null || agentId.isBlank()) return;
+        agentDefinitionRepository.findById(agentId).ifPresent(existing ->
+                requireCanEdit(existing.getScopeTenantId(), existing.getScopeUserId(), "Agent"));
         agentDefinitionRepository.deleteById(agentId);
     }
 
@@ -744,7 +892,11 @@ public class JpaAdminCatalogService implements AdminCatalogService {
                 entity.getMemoryMarkdown(),
                 entity.isEnabled(),
                 entity.getCreatedAt(),
-                entity.getUpdatedAt()
+                entity.getUpdatedAt(),
+                entity.getScopeType(),
+                entity.getScopeTenantId(),
+                entity.getAppId(),
+                entity.getScopeUserId()
         );
     }
 

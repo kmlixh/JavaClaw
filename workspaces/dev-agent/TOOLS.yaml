@@ -17,4 +17,9 @@ allow:
   - db.schema.inspect
   - table.render
   - chart.echarts
+  # 嵌入场景的浏览器回调通道(xmap-ol-front 这类宿主调用)
+  - host.invoke
+  # 计划工具(skill 强制 plan 流程时需要)
+  - plan.create
+  - plan.update
 deny: []

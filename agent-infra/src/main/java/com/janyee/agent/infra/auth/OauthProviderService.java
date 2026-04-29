@@ -186,10 +186,12 @@ public class OauthProviderService {
             throw new OauthException("MISSING_USER",
                     "client_credentials grant requires either user_id parameter or oauth_client.owner_user_id");
         }
+        // appId 用 clientId 自身 —— 第三方应用通过 client_credentials 拿到的 token,其 aid claim
+        // 就是该应用标识。后端 ResourceScopeFilter 的 APP scope 过滤用这个值跟资源的 app_id 配对。
         String accessToken = jwtService.issueOauthAccessToken(
-                resolvedUserId, tenantId, "system-default");
-        log.info("oauth.client_credentials.issued clientId={}, userId={}, tenant={}",
-                clientId, resolvedUserId, tenantId);
+                resolvedUserId, tenantId, clientId);
+        log.info("oauth.client_credentials.issued clientId={}, userId={}, tenant={}, appId={}",
+                clientId, resolvedUserId, tenantId, clientId);
         return new TokenResponse(accessToken, "Bearer", 7200, client.getScopes());
     }
 

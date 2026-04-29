@@ -80,7 +80,34 @@ public class AdminUserManagementService {
      * 复用为"跨租户管理用户/OAuth 客户端"的 marker 不会冲突。
      */
     private boolean isSystemAdmin(AuthPrincipal p) {
-        return p != null && (p.anonymous() || p.permissions().contains("session.read.all"));
+        // 统一到 ResourceScopeFilter.isSystemAdmin 的标准 (tenantId='system'),避免两个 service
+        // 用不同的 sysadmin 判定语义。anonymous(P2 兼容期) 仍放行。
+        if (p == null) return false;
+        if (p.anonymous()) return true;
+        return com.janyee.agent.infra.auth.ResourceScopeFilter.isSystemAdmin(p);
+    }
+
+    /**
+     * 校验当前 principal 是否可操作目标用户。
+     *   - 系统管理员:任何用户都可;
+     *   - 租户管理员:仅当目标用户在当前租户的 user_tenant_role 里有绑定才可。
+     * 不通过抛 AuthException("forbidden") → 由 AuthExceptionAdvice 转 HTTP 403。
+     * 给所有"按 userId 操作"的端点统一做边界检查,避免租户管理员越权改其它租户用户。
+     */
+    private void requireUserAccessible(String targetUserId) {
+        if (targetUserId == null || targetUserId.isBlank()) return;
+        AuthPrincipal p = SecurityContextHolder.current();
+        if (isSystemAdmin(p)) return;
+        if (p == null || p.tenantId() == null || p.tenantId().isBlank()) {
+            throw new AuthService.AuthException("forbidden", "no tenant context");
+        }
+        boolean bound = !userTenantRoleRepository
+                .findByUserIdAndTenantId(targetUserId, p.tenantId())
+                .isEmpty();
+        if (!bound) {
+            throw new AuthService.AuthException("forbidden",
+                    "user " + targetUserId + " 不在当前租户内,无权操作");
+        }
     }
 
     public List<UserView> listUsers() {
@@ -96,6 +123,7 @@ public class AdminUserManagementService {
     }
 
     public UserView getUser(String id) {
+        requireUserAccessible(id);
         return toUserView(userRepository.findById(id)
                 .orElseThrow(() -> new AuthService.AuthException("USER_NOT_FOUND", "user not found: " + id)));
     }
@@ -145,18 +173,28 @@ public class AdminUserManagementService {
 
     @Transactional
     public UserView updateUser(String id, UserUpdateCommand cmd) {
+        requireUserAccessible(id);
         AppUserEntity entity = userRepository.findById(id)
                 .orElseThrow(() -> new AuthService.AuthException("USER_NOT_FOUND", "user not found: " + id));
+        // 租户管理员不能改 preferredTenantId 把用户搬到别的租户(只能改自己租户内的字段)
+        AuthPrincipal p = SecurityContextHolder.current();
+        boolean systemAdmin = isSystemAdmin(p);
         if (cmd.displayName() != null) entity.setDisplayName(cmd.displayName().trim());
         if (cmd.email() != null) entity.setEmail(blankToNull(cmd.email()));
         if (cmd.status() != null && !cmd.status().isBlank()) entity.setStatus(cmd.status().trim().toUpperCase());
-        if (cmd.preferredTenantId() != null) entity.setPreferredTenantId(blankToNull(cmd.preferredTenantId()));
+        if (cmd.preferredTenantId() != null) {
+            if (systemAdmin) {
+                entity.setPreferredTenantId(blankToNull(cmd.preferredTenantId()));
+            }
+            // 非超管:忽略 preferredTenantId 字段,保持原值
+        }
         return toUserView(userRepository.save(entity));
     }
 
     /** 管理员触发的密码重置。生成新临时密码 + 强制下次登录改密。返回临时明文密码。 */
     @Transactional
     public String resetPassword(String userId) {
+        requireUserAccessible(userId);
         AppUserEntity entity = userRepository.findById(userId)
                 .orElseThrow(() -> new AuthService.AuthException("USER_NOT_FOUND", "user not found: " + userId));
         String temp = generateTempPassword();
@@ -197,6 +235,7 @@ public class AdminUserManagementService {
         if ("admin".equals(id)) {
             throw new AuthService.AuthException("FORBIDDEN_DELETE_ADMIN", "cannot delete the bootstrap admin user");
         }
+        requireUserAccessible(id);
         // 先清绑定再删主体,避免 FK 约束失败。
         userTenantRoleRepository.findByUserId(id).forEach(userTenantRoleRepository::delete);
         // user_permission 没有 findByUserId,逐租户清理:遍历 user_tenant_role 时已捎带,
@@ -305,6 +344,21 @@ public class AdminUserManagementService {
                 .orElseThrow(() -> new AuthService.AuthException("USER_NOT_FOUND", "user not found: " + userId));
         tenantRepository.findById(tenantId)
                 .orElseThrow(() -> new AuthService.AuthException("TENANT_NOT_FOUND", "tenant not found: " + tenantId));
+        // 校验每个 roleId 真属于目标 tenantId —— 之前这里没查,
+        // 租户管理员能传别租户的 roleId 绑到自己租户用户头上,导致权限模型混乱。
+        if (roleIds != null) {
+            for (String roleId : roleIds) {
+                if (isBlank(roleId)) continue;
+                RoleEntity role = roleRepository.findById(roleId.trim())
+                        .orElseThrow(() -> new AuthService.AuthException("ROLE_NOT_FOUND",
+                                "role not found: " + roleId));
+                if (!java.util.Objects.equals(role.getTenantId(), tenantId)) {
+                    throw new AuthService.AuthException("forbidden",
+                            "role '" + roleId + "' belongs to tenant '" + role.getTenantId()
+                                    + "', cannot assign within tenant '" + tenantId + "'");
+                }
+            }
+        }
         userTenantRoleRepository.findByUserIdAndTenantId(userId, tenantId)
                 .forEach(userTenantRoleRepository::delete);
         userTenantRoleRepository.flush();
@@ -320,7 +374,12 @@ public class AdminUserManagementService {
     }
 
     public List<UserTenantRoleView> listUserTenantRoles(String userId) {
+        requireUserAccessible(userId);
+        AuthPrincipal p = SecurityContextHolder.current();
+        boolean systemAdmin = isSystemAdmin(p);
         return userTenantRoleRepository.findByUserId(userId).stream()
+                // 租户管理员只看自己租户的绑定行,不要泄露目标用户在别租户的角色
+                .filter(e -> systemAdmin || e.getTenantId().equals(p.tenantId()))
                 .map(e -> new UserTenantRoleView(e.getUserId(), e.getTenantId(), e.getRoleId(), e.getGrantedAt()))
                 .toList();
     }

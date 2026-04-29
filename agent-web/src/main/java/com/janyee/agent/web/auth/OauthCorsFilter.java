@@ -11,15 +11,16 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
 /**
- * 极简 CORS:专门给 /oauth/token 用,让第三方页面里的 SDK 能跨域 POST 拿 access_token。
- * 其它 API 仍走同源(嵌入页 iframe 在我们域下,fetch 自带 cookie/Bearer,无需 CORS)。
+ * 极简 CORS:给 /oauth/* 和 /api/bridge/* 用 —— 这两条路径会被第三方页面嵌入的 SDK
+ * 跨域调用(/oauth/token 拿 access_token、/api/bridge/invoke-result 直接 HTTP 回写
+ * host.invoke 的结果绕开 postMessage)。
  *
- * <p>SDK 的 POST 是 application/x-www-form-urlencoded —— simple request,没有 preflight,
- * 只需要回包带上 Access-Control-Allow-Origin。这里也兼容 OPTIONS preflight 以防未来扩展。</p>
+ * <p>/oauth/token 是 application/x-www-form-urlencoded simple request,无 preflight。
+ * /api/bridge/invoke-result 是 application/json + Authorization header,触发 preflight,
+ * 这里 OPTIONS 分支会回 204。</p>
  *
- * <p>放行原则:回响请求来源(Access-Control-Allow-Origin: <origin>),允许带凭据用不上 ——
- * client_credentials 不需要 cookie。如果以后想严格白名单,改成读 oauth_client.redirect_uris
- * 解析出 origin 集合做匹配即可。</p>
+ * <p>放行原则:回响请求来源(Access-Control-Allow-Origin: &lt;origin&gt;)。如果以后想严格
+ * 白名单,改成读 oauth_client.redirect_uris 解析出 origin 集合做匹配即可。</p>
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 5)  // 在 JwtAuthWebFilter(+10) 之前
@@ -28,7 +29,7 @@ public class OauthCorsFilter implements WebFilter {
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().pathWithinApplication().value();
-        if (path == null || !path.startsWith("/oauth/")) {
+        if (path == null || !(path.startsWith("/oauth/") || path.startsWith("/api/bridge/"))) {
             return chain.filter(exchange);
         }
         String origin = exchange.getRequest().getHeaders().getFirst(HttpHeaders.ORIGIN);

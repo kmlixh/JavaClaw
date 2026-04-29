@@ -60,6 +60,42 @@ public class RunPlan {
         return Optional.empty();
     }
 
+    /**
+     * Step IDs in {@code step.dependsOn()} that are NOT yet COMPLETED or SKIPPED. An empty
+     * list means the step is unblocked and may transition to IN_PROGRESS. Unknown step IDs
+     * are treated as unmet (defensive — a typo in skill JSON shouldn't silently let the LLM
+     * skip a real predecessor).
+     */
+    public List<String> unmetDependencies(PlanStep step) {
+        if (step == null || step.dependsOn() == null || step.dependsOn().isEmpty()) {
+            return List.of();
+        }
+        List<String> unmet = new ArrayList<>();
+        for (String depId : step.dependsOn()) {
+            if (depId == null || depId.isBlank()) {
+                continue;
+            }
+            PlanStep dep = stepsById.get(depId);
+            if (dep == null) {
+                unmet.add(depId + " (unknown step id)");
+                continue;
+            }
+            PlanStatus s = dep.status();
+            if (s != PlanStatus.COMPLETED && s != PlanStatus.SKIPPED) {
+                unmet.add(depId + " (" + s.name() + ")");
+            }
+        }
+        return unmet;
+    }
+
+    /**
+     * Whether {@code step} can legally transition to IN_PROGRESS right now. False when any
+     * declared dependency is still PENDING / IN_PROGRESS / FAILED.
+     */
+    public boolean isReady(PlanStep step) {
+        return unmetDependencies(step).isEmpty();
+    }
+
     public boolean hasUnfinishedSteps() {
         for (PlanStep step : steps) {
             PlanStatus status = step.status();
@@ -86,6 +122,7 @@ public class RunPlan {
             stepMap.put("status", step.status().name());
             stepMap.put("resultNote", step.resultNote());
             stepMap.put("outputCount", step.toolSummaries().size());
+            stepMap.put("dependsOn", step.dependsOn());
             return stepMap;
         }).collect(Collectors.toList()));
         return snapshot;
@@ -104,6 +141,11 @@ public class RunPlan {
                     .append(step.id()).append(": ").append(step.title());
             if (!step.toolHint().isBlank()) {
                 builder.append(" | tool=").append(step.toolHint());
+            }
+            // dependsOn 直接渲染到 plan compact 视图 —— LLM 需要看到"我必须先等谁",而不是
+            // 等 plan.update 拒绝时才知道。每行末尾一段简短的 deps=[A,B] 标识。
+            if (!step.dependsOn().isEmpty()) {
+                builder.append(" | deps=").append(step.dependsOn());
             }
             if (!step.resultNote().isBlank()) {
                 builder.append(" | note=").append(truncate(step.resultNote(), 120));

@@ -68,7 +68,7 @@ public class PlanPreflightExecutor {
         this.objectMapper = objectMapper;
     }
 
-    /** Returns the number of steps successfully preflighted. */
+    /** Returns the number of steps successfully preflighted across all waves. */
     public int runWave0(ToolLoopContext context, List<ChatAttachment> attachments) {
         RunPlan plan = context.runPlan();
         if (plan == null || plan.isEmpty()) {
@@ -77,44 +77,74 @@ public class PlanPreflightExecutor {
         String geoJson = extractGeoJsonFromAttachments(attachments);
         Variant variant = geoJson != null ? Variant.GEOJSON : Variant.NO_FILTER;
 
-        List<PlanStep> candidates = new ArrayList<>();
-        for (PlanStep step : plan.steps()) {
-            if (isEligible(step, variant)) {
-                candidates.add(step);
+        // Multi-wave 推进:每轮挑出"PENDING + 模板可用 + 所有 dependsOn 都已 COMPLETED/SKIPPED"的
+        // step 一起并发跑;跑完一轮后再用最新 plan 状态选下一轮。直到没有可推进的为止。
+        // 之前是一刀切单轮,序列化串行 skill (默认 dependsOn=前一步) 在 preflight 阶段只能跑掉
+        // 第一个 step,后面的全都被 dep 卡住。multi-wave 让先 COMPLETED 的 step 解锁它的下游,
+        // 整条数据采集链都能在 LLM 接管之前跑完。
+        // 加 16 轮硬上限防御无意义死循环 —— 正常 skill plan 不超过 8 个 step,16 已经留足余量。
+        final int maxWaves = 16;
+        AtomicInteger successCount = new AtomicInteger(0);
+        int totalDispatched = 0;
+
+        for (int wave = 0; wave < maxWaves; wave++) {
+            List<PlanStep> candidates = new ArrayList<>();
+            for (PlanStep step : plan.steps()) {
+                if (isEligible(step, variant) && plan.isReady(step)) {
+                    candidates.add(step);
+                }
+            }
+            if (candidates.isEmpty()) {
+                if (wave == 0) {
+                    log.info("plan.preflight.no_candidates runId={}, variant={}", context.runId(), variant);
+                }
+                break;
+            }
+            totalDispatched += candidates.size();
+            log.info("plan.preflight.wave_start runId={}, wave={}, variant={}, candidateCount={}, stepIds={}",
+                    context.runId(), wave, variant, candidates.size(),
+                    candidates.stream().map(PlanStep::id).toList());
+            context.emitEvent(
+                    AgentEventType.RUN_STATUS,
+                    "phase=PREFLIGHT wave=%d 并行预执行 %d 个 step: %s".formatted(
+                            wave, candidates.size(),
+                            candidates.stream().map(PlanStep::id).toList())
+            );
+
+            AtomicInteger waveSuccess = new AtomicInteger(0);
+            // Reactor 扇出:maxConcurrency=3 覆盖典型一波 3 路独立查询。太高抢光 DB 池;太低失去并行意义。
+            Flux.fromIterable(candidates)
+                    .flatMap(step -> Mono
+                                    .fromCallable(() -> executeStepOffMainThread(context, step, variant, geoJson))
+                                    .subscribeOn(Schedulers.boundedElastic())
+                                    .doOnNext(ok -> {
+                                        if (ok) {
+                                            waveSuccess.incrementAndGet();
+                                            successCount.incrementAndGet();
+                                        }
+                                    })
+                                    .onErrorResume(error -> {
+                                        log.warn("plan.preflight.step_errored runId={}, stepId={}, cause={}",
+                                                context.runId(), step.id(), error.getMessage());
+                                        return Mono.just(Boolean.FALSE);
+                                    }),
+                            DEFAULT_CONCURRENCY)
+                    .blockLast();
+            log.info("plan.preflight.wave_done runId={}, wave={}, succeeded={}, total={}",
+                    context.runId(), wave, waveSuccess.get(), candidates.size());
+            // 这一波有 step 失败 → 它的 dep 链下游不会被解锁,下一轮 candidates 可能为空提前退出;
+            // 这是预期行为:preflight 不强制追完,失败 step 留 PENDING 让 LLM 接手。
+            if (waveSuccess.get() == 0) {
+                // 整波都失败 = 没有任何下游能解锁,提前结束防止下一轮空跑。
+                break;
             }
         }
-        if (candidates.isEmpty()) {
+
+        if (totalDispatched == 0) {
             return 0;
         }
-
-        log.info("plan.preflight.start runId={}, variant={}, candidateCount={}, stepIds={}",
-                context.runId(), variant, candidates.size(),
-                candidates.stream().map(PlanStep::id).toList());
-        context.emitEvent(
-                AgentEventType.RUN_STATUS,
-                "phase=PREFLIGHT 并行预执行 %d 个已就绪 step: %s".formatted(
-                        candidates.size(),
-                        candidates.stream().map(PlanStep::id).toList())
-        );
-
-        AtomicInteger successCount = new AtomicInteger(0);
-        // Reactor 扇出:maxConcurrency=3 覆盖典型 wave 1 的 3 路独立查询(skill.coverage.analysis
-        // 的 sector/weak_area/coverage)。太高会把后端 DB 连接池抢空;太低失去并行意义。
-        Flux.fromIterable(candidates)
-                .flatMap(step -> Mono
-                                .fromCallable(() -> executeStepOffMainThread(context, step, variant, geoJson))
-                                .subscribeOn(Schedulers.boundedElastic())
-                                .doOnNext(ok -> { if (ok) successCount.incrementAndGet(); })
-                                .onErrorResume(error -> {
-                                    log.warn("plan.preflight.step_errored runId={}, stepId={}, cause={}",
-                                            context.runId(), step.id(), error.getMessage());
-                                    return Mono.just(Boolean.FALSE);
-                                }),
-                        DEFAULT_CONCURRENCY)
-                .blockLast();
-
         planPersister.sync(context.runId(), plan);
-        // Preflight 完成后把整张 plan 快照再推一次,前端面板直接看到 wave 0 step 已 COMPLETED。
+        // Preflight 完成后把整张 plan 快照再推一次,前端面板直接看到 wave 0..N step 已 COMPLETED。
         try {
             context.emitEvent(
                     AgentEventType.PLAN_UPDATED,
@@ -127,10 +157,10 @@ public class PlanPreflightExecutor {
         context.emitEvent(
                 AgentEventType.RUN_STATUS,
                 "phase=PREFLIGHT 并行预执行完成: %d/%d step 成功"
-                        .formatted(successCount.get(), candidates.size())
+                        .formatted(successCount.get(), totalDispatched)
         );
-        log.info("plan.preflight.finish runId={}, succeeded={}, total={}",
-                context.runId(), successCount.get(), candidates.size());
+        log.info("plan.preflight.finish runId={}, succeeded={}, totalDispatched={}",
+                context.runId(), successCount.get(), totalDispatched);
         return successCount.get();
     }
 
@@ -166,33 +196,85 @@ public class PlanPreflightExecutor {
      */
     private boolean executeStepOffMainThread(ToolLoopContext context, PlanStep step, Variant variant, String geoJson) {
         List<String> templates = templatesForVariant(step, variant);
+        long stepStartMs = System.currentTimeMillis();
+        log.info("plan.preflight.step_start runId={}, stepId={}, variant={}, templateCount={}",
+                context.runId(), step.id(), variant, templates.size());
         step.updateStatus(PlanStatus.IN_PROGRESS);
         boolean allOk = true;
         int rowCountSum = 0;
+        int sqlIdx = 0;
+        int failedAtSql = -1;
         for (String raw : templates) {
+            sqlIdx += 1;
+            long sqlStartMs = System.currentTimeMillis();
             String sql = substitute(raw, variant, geoJson);
             ToolCallOutcome outcome = runDbQuery(context, step, sql);
+            long sqlDur = System.currentTimeMillis() - sqlStartMs;
             if (outcome == null || !outcome.executed() || !outcome.success()) {
+                log.warn("plan.preflight.step_sql_failed runId={}, stepId={}, sqlIdx={}/{}, durationMs={}, error={}",
+                        context.runId(), step.id(), sqlIdx, templates.size(), sqlDur,
+                        outcome == null ? "null-outcome" : outcome.errorMessage());
                 allOk = false;
+                failedAtSql = sqlIdx;
                 break;
             }
-            rowCountSum += parseRowCount(outcome);
+            int rowCount = parseRowCount(outcome);
+            rowCountSum += rowCount;
+            String firstRow = parseFirstRowJson(outcome);
+            log.info("plan.preflight.step_sql_done runId={}, stepId={}, sqlIdx={}/{}, durationMs={}, rowCount={}",
+                    context.runId(), step.id(), sqlIdx, templates.size(), sqlDur, rowCount);
             step.attachToolSummary(CompletedToolSummary.of(
                     "db.query",
                     sql,
                     outcome.toolResult() != null ? outcome.toolResult().summary() : "",
                     rowCountSum,
-                    step.id()
+                    step.id(),
+                    firstRow
             ));
         }
+        long stepDur = System.currentTimeMillis() - stepStartMs;
         if (allOk) {
+            // step 完成校验:不光看"所有 SQL 都没报错",还要检查每条 SQL 实际返回了行。
+            // 业务上 preflight 用的是 COUNT(*) / SUM(...) 这类聚合,正常每条 SQL 必返 1 行,
+            // 全 0 行通常意味着用户限定的 region(geojson / 县级 filter) 在表里没数据,
+            // 这种"虚假完成"如果直接标 COMPLETED,LLM 看到 plan 全绿就直接调 artifact.markdown,
+            // 报告里全是占位符。所以校验三档:
+            //   sqlExecuted < templates.size  → 实际不应进 allOk 分支(防御性兜底)
+            //   全部 SQL rowCount==0          → 标 COMPLETED 但 resultNote 加警告,
+            //                                   LLM 在 prompt 里能看见,知道要重查
+            //   有 SQL 返回行                  → 正常 COMPLETED
+            int summaryCount = step.toolSummaries().size();
+            int zeroRowSummaries = (int) step.toolSummaries().stream()
+                    .filter(s -> s != null && s.rowCount() == 0)
+                    .count();
+            boolean allZeroRows = summaryCount > 0 && zeroRowSummaries == summaryCount;
             step.updateStatus(PlanStatus.COMPLETED);
-            step.updateResultNote("preflight: auto-executed " + templates.size()
-                    + " SQL, rowCountSum=" + rowCountSum);
+            // scope 标签必须显式塞进 resultNote —— 这是 LLM 在 [Plan] 里能直接看到的字段。
+            // NO_FILTER = 没有 region 过滤的全省级 SQL,数字不能当区县/城市答复;
+            // GEOJSON   = 用户附件 GeoJSON 区域内的精确数字,可以直接采用。
+            // 之前的 note 只写 "auto-executed N SQL, rowCountSum=X",LLM 看不出范围,
+            // 把全省级数字直接当成"西山区"的答案塞进报告 —— 这条修复就是为了堵这个洞。
+            String scopeTag = variant == Variant.GEOJSON
+                    ? "scope=GEOJSON (用户附件区域内,数字可直接采用)"
+                    : "scope=NO_FILTER (无 region 过滤,全表/全省统计 — 若用户问的是具体城市/区县/{地图N},这些数字不可直接写入报告,必须按用户 region 重新 db.query)";
+            if (allZeroRows) {
+                step.updateResultNote(scopeTag + " | preflight: " + templates.size()
+                        + " SQL 全部返回 0 行 — 用户筛选条件下可能无数据,生成报告前请按 GeoJSON / 区县名重新核查");
+                log.warn("plan.preflight.step_done runId={}, stepId={}, status=COMPLETED(but zero-rows), variant={}, durationMs={}, sqlExecuted={}, summaries={}",
+                        context.runId(), step.id(), variant, stepDur, templates.size(), summaryCount);
+            } else {
+                step.updateResultNote(scopeTag + " | preflight: auto-executed " + templates.size()
+                        + " SQL, rowCountSum=" + rowCountSum
+                        + (zeroRowSummaries > 0 ? " (其中 " + zeroRowSummaries + "/" + summaryCount + " 条返回 0 行)" : ""));
+                log.info("plan.preflight.step_done runId={}, stepId={}, status=COMPLETED, variant={}, durationMs={}, sqlExecuted={}, summaries={}, rowCountSum={}, zeroRowSummaries={}",
+                        context.runId(), step.id(), variant, stepDur, templates.size(), summaryCount, rowCountSum, zeroRowSummaries);
+            }
             return true;
         }
         step.updateStatus(PlanStatus.PENDING);
         step.updateResultNote("preflight partial/failed — LLM will continue normally");
+        log.warn("plan.preflight.step_done runId={}, stepId={}, status=PENDING(partial), durationMs={}, failedAtSql={}/{}, rowCountSum={}",
+                context.runId(), step.id(), stepDur, failedAtSql, templates.size(), rowCountSum);
         return false;
     }
 
@@ -277,6 +359,23 @@ public class PlanPreflightExecutor {
             return rows.isArray() ? rows.size() : 0;
         } catch (Exception ignored) {
             return 0;
+        }
+    }
+
+    /** 抽 rows[0] 的 JSON 表达,给 PlanStepRuleEvaluator 做字段级 acceptance 校验。null=不可用。 */
+    private String parseFirstRowJson(ToolCallOutcome outcome) {
+        if (outcome == null || outcome.toolResult() == null) return null;
+        String data = outcome.toolResult().dataJson();
+        if (data == null || data.isBlank()) return null;
+        try {
+            JsonNode root = objectMapper.readTree(data);
+            JsonNode rows = root.path("rows");
+            if (!rows.isArray() || rows.isEmpty()) return null;
+            JsonNode first = rows.get(0);
+            if (first == null || first.isMissingNode() || first.isNull()) return null;
+            return objectMapper.writeValueAsString(first);
+        } catch (Exception ignored) {
+            return null;
         }
     }
 

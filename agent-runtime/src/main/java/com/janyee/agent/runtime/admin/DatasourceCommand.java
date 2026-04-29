@@ -12,6 +12,10 @@ public record DatasourceCommand(
         String password,
         String dialect,
         String description,
-        boolean enabled
+        boolean enabled,
+        String scopeType,
+        String scopeTenantId,
+        String appId,
+        String scopeUserId
 ) {
 }

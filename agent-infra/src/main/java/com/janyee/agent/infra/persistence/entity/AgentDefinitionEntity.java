@@ -63,9 +63,8 @@ public class AgentDefinitionEntity {
         Instant now = Instant.now();
         this.createdAt = now;
         this.updatedAt = now;
-        // P1 兼容:新 agent 默认 SYSTEM 可见,现有 CRUD 不受影响
-        if (visibility == null || visibility.isBlank()) {
-            visibility = "SYSTEM";
+        if (scopeType == null || scopeType.isBlank()) {
+            scopeType = "SYSTEM";
             if (appId == null || appId.isBlank()) appId = "system-default";
         }
     }
@@ -75,13 +74,11 @@ public class AgentDefinitionEntity {
         this.updatedAt = Instant.now();
     }
 
-    // ===== V23: agent 可见性 ================================================
-    // visibility: SYSTEM | TENANT | USER
-    //   SYSTEM → 任何用户可见(V24 backfill 把现有 agent 全部标 SYSTEM)
-    //   TENANT → scope_tenant_id 必填,租户内可见
-    //   USER   → scope_user_id 必填,owner 自己和通过 user_agent_binding "收藏" 该 agent 的用户可见
-    @Column(name = "visibility", length = 16, nullable = false)
-    private String visibility;
+    // ===== 通用 scope:与 skill / knowledge / tool / llm / datasource 对齐 =====
+    // scope_type:SYSTEM | PUBLIC | TENANT | APP | USER
+    // 旧的 visibility 列已经废弃(DB 那边 NULL 容忍,数据搬到 scope_type)。
+    @Column(name = "scope_type", length = 32, nullable = false)
+    private String scopeType;
 
     @Column(name = "scope_tenant_id", length = 64)
     private String scopeTenantId;
@@ -92,8 +89,12 @@ public class AgentDefinitionEntity {
     @Column(name = "app_id", length = 64)
     private String appId;
 
-    public String getVisibility() { return visibility; }
-    public void setVisibility(String visibility) { this.visibility = visibility; }
+    public String getScopeType() { return scopeType; }
+    public void setScopeType(String scopeType) { this.scopeType = scopeType; }
+    /** @deprecated 用 getScopeType,visibility 字段已下线 */
+    @Deprecated public String getVisibility() { return scopeType; }
+    /** @deprecated 用 setScopeType,visibility 字段已下线 */
+    @Deprecated public void setVisibility(String value) { this.scopeType = value; }
     public String getScopeTenantId() { return scopeTenantId; }
     public void setScopeTenantId(String scopeTenantId) { this.scopeTenantId = scopeTenantId; }
     public String getScopeUserId() { return scopeUserId; }

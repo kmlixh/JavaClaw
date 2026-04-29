@@ -406,8 +406,11 @@ public class DefaultToolResultAppender implements ToolResultAppender {
         final PlanStep autoAdvancedFinal = autoAdvanced;
         String stepId = context.runPlan().currentInProgressStep().map(PlanStep::id)
                 .orElseGet(() -> autoAdvancedFinal != null ? autoAdvancedFinal.id() : "");
+        // 抽出 firstRow JSON,让 PlanStepRuleEvaluator 能在 acceptance 校验里读到具体字段值。
+        // 之前只有 summary 文本,evaluator 没法判断"cnt_2g=0,cnt_4g=0,cnt_5g=0"这种全零情况。
+        String firstRowJson = extractFirstRowJson(outcome);
         CompletedToolSummary completed = CompletedToolSummary.of(
-                toolName, fingerprint, safe(summaryText), rowCount, stepId
+                toolName, fingerprint, safe(summaryText), rowCount, stepId, firstRowJson
         );
         context.addCompletedToolSummary(completed);
 
@@ -544,6 +547,35 @@ public class DefaultToolResultAppender implements ToolResultAppender {
         } catch (Exception ignored) {
         }
         return "";
+    }
+
+    /**
+     * 取 dataJson.rows[0] 序列化成 JSON 字符串。给 PlanStepRuleEvaluator 用 —— evaluator 用
+     * 来按字段名查值,做 acceptance 检查 (requiredColumns / nonZeroColumns)。null 表示
+     * 没有可解析的行。
+     */
+    private String extractFirstRowJson(ToolCallOutcome outcome) {
+        if (outcome == null || outcome.toolResult() == null) {
+            return null;
+        }
+        String dataJson = outcome.toolResult().dataJson();
+        if (dataJson == null || dataJson.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(dataJson);
+            JsonNode rows = root.path("rows");
+            if (!rows.isArray() || rows.isEmpty()) {
+                return null;
+            }
+            JsonNode first = rows.get(0);
+            if (first == null || first.isMissingNode() || first.isNull()) {
+                return null;
+            }
+            return objectMapper.writeValueAsString(first);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private int extractRowCount(ToolCallOutcome outcome) {

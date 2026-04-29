@@ -73,6 +73,11 @@ public final class SkillGuard {
      * Resolve the effective rule for a step. If the step's rule declares
      * {@code reuseStep}, follow one link of indirection so callers can read "sector shares
      * completion with coverage" without duplicating declarations.
+     *
+     * <p>Use this for COMPLETION-criteria evaluation (requiresSuccess / minQueries /
+     * requiredTables / acceptance). For per-step CONFIG (dependsOn / reportSection /
+     * sqlTemplates) use {@link #stepRuleOwn(String)} so the step's own values are not
+     * silently overwritten by the reuse target's.</p>
      */
     public Optional<PlanStepRule> stepRule(String stepId) {
         if (stepId == null || stepId.isBlank()) {
@@ -89,6 +94,21 @@ public final class SkillGuard {
             }
         }
         return Optional.of(rule);
+    }
+
+    /**
+     * Return the step's OWN rule without following {@code reuseStep}. Use for
+     * configuration that must reflect the step's identity (its own dependsOn,
+     * reportSection heading, sqlTemplates). E.g. weak_grid declares its own
+     * "## 4. 弱覆盖栅格分布" heading + dependsOn=["coverage"] while reusing
+     * coverage's completion criteria — those values must NOT be replaced by
+     * coverage's heading or dependsOn=[].
+     */
+    public Optional<PlanStepRule> stepRuleOwn(String stepId) {
+        if (stepId == null || stepId.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(stepRules.get(stepId));
     }
 
     public List<String> contributingSkills() {

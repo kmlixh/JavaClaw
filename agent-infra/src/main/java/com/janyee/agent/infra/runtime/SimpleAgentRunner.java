@@ -113,9 +113,49 @@ public class SimpleAgentRunner implements AgentRunner {
 
     @Override
     public Flux<AgentEvent> run(RunRequest request) {
+        // boundedElastic 是新线程,ThreadLocal 不会跨过来。如果不在新线程上重建
+        // SecurityContextHolder,下游所有 SecurityContextHolder.current() 都会 fallback
+        // 到 anonymousSystemAdmin (admin / system / system-default),session/run
+        // 的 tenant_id 全部落到 'system',xmap embed 列表永远查不到自己的会话。
+        // 这里用 RunRequest 携带的身份三元组(controller 在请求线程上写进去的)在
+        // 新线程上重建 principal,executeRun 结束后清理。
         return Flux.create(sink ->
-                        Schedulers.boundedElastic().schedule(() -> executeRun(request, sink)),
+                        Schedulers.boundedElastic().schedule(() -> {
+                            com.janyee.agent.infra.auth.AuthPrincipal restored =
+                                    rebuildPrincipal(request);
+                            if (restored != null) {
+                                com.janyee.agent.infra.auth.SecurityContextHolder.setCurrent(restored);
+                            }
+                            try {
+                                executeRun(request, sink);
+                            } finally {
+                                com.janyee.agent.infra.auth.SecurityContextHolder.clear();
+                            }
+                        }),
                 FluxSink.OverflowStrategy.BUFFER
+        );
+    }
+
+    /**
+     * 用 RunRequest 上的身份三元组重建一个最小可用的 AuthPrincipal。三元组缺失的话
+     * 返回 null,executeRun 跑在 ThreadLocal 空(SecurityContextHolder.current() 走匿名兜底)
+     * 的状态下 —— 跟改造前老行为一致,不会放大风险。
+     */
+    private com.janyee.agent.infra.auth.AuthPrincipal rebuildPrincipal(RunRequest request) {
+        String userId = request.authUserId();
+        String tenantId = request.authTenantId();
+        String appId = request.authAppId();
+        if ((userId == null || userId.isBlank())
+                && (tenantId == null || tenantId.isBlank())
+                && (appId == null || appId.isBlank())) {
+            return null;
+        }
+        return new com.janyee.agent.infra.auth.AuthPrincipal(
+                userId == null ? "" : userId,
+                tenantId == null ? "system" : tenantId,
+                appId == null ? "system-default" : appId,
+                java.util.Set.of(),
+                false
         );
     }
 
@@ -209,6 +249,15 @@ public class SimpleAgentRunner implements AgentRunner {
                     planPreflightExecutor.runWave0(context, request.attachments());
                 } catch (Exception error) {
                     log.warn("agent.run.preflight_failed runId={}, cause={}", runId, error.getMessage());
+                }
+                // preflight 把若干 step 推到 COMPLETED 但不会自己 emit PLAN_UPDATED。再发一次
+                // 让前端 panel 实时反映这些 step 的最新状态(否则前端只看到最初 seed 的全 PENDING
+                // 快照,直到 LLM 第一次 plan.update 才会更新,看起来像"没动"导致用户怀疑没 plan)。
+                try {
+                    emit(sink, AgentEventType.PLAN_UPDATED, request.sessionId(), runId,
+                            objectMapper.writeValueAsString(context.runPlan().toSnapshot()));
+                } catch (Exception error) {
+                    log.warn("agent.run.plan_after_preflight_event_failed runId={}, cause={}", runId, error.getMessage());
                 }
             }
             runRecordService.updateStatus(runId, RunStatus.MODEL_RUNNING, "model running");
