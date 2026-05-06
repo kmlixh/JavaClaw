@@ -20,6 +20,10 @@ FIRST_ADMIN_PASSWORD.txt
 tmp/
 *.log
 
+# 部署产物 (jar / zip / 解压目录) —— 由 ./gradlew :agent-app:bootJar 生成,
+# 单文件 70MB+,不入仓避免膨胀。deploy/ 目录(install.sh / nginx 配置)是入仓的。
+dist/
+
 # Agent 运行时 LLM 产出物 (artifacts/{runId}/...) —— 永不入仓
 workspaces/**/artifacts/
 agent-app/workspaces/**/artifacts/

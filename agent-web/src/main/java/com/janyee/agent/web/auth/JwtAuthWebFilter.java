@@ -100,7 +100,10 @@ public class JwtAuthWebFilter implements WebFilter {
         }
         return path.equals("/api/auth/login")
                 || path.equals("/api/auth/whoami")
-                || path.equals("/oauth/token");
+                || path.equals("/oauth/token")
+                // /api/apps/{clientId}/enabled —— 嵌入端在拿 OAuth token 之前要先问"应用启不启用"
+                // 来决定 AI 按钮是否显示。这条接口只返 boolean,不泄漏任何 client 细节,可匿名调。
+                || path.startsWith("/api/apps/");
     }
 
     private String extractToken(ServerWebExchange exchange) {

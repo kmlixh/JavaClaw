@@ -1,0 +1,39 @@
+# 生产 profile —— 部署在 /data/javaClaw 下,启动用 --spring.profiles.active=prod
+#
+# 跟 dev 用的 application-postgres.yml 区别:
+#   1. DB 凭据硬编码,不再读环境变量(部署 zip 不带 .env 文件)
+#   2. 不带 agent.llm.* 段 —— LLM 完全走 DB 配置(llm_provider_config 表),
+#      由 admin UI 维护;application.yml 默认 enabled=false,fallback 不会触发
+#   3. flyway baseline 与现有 dev DB 兼容
+#
+# DB 密码进 jar 是明文 —— 这是部署模型的取舍。要换成更安全的方式可以:
+#   --spring.config.additional-location=file:/data/javaClaw/  + 把同名外部 yaml
+#   覆盖,或改回 ${DB_PASSWORD:...} 用 EnvironmentFile 注入。
+
+spring:
+  datasource:
+    url: jdbc:postgresql://10.173.108.120:5433/java_claw
+    driver-class-name: org.postgresql.Driver
+    username: postgres
+    password: JL0Is1KqGuQMayeF
+    hikari:
+      connection-timeout: 10000
+      validation-timeout: 5000
+      max-lifetime: 240000
+      keepalive-time: 60000
+      minimum-idle: 2
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 9
+    baseline-description: legacy-schema-baseline
+
+agent:
+  session-lock:
+    type: in-memory

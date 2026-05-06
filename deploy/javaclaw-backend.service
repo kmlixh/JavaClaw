@@ -1,0 +1,56 @@
+[Unit]
+Description=JavaClaw AI Agent Platform (spring boot backend)
+After=network.target postgresql.service
+# postgresql.service 行可删,这里只是声明先后顺序;DB 远程的话不影响。
+
+[Service]
+Type=simple
+
+# 运行用户/组 —— install.sh 已 useradd 一个非 root 系统账户。
+User=javaclaw
+Group=javaclaw
+
+# 工作目录:jar + workspaces + web-console 都在大容量盘下统一目录。
+# WorkingDirectory 也是 spring 自动生成 JWT_SECRET.txt / FIRST_ADMIN_PASSWORD.txt 的位置。
+WorkingDirectory=/data/javaClaw
+
+# 启动命令 —— prod profile 把 DB 凭据写死在 jar 内的 application-prod.yml,
+# LLM 全走 DB(llm_provider_config 表 + admin UI 维护),无环境变量依赖。
+ExecStart=/usr/bin/java \
+    -Xmx2g -Xms512m \
+    -XX:+ExitOnOutOfMemoryError \
+    -Dfile.encoding=UTF-8 \
+    -jar /data/javaClaw/agent-app.jar \
+    --spring.profiles.active=prod \
+    --agent.workspace-root=/data/javaClaw/workspaces \
+    --agent.embed.static-dir=/data/javaClaw/web-console/embed/ \
+    --agent.web-console.static-dir=/data/javaClaw/web-console/
+
+# graceful shutdown:application.yml 已设 server.shutdown=graceful;给 30s 让活跃 run 收尾。
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# 自动重启策略
+Restart=on-failure
+RestartSec=5s
+
+# 安全沙箱(systemd 自带)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# 整个 /data/javaClaw 都给 javaclaw 读写(jar 自更新需要、workspaces 写产物、logs 写日志)
+ReadWritePaths=/data/javaClaw
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 日志:journalctl 是主路径(systemctl status / journalctl -u 自动归档),
+# 同时输出一份纯文本到 /data/javaClaw/logs/ 方便 grep / 长期归档
+StandardOutput=append:/data/javaClaw/logs/backend.log
+StandardError=append:/data/javaClaw/logs/backend.err.log
+
+[Install]
+WantedBy=multi-user.target

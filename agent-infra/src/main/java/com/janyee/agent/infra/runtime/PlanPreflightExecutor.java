@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 /**
  * L1 并行化 —— 在 LLM tool loop 开始前,把"输入已完全就绪、SQL 模板已物化、彼此独立"的
@@ -37,9 +38,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ul>
  *   <li>step 状态仍是 PENDING;</li>
  *   <li>至少有一套 SQL 模板(geojson / noFilter)在用户上下文里可用 —— L1 不处理 admin filter,
- *       城市/区县名抽取留给 L2;</li>
+ *       城市/区县名抽取留给 LLM(走 sqlTemplates 路径);</li>
  *   <li>toolHint 不是 artifact.* —— 合成性 step(report)必须 LLM 参与,不能程序执行。</li>
  * </ul>
+ *
+ * <h3>整体放弃 preflight 的场景</h3>
+ * <p>用户消息含中文行政区后缀(市/区/县/州/盟/地区)时,preflight 整体退出(return 0),让
+ * LLM 按 prompt 决策树走 sqlTemplates(admin filter)。否则 preflight 会强行用 NoFilter 把
+ * 上游 step 跑成全省口径,跟用户意图不符,LLM 接手后无法挽救(weak_grid 等下游 step 拒绝
+ * COMPLETED,run 整体失败)。</p>
  *
  * <p>成功 preflight 的 step 直接标 COMPLETED 并挂上 CompletedToolSummary,LLM 从 wave 1 起手
  * 时看到的就是"已有数据的 plan",不需要再发 db.query 请求。失败的 step 保持 PENDING,LLM
@@ -50,6 +57,19 @@ public class PlanPreflightExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(PlanPreflightExecutor.class);
     private static final int DEFAULT_CONCURRENCY = 3;
+
+    /**
+     * 用户消息含中文行政区后缀(市/区/县/州/盟/地区)就视为"区域意图",preflight 整体放弃 ——
+     * 让 LLM 按 prompt 决策树走 sqlTemplates(admin filter)。否则 preflight 会强行用
+     * sqlTemplatesNoFilter 把上游 step 跑成全省口径,跟用户意图不符,LLM 接手后无法挽救。
+     *
+     * <p>误判方向偏保守:常见词组 "小区"/"超市"/"市场"/"区域" 也会命中这个 pattern,
+     * 但代价仅是 preflight 不预跑(LLM 自己跑慢一点),不会损失正确性。漏判才会出现
+     * "用户问盘龙区,数据却是全云南"的事故,所以宁可多跳过也不要错过。</p>
+     */
+    private static final Pattern ADMIN_SCOPE_PATTERN = Pattern.compile(
+            "[\\u4e00-\\u9fa5]{1,6}(市|区|县|州|盟|地区)"
+    );
 
     private final ToolExecutor toolExecutor;
     private final SessionTranscriptService transcriptService;
@@ -69,12 +89,21 @@ public class PlanPreflightExecutor {
     }
 
     /** Returns the number of steps successfully preflighted across all waves. */
-    public int runWave0(ToolLoopContext context, List<ChatAttachment> attachments) {
+    public int runWave0(ToolLoopContext context, List<ChatAttachment> attachments, String userMessage) {
         RunPlan plan = context.runPlan();
         if (plan == null || plan.isEmpty()) {
             return 0;
         }
         String geoJson = extractGeoJsonFromAttachments(attachments);
+        // 决策顺序:GeoJSON > admin filter 意图 > 全省 NoFilter。
+        // GeoJSON 优先是因为它是几何过滤,精度高于行政区名,即使 message 里带 "盘龙区" 也以几何为准。
+        // 没有 GeoJSON 但 message 含行政区名 → preflight 放弃,LLM 自己按 sqlTemplates(admin filter)
+        // 路径跑;否则才走 NoFilter preflight 加速。
+        if (geoJson == null && hasAdminScopeIntent(userMessage)) {
+            log.info("plan.preflight.skipped_admin_scope runId={}, reason=user_message_has_admin_scope, snippet={}",
+                    context.runId(), snippet(userMessage));
+            return 0;
+        }
         Variant variant = geoJson != null ? Variant.GEOJSON : Variant.NO_FILTER;
 
         // Multi-wave 推进:每轮挑出"PENDING + 模板可用 + 所有 dependsOn 都已 COMPLETED/SKIPPED"的
@@ -426,4 +455,22 @@ public class PlanPreflightExecutor {
     }
 
     private enum Variant { GEOJSON, NO_FILTER }
+
+    /**
+     * 用户消息含中文行政区后缀 → 视为有 admin filter 意图,preflight 应该让位给 LLM。
+     * 见 {@link #ADMIN_SCOPE_PATTERN} 注释。
+     */
+    private static boolean hasAdminScopeIntent(String userMessage) {
+        if (userMessage == null || userMessage.isBlank()) {
+            return false;
+        }
+        return ADMIN_SCOPE_PATTERN.matcher(userMessage).find();
+    }
+
+    /** 日志短摘:截前 60 字符,避免长 message 把 log 撑爆。 */
+    private static String snippet(String text) {
+        if (text == null) return "";
+        String trimmed = text.trim();
+        return trimmed.length() <= 60 ? trimmed : trimmed.substring(0, 60) + "...";
+    }
 }

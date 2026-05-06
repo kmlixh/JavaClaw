@@ -925,7 +925,12 @@ p {
 
 .agent-list,
 .session-list {
-  display: grid;
+  /* 垂直堆叠的列表项。之前用 display:grid 但没声明 grid-template-columns,在
+     默认 grid-auto-flow:row 下浏览器会把 item 横向铺到同一行的多个 implicit
+     column,2 项时呈"左右并排"导致视觉上"一个在顶一个在中间"的错位。改成
+     flex column 语义最直白,gap 同样生效,且不会出现横向自动展开的歧义。 */
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
 

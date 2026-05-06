@@ -1,5 +1,14 @@
 server:
   port: 8080
+  # 只监听 loopback —— 所有外部流量必须经 nginx (8888) 反向代理进来,8080 不暴露公网。
+  # nginx 同机部署用 127.0.0.1 即可命中;若 nginx 跨机需要把 address 改回 0.0.0.0
+  # 并配防火墙白名单 (sudo ufw allow from <nginx-ip> to any port 8080)。
+  address: 127.0.0.1
+  # 信任 nginx 转发的 X-Forwarded-Host / -Proto / -For,让 OAuth redirect_uri 计算
+  # 和 SecurityContextHolder 里的 client ip 都对得上外部地址(nginx 监听 8888,
+  # 后端在 8080,没有这条 spring 会用 8080 当 port,callback / cookie domain 错位)。
+  forward-headers-strategy: native
+  shutdown: graceful
 
 spring:
   application:
@@ -25,6 +34,9 @@ agent:
     # P4: 强制登录;关掉匿名兜底,所有 /api/* /oauth/* /ws/* 必须带 JWT。
     # 临时回退本地开发可在 application-postgres.yml 或环境变量里覆盖为 true。
     anonymous-enabled: false
+    # 部署在 http(非 https)时必须 false,否则浏览器拒绝设置 Secure cookie 导致登录失败。
+    # 上 https 后改 true。
+    cookie-secure: false
   workspace-root: ./workspaces
   default-agent-id: dev-agent
   runtime:

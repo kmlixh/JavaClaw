@@ -246,7 +246,7 @@ public class SimpleAgentRunner implements AgentRunner {
                 // LLM 再进 loop 时看到的就是带数据的 plan。对 skill.coverage.analysis 这种典型
                 // "多路独立聚合"场景,能把端到端耗时从串行 N×单轮 压到 1×单轮 + 合成。
                 try {
-                    planPreflightExecutor.runWave0(context, request.attachments());
+                    planPreflightExecutor.runWave0(context, request.attachments(), request.message());
                 } catch (Exception error) {
                     log.warn("agent.run.preflight_failed runId={}, cause={}", runId, error.getMessage());
                 }
