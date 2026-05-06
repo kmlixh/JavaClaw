@@ -24,6 +24,11 @@ tmp/
 # 单文件 70MB+,不入仓避免膨胀。deploy/ 目录(install.sh / nginx 配置)是入仓的。
 dist/
 
+# xmap-ol-front 已从 submodule 解绑,作为独立 git 仓库(自带 .git/,
+# remote=http://192.168.110.240/it/xmap-ol-front.git)单独维护,
+# 不再被主仓库追踪。本目录本地存在不影响主仓库 git 状态。
+xmap-ol-front/
+
 # Agent 运行时 LLM 产出物 (artifacts/{runId}/...) —— 永不入仓
 workspaces/**/artifacts/
 agent-app/workspaces/**/artifacts/
