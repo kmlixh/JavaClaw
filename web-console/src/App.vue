@@ -28,6 +28,8 @@ import {
   listRunsBySession,
   listSessions,
   listSessionsPaged,
+  listFilterableTenants,
+  listFilterableApps,
   saveAgentDefinitionAdmin,
   saveMemoryNoteAdmin,
   deleteAgentDefinitionAdmin,
@@ -6211,9 +6213,42 @@ const sessionsListState = reactive({
   runStatus: "all"
 });
 
+// 过滤下拉的数据源:租户列表 + 应用列表。后端按 SessionVisibility 自动收窄,所以
+// tenantsCanFilter=false 时前端把租户下拉禁用(非 sysadmin)。
+// 应用下拉永远开放(因为后端已经按租户收窄过 rows)。
+const filterOptions = reactive({
+  tenants: [],
+  tenantsCanFilter: false,
+  apps: [],
+  loaded: false,
+  loading: false
+});
+
+async function loadFilterOptions(force = false) {
+  if (filterOptions.loaded && !force) return;
+  if (filterOptions.loading) return;
+  filterOptions.loading = true;
+  try {
+    const [t, a] = await Promise.all([
+      listFilterableTenants(),
+      listFilterableApps()
+    ]);
+    filterOptions.tenants = t?.rows || [];
+    filterOptions.tenantsCanFilter = !!t?.canFilter;
+    filterOptions.apps = a?.rows || [];
+    filterOptions.loaded = true;
+  } catch (error) {
+    console.warn("[filter-options.load_failed]", error?.message || error);
+  } finally {
+    filterOptions.loading = false;
+  }
+}
+
 async function refreshSessionsList(page = sessionsListState.page) {
   sessionsListState.loading = true;
   sessionsListState.error = "";
+  // 顺手把过滤下拉数据拉一次 —— 进列表页时第一次需要,后续 force=false 直接复用缓存
+  loadFilterOptions().catch(() => { /* 已在 loadFilterOptions 里 warn 过 */ });
   try {
     const data = await listSessionsPaged({
       page,
@@ -6978,14 +7013,25 @@ function formatTimelineEventContent(event) {
                    @keyup.enter="refreshSessionsList()">
           </label>
           <label class="sessions-filter-field">
-            <span>租户 ID</span>
-            <input v-model="sessionsListState.tenantId" placeholder="精确匹配(仅 sysadmin)"
-                   @keyup.enter="refreshSessionsList()">
+            <span>租户</span>
+            <select v-model="sessionsListState.tenantId"
+                    :disabled="!filterOptions.tenantsCanFilter"
+                    :title="filterOptions.tenantsCanFilter ? '' : '只有系统管理员可以跨租户筛选'"
+                    @change="refreshSessionsList()">
+              <option value="">全部</option>
+              <option v-for="t in filterOptions.tenants" :key="t.id" :value="t.id">
+                {{ t.name || t.code || t.id }}
+              </option>
+            </select>
           </label>
           <label class="sessions-filter-field">
-            <span>App ID</span>
-            <input v-model="sessionsListState.appId" placeholder="精确匹配"
-                   @keyup.enter="refreshSessionsList()">
+            <span>应用</span>
+            <select v-model="sessionsListState.appId" @change="refreshSessionsList()">
+              <option value="">全部</option>
+              <option v-for="a in filterOptions.apps" :key="a.appId" :value="a.appId">
+                {{ a.displayName || a.appId }}
+              </option>
+            </select>
           </label>
           <label class="sessions-filter-field">
             <span>Agent</span>

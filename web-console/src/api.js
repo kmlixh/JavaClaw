@@ -818,6 +818,28 @@ export async function adminListSessionRuns(sessionId) {
   return response.json();
 }
 
+/**
+ * 当前登录用户可见的"租户过滤"下拉数据源。
+ * 返回 { rows: [{id, code, name, kind, status}], canFilter: bool }。
+ * canFilter=false 时前端应把下拉禁用 —— 非 sysadmin 没权限跨租户筛。
+ */
+export async function listFilterableTenants() {
+  const response = await authedFetch("/api/me/filterable-tenants");
+  await check(response);
+  return response.json();
+}
+
+/**
+ * 当前登录用户可见的"应用过滤"下拉数据源。
+ * 返回 { rows: [{appId, displayName, tenantId}], canFilter: bool }。
+ * 永远包含一条 system-default(主控台直登的会话 app_id 是它)。
+ */
+export async function listFilterableApps() {
+  const response = await authedFetch("/api/me/filterable-apps");
+  await check(response);
+  return response.json();
+}
+
 /** 真分页 session 列表。返回 { rows, total, page, size }。
  *  支持多维过滤:agentId / userId / tenantId / appId / runStatus(running/idle/all)/ keyword。
  *  权限由后端 SessionVisibility 兜底,这里只是前端透传。 */
