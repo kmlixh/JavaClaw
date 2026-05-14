@@ -15,6 +15,5 @@ allow:
   - db.query
   - db.execute
   - db.schema.inspect
-  - table.render
   - chart.echarts
 deny: []

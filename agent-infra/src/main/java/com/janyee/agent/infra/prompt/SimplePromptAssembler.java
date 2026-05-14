@@ -56,8 +56,9 @@ public class SimplePromptAssembler implements PromptAssembler {
     @Override
     public PromptContext assemble(RunRequest request) {
         AgentDefinition agent = agentDefinitionService.getAgent(request.agentId());
-        // 必须传 sessionId —— 否则 retrieve 会把其他会话残留的 run_summary（含数字）拉进来，
-        // LLM 会把它们当成自己查到的数据写进新报告。这是一个真实发生过的 bug。
+        // 会话内的历史 run 摘要已经在 WorkspaceMemoryService.retrieve() 里过滤掉了 ——
+        // 这里只会拿到 agent/global 级 pin 的备注 + MEMORY.md / knowledge 文件命中条目。
+        // sessionId 仍然传:留作以后审计 / 后续若要按 session 做权限校验。
         String memorySection = memoryService.retrieve(
                 new MemoryQuery(agent.id(), request.sessionId(), request.message())).stream()
                 .map(memory -> "- " + memory.content())
@@ -133,7 +134,7 @@ public class SimplePromptAssembler implements PromptAssembler {
                 %s
                 User: %s
                 Message: %s
-                Relevant memory (仅本会话历史 + 用户 pin 的长期备注；**不要引用这里面的数字作为"当前查询结果"，必须用 db.query 重新取数**):
+                Relevant memory (仅用户 pin 的长期备注 / agent 级 MEMORY.md / knowledge 文件；**不要引用这里面的数字作为"当前查询结果"，必须用 db.query 重新取数**。会话内的历史 run 摘要不会出现在这里):
                 %s
                 """.formatted(
                 nowStamp,

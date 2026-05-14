@@ -43,11 +43,20 @@ public class DatabaseBackedLlmConfigService implements LlmConfigService {
 
     @Override
     public Optional<LlmConfigDescriptor> findDefault() {
+        // 1) 优先走 DB 里 is_default=true 的 LLM
         Optional<LlmConfigDescriptor> databaseDefault = repository.findFirstByEnabledTrueAndDefaultConfigTrueOrderByDisplayNameAsc()
                 .map(this::toDescriptor);
         if (databaseDefault.isPresent()) {
             return databaseDefault;
         }
+        // 2) 没显式标 default 时,挑第一个 enabled 的 DB LLM 兜底 ——
+        //    比直接退到 application-default(yml 里那条 token 经常过期 / 不该用)更靠谱。
+        Optional<LlmConfigDescriptor> firstEnabled = repository.findByEnabledTrueOrderByDisplayNameAsc()
+                .stream().findFirst().map(this::toDescriptor);
+        if (firstEnabled.isPresent()) {
+            return firstEnabled;
+        }
+        // 3) DB 都没 LLM 才回到 application-prod.yml 的 application-default 兜底
         return fallbackConfig();
     }
 

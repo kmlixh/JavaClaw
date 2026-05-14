@@ -70,6 +70,7 @@ public class SimpleAgentRunner implements AgentRunner {
     private final com.janyee.agent.infra.skill.SkillPlanSeeder skillPlanSeeder;
     private final PlanPreflightExecutor planPreflightExecutor;
     private final ObjectMapper objectMapper;
+    private final RunEventCollector runEventCollector;
 
     public SimpleAgentRunner(
             PromptAssembler promptAssembler,
@@ -89,7 +90,8 @@ public class SimpleAgentRunner implements AgentRunner {
             com.janyee.agent.infra.skill.SkillAgentMismatchChecker mismatchChecker,
             com.janyee.agent.infra.skill.SkillPlanSeeder skillPlanSeeder,
             PlanPreflightExecutor planPreflightExecutor,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            RunEventCollector runEventCollector
     ) {
         this.promptAssembler = promptAssembler;
         this.toolLoopOrchestrator = toolLoopOrchestrator;
@@ -109,6 +111,7 @@ public class SimpleAgentRunner implements AgentRunner {
         this.skillPlanSeeder = skillPlanSeeder;
         this.planPreflightExecutor = planPreflightExecutor;
         this.objectMapper = objectMapper;
+        this.runEventCollector = runEventCollector;
     }
 
     @Override
@@ -176,6 +179,7 @@ public class SimpleAgentRunner implements AgentRunner {
         }
 
         liveRunRegistry.register(runId);
+        runEventCollector.start(runId);
         try {
             runRecordService.updateStatus(runId, RunStatus.RECEIVED, "run started");
             emit(sink, AgentEventType.RUN_STARTED, request.sessionId(), runId, "run started");
@@ -242,17 +246,17 @@ public class SimpleAgentRunner implements AgentRunner {
                 } catch (Exception error) {
                     log.warn("agent.run.plan_seed_event_failed runId={}, cause={}", runId, error.getMessage());
                 }
-                // L1 并行预执行:把"SQL 模板已物化、用户上下文完全就绪"的 wave 0 step 并发跑完,
-                // LLM 再进 loop 时看到的就是带数据的 plan。对 skill.coverage.analysis 这种典型
-                // "多路独立聚合"场景,能把端到端耗时从串行 N×单轮 压到 1×单轮 + 合成。
-                try {
-                    planPreflightExecutor.runWave0(context, request.attachments(), request.message());
-                } catch (Exception error) {
-                    log.warn("agent.run.preflight_failed runId={}, cause={}", runId, error.getMessage());
-                }
-                // preflight 把若干 step 推到 COMPLETED 但不会自己 emit PLAN_UPDATED。再发一次
-                // 让前端 panel 实时反映这些 step 的最新状态(否则前端只看到最初 seed 的全 PENDING
-                // 快照,直到 LLM 第一次 plan.update 才会更新,看起来像"没动"导致用户怀疑没 plan)。
+                // L1 preflight 已禁用 —— 它会在 LLM 看到 plan 之前把 wave-0 step 用 NoFilter 模板
+                // 跑成 COMPLETED,LLM 之后既不再调 SQL 也常常拿 GeoJSON 口径的数字凑报告,跟用户
+                // 真实意图(admin 行政区 / 完整覆盖率口径)对不上,加上 SkillGuard 见到"待补充"
+                // 又把整 run 拒掉,体验是"plan 自己跑完了但报告 FAIL"。
+                // 现在留给 LLM 全权按 prompt 决策树走 plan.update → db.query → plan.update COMPLETED
+                // 的标准流程,慢一点但行为可预测、口径正确。需要重新启用时取消下面注释即可。
+                // try {
+                //     planPreflightExecutor.runWave0(context, request.attachments(), request.message());
+                // } catch (Exception error) {
+                //     log.warn("agent.run.preflight_failed runId={}, cause={}", runId, error.getMessage());
+                // }
                 try {
                     emit(sink, AgentEventType.PLAN_UPDATED, request.sessionId(), runId,
                             objectMapper.writeValueAsString(context.runPlan().toSnapshot()));
@@ -272,7 +276,8 @@ public class SimpleAgentRunner implements AgentRunner {
                     loopResult.errorMessage());
             boolean renderedOutput = displayOutcomes.stream().anyMatch(this::isRenderedOutcome);
             if (renderedOutput && !finalAssistantText.isBlank()) {
-                transcriptService.appendAssistantMessage(request.sessionId(), runId, finalAssistantText);
+                transcriptService.appendAssistantMessage(request.sessionId(), runId, finalAssistantText,
+                        loopResult.totalPromptTokens(), loopResult.totalCompletionTokens(), loopResult.totalTokens());
             }
             for (ToolCallOutcome outcome : displayOutcomes) {
                 String toolContent = outcome.toolResult() != null
@@ -289,8 +294,25 @@ public class SimpleAgentRunner implements AgentRunner {
             }
             emitLoopResultEvents(sink, request.sessionId(), runId, loopResult, finalAssistantText, renderedOutput);
 
+            // 把本次 run 的 token 用量推到前端,前端在对应 assistant 气泡末尾渲染"本次消耗 N tokens"。
+            // 供应商不返 usage 时三个值全 null,跳过不发(避免前端显示 0 误导)。
+            if (loopResult.totalTokens() != null) {
+                try {
+                    String payload = objectMapper.writeValueAsString(java.util.Map.of(
+                            "prompt", loopResult.totalPromptTokens(),
+                            "completion", loopResult.totalCompletionTokens(),
+                            "total", loopResult.totalTokens()
+                    ));
+                    emit(sink, AgentEventType.TOKEN_USAGE, request.sessionId(), runId, payload);
+                } catch (Exception serializeError) {
+                    log.warn("agent.run.token_usage_emit_failed runId={}, cause={}",
+                            runId, serializeError.getMessage());
+                }
+            }
+
             if (!finalAssistantText.isBlank() && !renderedOutput) {
-                transcriptService.appendAssistantMessage(request.sessionId(), runId, finalAssistantText);
+                transcriptService.appendAssistantMessage(request.sessionId(), runId, finalAssistantText,
+                        loopResult.totalPromptTokens(), loopResult.totalCompletionTokens(), loopResult.totalTokens());
             }
             // loop 正常返回(没抛异常)但业务失败 —— 需要把失败原因落库,否则刷新后 FAILED
             // 状态显示在 run 列表里,却没有任何对应的消息气泡,用户看着摸不着头脑。
@@ -332,9 +354,20 @@ public class SimpleAgentRunner implements AgentRunner {
                         ? (loopResult.errorMessage() != null ? loopResult.errorMessage() : "cancelled by user")
                         : loopResult.errorMessage();
             runRecordService.updateStatus(runId, finalStatus, statusDetail);
+            // 关键:DB 一旦写到终态,立刻释放 sessionLock。这样前端收到 RUN_COMPLETED 之后立刻
+            // 再发新消息,POST 那一刻看到的 DB 状态(COMPLETED) 和 lock 状态(已释放)是一致的,
+            // 不会被 finally 里其他清理(event_log flush 10-50ms + ensureTerminalStatus 等)拖出
+            // 一个窗口,期间用户的 Run2 在 ChatController.send 那条 isLocked 检查上误报 busy。
+            // finally 里的 unlock 保留作为 idempotent 兜底——locks Set 多次 remove 无副作用。
+            sessionLockManager.unlock(request.sessionId());
             log.info("agent.run.finish runId={}, sessionId={}, finalStatus={}", runId, request.sessionId(), finalStatus);
             sink.complete();
-        } catch (Exception error) {
+        } catch (Throwable error) {
+            // 关键:catch Throwable,不只是 Exception。第三方库 / Reactor / JVM 内部可能扔
+            // OutOfMemoryError / AssertionError / VirtualMachineError 这种 Error,以前 catch
+            // (Exception) 漏掉 → executeRun 直接从线程上消失但 DB 还停在 MODEL_RUNNING,
+            // reconciler 把它当孤儿杀,detail 写成 "auto-terminated: server has no live
+            // execution" —— 用户看到的就是"跑到一半莫名 FAILED 没原因"。
             log.error("agent.run.iterations runId={}, sessionId={}, iterations=\n{}",
                     runId,
                     request.sessionId(),
@@ -343,20 +376,66 @@ public class SimpleAgentRunner implements AgentRunner {
             String failureMessage = error.getMessage() != null && !error.getMessage().isBlank()
                     ? error.getMessage()
                     : error.getClass().getSimpleName();
-            runRecordService.updateStatus(runId, RunStatus.FAILED, failureMessage);
+            try {
+                runRecordService.updateStatus(runId, RunStatus.FAILED, failureMessage);
+            } catch (Throwable persistError) {
+                log.warn("agent.run.failure_status_persist_failed runId={}, cause={}",
+                        runId, persistError.getMessage());
+            }
+            // 跟 success 路径同口径:DB 写到 FAILED 后立刻释放 lock。否则前端拿到 RUN_FAILED 立刻
+            // 重试,POST 那条 isLocked / DB 检查会跟 lock 不一致(DB 已 FAILED 但 lock 还在)。
+            try {
+                sessionLockManager.unlock(request.sessionId());
+            } catch (Throwable unlockError) {
+                log.warn("agent.run.early_unlock_failed runId={}, cause={}",
+                        runId, unlockError.getMessage());
+            }
             // 把失败原因落进 session_message,让它跟普通 assistant 消息一样走持久化路径 ——
             // 刷新 / 切会话 / 重连后依然可见,不会再出现"报错一闪而过"的体验。
             // 落盘失败不应该淹没原始错误,try/catch 单独兜住。
             try {
                 transcriptService.appendAssistantMessage(request.sessionId(), runId,
                         "[运行失败] " + failureMessage);
-            } catch (Exception persistError) {
+            } catch (Throwable persistError) {
                 log.warn("agent.run.failure_persist_failed runId={}, sessionId={}, cause={}",
                         runId, request.sessionId(), persistError.getMessage());
             }
-            emit(sink, AgentEventType.RUN_FAILED, request.sessionId(), runId, failureMessage);
-            sink.complete();
+            try {
+                emit(sink, AgentEventType.RUN_FAILED, request.sessionId(), runId, failureMessage);
+                sink.complete();
+            } catch (Throwable sinkError) {
+                log.warn("agent.run.sink_complete_failed runId={}, cause={}",
+                        runId, sinkError.getMessage());
+            }
         } finally {
+            // V42 起:每条 curated 事件 insert 一行到 run_event_step,前端可按 category 服务端过滤;
+            // event_log_json 列同时写,作为旧 run / 灾备 fallback。
+            // V43 起:raw_log_text 列写入**未过滤**的事件序列(含 TOKEN_DELTA + streaming MODEL_OUTPUT),
+            // 给细粒度 debug 用。flushAndPersist 一次性返回两段 JSON。
+            try {
+                com.janyee.agent.infra.runtime.RunEventCollector.FlushResult flush =
+                        runEventCollector.flushAndPersist(runId, request.sessionId());
+                if (flush != null) {
+                    if (flush.curatedJson() != null && !flush.curatedJson().isBlank()) {
+                        runRecordService.attachEventLog(runId, flush.curatedJson());
+                    }
+                    if (flush.rawJson() != null && !flush.rawJson().isBlank()) {
+                        runRecordService.attachRawLog(runId, flush.rawJson());
+                    }
+                }
+            } catch (Throwable eventLogError) {
+                log.warn("agent.run.event_log_persist_failed runId={}, cause={}",
+                        runId, eventLogError.getMessage());
+            }
+            // 防御兜底:如果 catch 因为某种原因没把 DB 写到终态(catch 自己又抛 Throwable、
+            // 或主流程线程被强行中断没走到 catch 也没走到 success 路径),这里强制把 DB 改成
+            // FAILED。reconciler 见到终态状态就不会再误杀,detail 也能告诉用户真实原因。
+            try {
+                ensureTerminalStatus(runId, request.sessionId());
+            } catch (Throwable ensureError) {
+                log.warn("agent.run.ensure_terminal_failed runId={}, cause={}",
+                        runId, ensureError.getMessage());
+            }
             runPlanStore.unregister(runId);
             skillGuardStore.unregister(runId);
             liveRunRegistry.unregister(runId);
@@ -400,11 +479,47 @@ public class SimpleAgentRunner implements AgentRunner {
         }
     }
 
+    /**
+     * 防御兜底:run 已经走到 finally 但 DB 还停在 in-progress —— 大概率是主 try 块抛了
+     * Throwable、catch 块自己又抛了第二个异常,把 updateStatus(FAILED) 跳过去了。这种情况下
+     * reconciler 会把它标 "auto-terminated"。我们抢在 reconciler 之前补一刀,把 detail 写得
+     * 更具体,告诉用户"主流程异常退出"。
+     */
+    private void ensureTerminalStatus(String runId, String sessionId) {
+        try {
+            boolean changed = runRecordService.updateStatusIfInProgress(
+                    runId,
+                    RunStatus.FAILED,
+                    "execution thread exited without writing terminal status (likely uncaught Throwable in run loop)"
+            );
+            if (changed) {
+                log.warn("agent.run.terminal_status_recovered runId={}, sessionId={}", runId, sessionId);
+            }
+        } catch (Throwable ignored) {
+            // updateStatusIfInProgress 已经自己处理过异常;这里 catch 是为了保证 finally 后续步骤
+            // (unregister / unlock)无论如何能跑完,不让"已经异常"的局面再被这次救火放大。
+        }
+    }
+
     private void emit(FluxSink<AgentEvent> sink, AgentEventType type, String sessionId, String runId, String content) {
         AgentEvent event = AgentEvent.now(type, sessionId, runId, content);
         runEventStreamService.publish(event);
         if (!sink.isCancelled()) {
             sink.next(event);
+        }
+        // 同步落到 RunEventCollector(per-run 内存累积),run 结束 flush 出两份:
+        //   - curated → run_record.event_log_json + run_event_step 行表
+        //   - raw     → run_record.raw_log_text(V43)
+        // 路由规则:TOKEN_DELTA 和 RUN_STATUS phase=MODEL_OUTPUT 这两类高频流式心跳**只**进 raw,
+        // 不进 curated;其余事件进双流。两边 sequence 号共用,raw 里看到的 seq 跟 curated 对得上。
+        if (runEventCollector == null || runId == null) return;
+        java.util.Map<String, Object> data = java.util.Map.of("content", content == null ? "" : content);
+        boolean rawOnly = (type == AgentEventType.TOKEN_DELTA)
+                || (type == AgentEventType.RUN_STATUS && content != null && content.contains("phase=MODEL_OUTPUT"));
+        if (rawOnly) {
+            runEventCollector.appendRawOnly(runId, type.name(), data);
+        } else {
+            runEventCollector.append(runId, type.name(), data);
         }
     }
 

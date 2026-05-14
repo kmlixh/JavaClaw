@@ -347,10 +347,13 @@ public class PlanPreflightExecutor {
         try {
             ToolCallOutcome outcome = toolExecutor.execute(context, request, decision);
             String summary = outcome.toolResult() != null ? outcome.toolResult().summary() : "";
-            context.emitEvent(
-                    AgentEventType.TOOL_COMPLETED,
-                    "tool=db.query success=" + outcome.success() + " summary=" + summary
-            );
+            String dataJson = outcome.toolResult() != null ? outcome.toolResult().dataJson() : null;
+            // 把 dataJson 也带进 TOOL_COMPLETED 的 content,复盘日志要看 preflight SQL 实际查到的行
+            String content = "tool=db.query success=" + outcome.success() + " summary=" + summary;
+            if (dataJson != null && !dataJson.isBlank() && !"{}".equals(dataJson.trim())) {
+                content = content + System.lineSeparator() + dataJson;
+            }
+            context.emitEvent(AgentEventType.TOOL_COMPLETED, content);
             // Persist as a tool message in session_message so transcript view after refresh
             // still shows "this SQL was run in preflight" like any other tool call.
             try {

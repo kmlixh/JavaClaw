@@ -22,6 +22,7 @@ import com.janyee.agent.runtime.query.AgentQueryService;
 import com.janyee.agent.runtime.query.RunDetailView;
 import com.janyee.agent.runtime.query.SessionDetailView;
 import com.janyee.agent.runtime.run.RunCancellationRegistry;
+import com.janyee.agent.runtime.run.RunEventStreamService;
 import com.janyee.agent.runtime.run.RunRecordService;
 import com.janyee.agent.runtime.session.SessionService;
 import com.janyee.agent.infra.auth.PermissionGate;
@@ -50,6 +51,7 @@ public class QueryController {
     private final ArtifactService artifactService;
     private final RunCancellationRegistry cancellationRegistry;
     private final RunRecordService runRecordService;
+    private final RunEventStreamService runEventStreamService;
 
     public QueryController(
             AgentQueryService agentQueryService,
@@ -58,7 +60,8 @@ public class QueryController {
             SessionService sessionService,
             ArtifactService artifactService,
             RunCancellationRegistry cancellationRegistry,
-            RunRecordService runRecordService
+            RunRecordService runRecordService,
+            RunEventStreamService runEventStreamService
     ) {
         this.agentQueryService = agentQueryService;
         this.agentDefinitionService = agentDefinitionService;
@@ -67,6 +70,7 @@ public class QueryController {
         this.artifactService = artifactService;
         this.cancellationRegistry = cancellationRegistry;
         this.runRecordService = runRecordService;
+        this.runEventStreamService = runEventStreamService;
     }
 
     @GetMapping("/agents")
@@ -97,9 +101,10 @@ public class QueryController {
 
     @GetMapping("/sessions")
     public java.util.List<SessionSummaryResponse> listSessions(
-            @RequestParam(value = "agentId", required = false) String agentId
+            @RequestParam(value = "agentId", required = false) String agentId,
+            @RequestParam(value = "limit", required = false, defaultValue = "20") int limit
     ) {
-        return agentQueryService.listSessions(agentId).stream()
+        return agentQueryService.listSessions(agentId, limit).stream()
                 .map(session -> new SessionSummaryResponse(
                         session.sessionId(),
                         session.title(),
@@ -111,6 +116,43 @@ public class QueryController {
                         session.updatedAt()
                 ))
                 .toList();
+    }
+
+    /**
+     * 真分页 session 列表 + 多维过滤。
+     * <ul>
+     *   <li>agentId / userId / tenantId / appId:精确匹配,空表示该维度不过滤</li>
+     *   <li>runStatus:"running"(有 in-progress run)/ "idle" / "all" 或 null。</li>
+     *   <li>keyword:title / id / agentId 子串模糊匹配</li>
+     * </ul>
+     * SessionVisibility 三档自动叠加,租户管理员看不到自己租户外的 row 即使过滤 tenantId。
+     */
+    @GetMapping("/sessions/paged")
+    public java.util.Map<String, Object> listSessionsPaged(
+            @RequestParam(value = "agentId", required = false) String agentId,
+            @RequestParam(value = "userId", required = false) String userId,
+            @RequestParam(value = "tenantId", required = false) String tenantId,
+            @RequestParam(value = "appId", required = false) String appId,
+            @RequestParam(value = "runStatus", required = false) String runStatus,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "15") int size,
+            @RequestParam(value = "keyword", required = false) String keyword
+    ) {
+        com.janyee.agent.runtime.query.SessionPage p =
+                agentQueryService.listSessionsPagedAdvanced(
+                        new com.janyee.agent.runtime.query.SessionListFilter(
+                                agentId, userId, tenantId, appId, runStatus, keyword, page, size));
+        java.util.List<SessionSummaryResponse> rows = p.rows().stream()
+                .map(session -> new SessionSummaryResponse(
+                        session.sessionId(), session.title(), session.agentId(), session.userId(),
+                        session.channel(), session.status(), session.createdAt(), session.updatedAt()))
+                .toList();
+        return java.util.Map.of(
+                "rows", rows,
+                "total", p.total(),
+                "page", p.page(),
+                "size", p.size()
+        );
     }
 
     @GetMapping("/sessions/{id}")
@@ -187,20 +229,60 @@ public class QueryController {
     }
 
     /**
-     * List runs currently executing on this process. The UI uses this to render the
-     * "running tasks" dock with a terminate button per row.
+     * 拉某个 run 当前在内存里累积的事件历史快照。给"刷新页面后恢复进行中 run"用:
+     * 前端先 GET 这个端点把已发生的 token 流 / 工具调用 / plan 回灌到 UI,然后再开 WS attach,
+     * 这样 WS replay 的 concatWith 即使在 snapshot/live 之间漏几条,REST 拉到的全量也兜得住,
+     * UI 不空白。run 已结束 / 已 flush 出内存返回空数组。
+     */
+    @GetMapping("/runs/{runId}/event-snapshot")
+    public java.util.List<java.util.Map<String, Object>> getRunEventSnapshot(@PathVariable("runId") String runId) {
+        // 权限闸:用 findActiveRun(sessionId) 间接走 SessionVisibility(JpaAgentQueryService
+        // 内部用 session.tenant_id/user_id 三档判定)。run 不在 session 的 active 列表里,
+        // 或 session 不可见,都视为没权限,返回空数组。
+        // 限制:run 已结束(COMPLETED/FAILED 等)时 findActiveRun 也返回空 —— 此时事件可能
+        // 还在 memory 但快照接口拒绝读;前端只在 attach 进行中 run 时用到这个端点,够了。
+        try {
+            RunDetailView view = agentQueryService.getRun(runId);
+            if (agentQueryService.findActiveRun(view.sessionId())
+                    .filter(r -> runId.equals(r.runId()))
+                    .isEmpty()) {
+                return java.util.List.of();
+            }
+        } catch (Exception ignored) {
+            return java.util.List.of();
+        }
+        java.util.List<com.janyee.agent.domain.AgentEvent> events = runEventStreamService.snapshot(runId);
+        java.util.List<java.util.Map<String, Object>> out = new java.util.ArrayList<>(events.size());
+        for (com.janyee.agent.domain.AgentEvent event : events) {
+            java.util.LinkedHashMap<String, Object> row = new java.util.LinkedHashMap<>();
+            row.put("type", event.type() == null ? null : event.type().name());
+            row.put("sessionId", event.sessionId());
+            row.put("runId", event.runId());
+            row.put("timestamp", event.timestamp() == null ? null : event.timestamp().toString());
+            row.put("content", event.content());
+            out.add(row);
+        }
+        return out;
+    }
+
+    /**
+     * 列出当前用户**有权看到**的所有 in-progress run。
+     *
+     * <p>之前的实现只看 {@code cancellationRegistry}(本进程在跑的),那是给"终止"按钮判定用的进程
+     * 内 registry。新的实现按 DB 查所有非终态 run + {@link com.janyee.agent.infra.auth.SessionVisibility}
+     * 过滤,这样:</p>
+     * <ul>
+     *   <li>跨多进程部署时,租户管理员也能看见其他实例上跑的 run</li>
+     *   <li>租户管理员看得到本租户其他用户在跑的 run(满足 read.tenant 权限语义)</li>
+     *   <li>sysadmin(read.all)看到全平台所有在跑的 run</li>
+     *   <li>普通用户只看自己的</li>
+     * </ul>
      */
     @GetMapping("/runs/active")
     public java.util.List<RunDetailResponse> listActiveRuns() {
         java.util.List<RunDetailResponse> result = new java.util.ArrayList<>();
-        for (String runId : cancellationRegistry.activeRunIds()) {
-            try {
-                RunDetailView view = agentQueryService.getRun(runId);
-                result.add(toRunDetailResponse(view));
-            } catch (Exception ignored) {
-                // DB race: run was registered in memory but the record is not yet visible.
-                // Dropping the row here is acceptable — UI polls and will pick it up next tick.
-            }
+        for (RunDetailView view : agentQueryService.listVisibleActiveRuns()) {
+            result.add(toRunDetailResponse(view));
         }
         return result;
     }
@@ -218,8 +300,20 @@ public class QueryController {
         PermissionGate.require("session.terminate");
         boolean signalled = cancellationRegistry.requestCancel(id, "cancelled by user");
         if (signalled) {
+            // 立刻往事件流推 RUN_STATUS:任何还连着的 WS 都立即收到"已发起取消"的反馈,
+            // 用户的 UI 不再要等 orchestrator 走到下一个 checkpoint 才看到状态变化。
+            // 真正的 RUN_CANCELLED 终态事件还是由 SimpleAgentRunner 的清理路径发,
+            // 这里只是给一个早期信号让前端立马显示"正在取消…"。
+            try {
+                String sessionId = agentQueryService.getRun(id).sessionId();
+                runEventStreamService.publish(com.janyee.agent.domain.AgentEvent.now(
+                        com.janyee.agent.domain.AgentEventType.RUN_STATUS,
+                        sessionId, id, "phase=CANCELLING cancel requested by user"));
+            } catch (Exception ignored) {
+                // run record 已不在 / 查询失败:不阻塞 cancel 路径,仍返回 ok。
+            }
             return ResponseEntity.ok(new CancelRunResponse(id, true, false,
-                    "Cancel signal delivered; run will exit on next iteration checkpoint."));
+                    "Cancel signalled; run will exit at the next safe checkpoint."));
         }
         // Try DB-fallback: if the DB still thinks the run is in-progress but no live context
         // exists on this process, the run is dead — flip the DB record so the UI isn't stuck.

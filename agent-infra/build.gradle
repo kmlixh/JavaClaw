@@ -11,6 +11,8 @@ dependencies {
     implementation 'org.springframework:spring-webflux'
     implementation 'io.projectreactor.netty:reactor-netty-http'
     implementation 'org.apache.poi:poi-ooxml:5.2.5'
+    // 文档结构化(doc.normalize tool):.pdf 解析 + 文本提取
+    implementation 'org.apache.pdfbox:pdfbox:3.0.3'
     implementation 'org.flywaydb:flyway-core'
     implementation 'org.flywaydb:flyway-database-postgresql'
     implementation 'org.yaml:snakeyaml'

@@ -63,6 +63,19 @@ public class RunRecordEntity {
     @Column(name = "app_id", length = 64)
     private String appId;
 
+    // V36: 完整执行流程的 JSON 日志(一个 run 一行 JSON 数组),用于事后复盘 + 前端时间线渲染。
+    // 跟 session_message / tool_audit_log 是不同的访问模式:这里按 run 时序读全部事件,
+    // 那两张按消息 / 工具维度过滤。冗余存储是必要的。
+    @Column(name = "event_log_json", columnDefinition = "TEXT")
+    private String eventLogJson;
+
+    // V43: 完整**未过滤**事件日志(JSON 数组)。跟 event_log_json 的区别是它**包含** TOKEN_DELTA 和
+    // 流式 MODEL_OUTPUT chunk —— 即每个 LLM token 增量、每个 700ms 进度心跳全都记下来。
+    // 用途:debug LLM 流式响应卡顿、回放 token 用量逐 chunk 累加曲线、查"为什么 UI 这一刻卡了 X 秒"
+    // 这类细粒度问题。run 结束时由 RunEventCollector.flushAndPersist 一次性写入。
+    @Column(name = "raw_log_text", columnDefinition = "TEXT")
+    private String rawLogText;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -177,6 +190,11 @@ public class RunRecordEntity {
     public void setTenantId(String tenantId) { this.tenantId = tenantId; }
     public String getAppId() { return appId; }
     public void setAppId(String appId) { this.appId = appId; }
+    public String getEventLogJson() { return eventLogJson; }
+    public void setEventLogJson(String eventLogJson) { this.eventLogJson = eventLogJson; }
+
+    public String getRawLogText() { return rawLogText; }
+    public void setRawLogText(String rawLogText) { this.rawLogText = rawLogText; }
 
     public Instant getCreatedAt() {
         return createdAt;

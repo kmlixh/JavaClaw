@@ -11,5 +11,8 @@ public enum AgentEventType {
     PLAN_UPDATED,
     RUN_COMPLETED,
     RUN_FAILED,
-    RUN_CANCELLED
+    RUN_CANCELLED,
+    // run 结束时携带 token 用量。content 是 JSON {"prompt":N,"completion":N,"total":N}。
+    // 供应商不返 usage 时不发该 event;前端在对应 assistant 气泡末尾渲染"本次消耗 N tokens"。
+    TOKEN_USAGE
 }

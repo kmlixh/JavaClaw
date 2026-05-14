@@ -23,4 +23,9 @@ public class InMemorySessionLockManager implements SessionLockManager {
     public void unlock(String sessionId) {
         locks.remove(sessionId);
     }
+
+    @Override
+    public boolean isLocked(String sessionId) {
+        return sessionId != null && locks.contains(sessionId);
+    }
 }

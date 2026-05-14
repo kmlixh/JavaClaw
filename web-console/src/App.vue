@@ -3,14 +3,15 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import MarkdownBlock from "./components/MarkdownBlock.vue";
 import ScopeEditor from "./components/ScopeEditor.vue";
+import EchartsBlock from "./components/EchartsBlock.vue";
 import {
   approve,
   cancelRun,
-  createSseStream,
-  createWebSocketStream,
+  openGlobalEventSocket,
   artifactDownloadUrl,
   deleteAdminLlm,
   getActiveRun,
+  getRunEventSnapshot,
   listActiveRuns,
   getApproval,
   getMemories,
@@ -20,11 +21,13 @@ import {
   listApprovals,
   listKnowledgeEntries,
   listAgents,
+  uploadChatAttachment,
   listAgentDefinitionsAdmin,
   listLlms,
   listMemoryNotesAdmin,
   listRunsBySession,
   listSessions,
+  listSessionsPaged,
   saveAgentDefinitionAdmin,
   saveMemoryNoteAdmin,
   deleteAgentDefinitionAdmin,
@@ -77,12 +80,355 @@ import {
   adminCreateOauthClient,
   adminUpdateOauthClient,
   adminRotateOauthClientSecret,
-  adminDeleteOauthClient
+  adminDeleteOauthClient,
+  fetchUsageSummary,
+  fetchUsageTimeseries,
+  fetchUsageRecent,
+  labCreateTask,
+  labListTasks,
+  labTaskDetail,
+  labCancelTask,
+  labRestartTask,
+  labRefineConstraints,
+  labRefineGoal,
+  labListAllSkills,
+  adminListSessions,
+  adminGetRunReplay,
+  adminGetRunSteps,
+  adminListSessionRuns
 } from "./api";
 
 const agents = ref([]);
 const llms = ref([]);
 const approvals = ref([]);
+
+// Token 用量页 state。range 选项映射到 from/to 时间;groupBy 切换聚合维度。
+// summary / timeseries / recent 三组数据各自独立加载,刷新按钮一次拉齐。
+const usageState = reactive({
+  range: "7d",
+  groupBy: "tenant",
+  loading: false,
+  error: "",
+  summary: [],
+  timeseries: [],
+  recent: []
+});
+
+// Agent 实验室 state。tasks 列表;currentDetail 是详情页(打开 taskId 时拉);
+// polling 是详情页"还在跑"时的自动刷新标志。
+const labState = reactive({
+  loading: false,
+  error: "",
+  tasks: [],
+  currentDetail: null,    // { task, iterations }
+  pollingTimer: null,
+  allSkills: []           // 拉一次缓存,Skill 选择下拉用
+});
+const labForm = reactive({
+  title: "",
+  goalDescription: "",
+  // 用户不再手写测试用例,而是写若干约束规则 + 可选粘贴参考文档。
+  // 后端 meta-LLM 据此自动派生测试场景并迭代调试。
+  // 整个流程对用户:目标描述 → 约束规则(+参考文档) → 让 AI 跑。
+  constraintRules: "",
+  referenceDocuments: "",
+  maxIterations: 5,
+  // mode: 针对 Skill 的 NEW / EXISTING / CLONE_FROM
+  mode: "NEW",
+  // host agent: hostAgentMode 三选一(跟 Skill 模式同思路)
+  hostAgentMode: "EXISTING",            // EXISTING / NEW / CLONE_FROM
+  hostAgentId: "",                      // EXISTING 时填(从下拉选)
+  newHostAgentId: "",                   // NEW / CLONE_FROM 时填
+  newHostAgentDisplayName: "",          // NEW / CLONE_FROM 时可选
+  newHostAgentSeedPrompt: "",           // NEW 时可选 — 一句话描述,meta-LLM 据此扩写
+  newHostAgentScopeType: "SYSTEM",
+  newHostAgentScopeTenantId: "",
+  cloneFromHostAgentId: "",             // CLONE_FROM 时填(选已有源)
+  // 是否允许迭代过程中也改 Agent(默认关 — 只改 Skill)
+  allowAgentEvolution: false,
+  // target Skill
+  targetSkillName: "",         // EXISTING 用(从下拉选)
+  newSkillName: "",            // NEW / CLONE_FROM 用(填新 skill 名)
+  cloneFromSkillName: "",      // CLONE_FROM 用(从下拉选)
+  // 新 Skill 的 scope
+  targetScopeType: "SYSTEM",
+  targetScopeTenantId: "",
+  // LLM 双栏 —— 跟会话面板一致,(configId, model) 一对一选择,
+  // 同一个 LLM 配置下挂多个 model 时也能区分。空 = 走 default。
+  metaLlmConfigId: "",         // 设计师 LLM(留空 = default)
+  metaLlmModel: "",            // 设计师 LLM 的 apiModel
+  testLlmConfigId: "",         // 测试 LLM(留空 = Agent 默认)
+  testLlmModel: ""             // 测试 LLM 的 apiModel
+});
+const labShowCreate = ref(false);
+
+// 详情页内嵌编辑器:允许"换 LLM / 改约束规则 / 改参考文档"后一键 保存+重启迭代。
+// 跟创建 modal 共用同一套字段语义,只是这里源是 currentDetail.task。
+const labDetailEditor = reactive({
+  taskId: "",
+  title: "",
+  goalDescription: "",
+  maxIterations: 5,
+  constraintRules: "",
+  referenceDocuments: "",
+  metaLlmKey: "|",        // "configId|apiModel"
+  testLlmKey: "|",
+  saving: false,
+  expanded: false
+});
+
+function labLoadDetailEditor(task) {
+  if (!task) return;
+  labDetailEditor.taskId = task.id;
+  labDetailEditor.title = task.title || "";
+  labDetailEditor.goalDescription = task.goalDescription || "";
+  labDetailEditor.maxIterations = task.maxIterations || 5;
+  labDetailEditor.constraintRules = task.constraintRules || "";
+  labDetailEditor.referenceDocuments = task.referenceDocuments || "";
+  labDetailEditor.metaLlmKey = `${task.metaLlmConfigId || task.llmConfigId || ""}|${task.metaLlmModel || ""}`;
+  labDetailEditor.testLlmKey = `${task.testLlmConfigId || ""}|${task.testLlmModel || ""}`;
+  // 失败 / 取消 态自动展开 —— 用户进来八成就是要改 LLM 或规则再跑,
+  // 折叠等于让他们多点一下;成功 / 跑中态保持折叠,免打扰看历史。
+  const status = (task.status || "").toUpperCase();
+  labDetailEditor.expanded = ["FAILED", "FAILED_META_LLM", "CANCELLED"].includes(status);
+}
+
+async function labDetailEditorSaveAndRestart() {
+  if (!labDetailEditor.taskId) return;
+  if (!labDetailEditor.constraintRules.trim()) {
+    labState.error = "约束规则不能为空"; return;
+  }
+  if (!confirm("用编辑器里的约束规则 / LLM / 参考文档覆盖原任务,AI 重新派生测试场景并从第 1 轮调试。已有迭代记录保留。")) return;
+  try {
+    labDetailEditor.saving = true;
+    const [metaCfg, metaModel] = String(labDetailEditor.metaLlmKey || "|").split("|");
+    const [testCfg, testModel] = String(labDetailEditor.testLlmKey || "|").split("|");
+    await labRefineConstraints(labDetailEditor.taskId, {
+      title: labDetailEditor.title.trim() || null,
+      goalDescription: labDetailEditor.goalDescription.trim() || null,
+      maxIterations: Number(labDetailEditor.maxIterations) || null,
+      constraintRules: labDetailEditor.constraintRules.trim(),
+      referenceDocuments: labDetailEditor.referenceDocuments.trim() || null,
+      metaLlmConfigId: metaCfg || null,
+      metaLlmModel: metaModel || null,
+      testLlmConfigId: testCfg || null,
+      testLlmModel: testModel || null
+    });
+    await labReloadDetail(labDetailEditor.taskId);
+    labStartPolling(labDetailEditor.taskId);
+  } catch (e) { labState.error = e.message; }
+  finally { labDetailEditor.saving = false; }
+}
+
+// 创建 modal 嵌入式"运行状态"面板:用户提交后 modal 不关,这里保留 activeTaskId
+// 并轮询 detail,显示当前迭代/状态/最近一轮总结,允许停 / 重启 / 改写约束规则后再调试。
+const labCreateModal = reactive({
+  activeTaskId: "",
+  detail: null,            // 完整 detail(task + iterations)
+  pollTimer: null,
+  pollError: "",
+  submitting: false,
+  refining: false          // 改写约束规则提交中
+});
+
+async function labStartCreateModalPolling(taskId) {
+  labCreateModal.activeTaskId = taskId;
+  labCreateModal.pollError = "";
+  labStopCreateModalPolling();
+  // 立刻拉一次,然后每 3s 轮询直到 task 不在运行态(或用户关掉 modal)
+  await labPollCreateModalOnce();
+  labCreateModal.pollTimer = setInterval(async () => {
+    try { await labPollCreateModalOnce(); }
+    catch (e) { labCreateModal.pollError = e.message || "poll failed"; }
+  }, 3000);
+}
+async function labPollCreateModalOnce() {
+  if (!labCreateModal.activeTaskId) return;
+  const detail = await labTaskDetail(labCreateModal.activeTaskId);
+  labCreateModal.detail = detail;
+  // 终态自动停轮询
+  const status = detail?.task?.status;
+  if (status && !["PENDING", "RUNNING"].includes(status)) {
+    labStopCreateModalPolling();
+  }
+}
+function labStopCreateModalPolling() {
+  if (labCreateModal.pollTimer) {
+    clearInterval(labCreateModal.pollTimer);
+    labCreateModal.pollTimer = null;
+  }
+}
+function labCloseCreateModal() {
+  labStopCreateModalPolling();
+  labCreateModal.activeTaskId = "";
+  labCreateModal.detail = null;
+  labCreateModal.pollError = "";
+  labShowCreate.value = false;
+}
+async function labCreateModalCancel() {
+  if (!labCreateModal.activeTaskId) return;
+  if (!confirm("取消当前迭代?当前轮会被中断,已有的轮次记录保留。")) return;
+  try {
+    await labCancelTask(labCreateModal.activeTaskId);
+    await labPollCreateModalOnce();
+  } catch (e) { labState.error = e.message; }
+}
+async function labCreateModalRestart() {
+  if (!labCreateModal.activeTaskId) return;
+  if (!confirm("从第 1 轮重新设计 + 测试?约束规则不变,只是重跑。已有迭代记录保留。")) return;
+  try {
+    await labRestartTask(labCreateModal.activeTaskId);
+    labStartCreateModalPolling(labCreateModal.activeTaskId);
+  } catch (e) { labState.error = e.message; }
+}
+async function labCreateModalRefineRules() {
+  if (!labCreateModal.activeTaskId) return;
+  if (!labForm.constraintRules.trim()) { labState.error = "约束规则不能为空"; return; }
+  if (!confirm("用当前表单里的约束规则覆盖原任务,AI 重新派生测试场景并从第 1 轮调试。已有迭代记录保留。")) return;
+  try {
+    labCreateModal.refining = true;
+    await labRefineConstraints(labCreateModal.activeTaskId, {
+      constraintRules: labForm.constraintRules.trim(),
+      referenceDocuments: labForm.referenceDocuments.trim() || null
+    });
+    labStartCreateModalPolling(labCreateModal.activeTaskId);
+  } catch (e) { labState.error = e.message; }
+  finally { labCreateModal.refining = false; }
+}
+
+// Lab modal 的 LLM 下拉源:展平成 (LLM × model) 对,跟会话面板的 llmModelOptions 同思路。
+// 一个 LLM 配置可能挂多个 model(modelMappingJson.models),用户实际选的就是
+// "用哪个 LLM 服务的哪个 model 跑"。option.value 用 "configId|apiModel" 拼接。
+// 数据源优先 admin catalog(含 disabled、跨租户;sysadmin 看全),回退到 /api/llms。
+const labLlmOptions = computed(() => {
+  const source = (state.catalog.llms && state.catalog.llms.length > 0)
+    ? state.catalog.llms
+    : (llms.value || []);
+  const out = [];
+  for (const llm of source) {
+    const configId = llm.id || llm.configId;
+    if (!configId) continue;
+    const enabled = llm.enabled !== false;
+    const models = parseLlmModelMappings(llm.modelMappingJson, llm.model);
+    if (!models.length) {
+      out.push({
+        key: `${configId}|`,
+        configId,
+        apiModel: "",
+        label: `${llm.displayName || configId}${enabled ? "" : " [disabled]"}`,
+        enabled
+      });
+      continue;
+    }
+    for (const m of models) {
+      out.push({
+        key: `${configId}|${m.apiModel}`,
+        configId,
+        apiModel: m.apiModel,
+        label: `${llm.displayName || configId} - ${m.displayName || m.apiModel}${enabled ? "" : " [disabled]"}`,
+        enabled
+      });
+    }
+  }
+  return out;
+});
+
+// 写入器:metaLlmKey 跟 form 的 metaLlmConfigId+metaLlmModel 双向绑定
+const labMetaLlmKey = computed({
+  get() { return `${labForm.metaLlmConfigId || ""}|${labForm.metaLlmModel || ""}`; },
+  set(value) {
+    const [configId, apiModel] = String(value || "").split("|");
+    labForm.metaLlmConfigId = configId || "";
+    labForm.metaLlmModel = apiModel || "";
+  }
+});
+const labTestLlmKey = computed({
+  get() { return `${labForm.testLlmConfigId || ""}|${labForm.testLlmModel || ""}`; },
+  set(value) {
+    const [configId, apiModel] = String(value || "").split("|");
+    labForm.testLlmConfigId = configId || "";
+    labForm.testLlmModel = apiModel || "";
+  }
+});
+
+// 管理员会话审计页 state。
+// fromDays: 0 = 不限,7 = 最近 7 天,等。
+const adminSessionsState = reactive({
+  loading: false,
+  error: "",
+  rows: [],
+  totalSessions: 0,
+  totalRuns: 0,
+  totalMessages: 0,
+  totalTokens: 0,
+  page: 0,
+  size: 20,
+  // 联动下拉的数据源(进入页面时一次性拉,缓存到内存)
+  catalogLoaded: false,
+  tenants: [],          // [{id, name}, ...]
+  oauthClients: [],     // [{clientId, tenantId, displayName}, ...]
+  agents: []            // [{agentId, displayName, scopeType, scopeTenantId, appId}, ...]
+});
+// 会话审计批量选择 state(仅缓存当前页可管理行的 sessionId)
+const adminSessionsSelection = reactive(new Set());
+
+// 权限判定:跟后端 SessionVisibility 三档同步。
+// 匿名兜底放行(application-prod.yml anonymous-enabled=false 时实际不会落到匿名);
+// 否则按当前 principal 的 permissions 决定。
+const sessionVisibilityForUi = computed(() => {
+  if (!authUser || authUser.anonymous) {
+    return { readAll: true, readTenant: false, tenantId: "", userId: "" };
+  }
+  const perms = new Set(authUser.permissions || []);
+  return {
+    readAll: perms.has("session.read.all"),
+    readTenant: perms.has("session.read.tenant") || perms.has("session.read.all"),
+    tenantId: authUser.activeTenantId || "",
+    userId: authUser.userId || ""
+  };
+});
+function canManageSession(row) {
+  const v = sessionVisibilityForUi.value;
+  if (v.readAll) return true;
+  if (v.readTenant) return row.tenantId === v.tenantId;
+  return row.userId === v.userId;
+}
+const manageableAdminSessions = computed(() =>
+  adminSessionsState.rows.filter(canManageSession)
+);
+const adminSessionsAllSelected = computed(() => {
+  const items = manageableAdminSessions.value;
+  if (items.length === 0) return false;
+  return items.every(r => adminSessionsSelection.has(r.sessionId));
+});
+const adminSessionsFilter = reactive({
+  userId: "",
+  tenantId: "",
+  appId: "",
+  agentId: "",
+  fromDays: 7
+});
+const adminReplayState = reactive({
+  open: false,
+  loading: false,
+  runId: "",
+  data: null,
+  // V42:行级事件由后端按 category 落表后返回。空数组表示尚未加载;
+  // 没有 steps 时 fallback 走 data.eventLogJson(老 run 兼容路径,服务端会代为解析)。
+  steps: [],
+  error: "",
+  // 复盘分类过滤:用户可以只看 AI 调用 / 数据库 / 文件 / 产物 等
+  activeCategories: new Set(["ai", "db", "file", "artifact", "plan", "tool-other", "lifecycle"])
+});
+// 选 run 复盘的中间 modal:某 session 下所有 run 列表,管理员选一个再展开 trace。
+const adminRunsModal = reactive({
+  open: false,
+  sessionId: "",
+  sessionTitle: "",
+  loading: false,
+  runs: [],
+  error: ""
+});
 
 // embed 模式标志:URL 带 ?embed=1 立即生效,渲染前就决定了 → 不会闪左栏
 const embedMode = computed(() => route.query.embed === "1");
@@ -111,8 +457,14 @@ const authUser = reactive({
 });
 const loginForm = reactive({ username: "", password: "", submitting: false, error: "" });
 const passwordChangeForm = reactive({ oldPassword: "", newPassword: "", submitting: false, error: "" });
-const currentStream = ref(null);
-const transport = ref("websocket");
+// 全局 WebSocket 单例。登录后建一条到 /ws/events,后端按权限把所有可见 session 的事件流推过来,
+// 整个会话生命周期常驻,不每发一条消息 / 切一个 session 就开一条新 WS。openGlobalEventSocket
+// 内部已经做断线指数退避重连,这里只需要拿到句柄等登出时主动 close。
+const globalSocket = ref(null);
+// 受全局 socket 推送过来的事件,默认全部走 pushEvent(state.events 的 dedup + render)。
+// 但当事件 sessionId 不是用户当前正在看的 form.sessionId 时,我们改成更新 sidebar 的"活动时间"
+// + 终态时标红点,不刷主对话流。这是"多管理员共视一个会话"的实现支撑面。
+const sessionActivity = reactive({});  // sessionId → { lastEventAt, terminalType, runId }
 const activeMenu = ref("chat");
 const activeRuns = ref([]);
 let activeRunsTimer = null;
@@ -150,23 +502,9 @@ function scrollConversationToBottom(opts = {}) {
   });
 }
 
-// WebSocket 重连控制:
-//   - runId:当前需要保活的 run。切 session / clearStream 时会被清或设 cancelled=true。
-//   - attempts:指数退避计数,open 成功时归零,连续失败累加。
-//   - cancelled:用户主动切换时设 true,避免被调度的 setTimeout 触发意外重连。
-//   - timer:待定的重连 setTimeout 句柄,用于取消。
-// 设计上一次只保活一个 run。跨 session 的 run 靠 cross-session 过滤保护。
-const reconnectCtl = {
-  runId: "",
-  sessionId: "",
-  agentId: "",
-  userId: "",
-  attempts: 0,
-  cancelled: false,
-  timer: null
-};
-const RECONNECT_MAX_ATTEMPTS = 10;
-const RECONNECT_MAX_DELAY_MS = 30000;
+// 重连状态以前是 per-run 的:每发一条消息开一条 WS,WS 断了走 reconnectCtl 指数退避。
+// 新通信模型下 globalSocket 是登录态长连接,openGlobalEventSocket 内部自己管断线 + 指数退避;
+// 这里不再需要业务层维护一份重连 state。
 
 // 事件签名用于重连 replay 去重。服务端 replayAndSubscribe 会重放全部 history,
 // 前端若不识别会把 liveAssistant / runPlan 再灌一遍。签名 = type|runId|timestamp|content(前160),
@@ -335,6 +673,7 @@ const menuItems = [
   { id: "search",      group: "工作区", label: "搜索",      hint: "查询消息 / 记忆 / artifact" },
   { id: "approval",    group: "工作区", label: "审批",      hint: "查看历史审批记录" },
   { id: "memory",      group: "工作区", label: "长期记忆",   hint: "浏览 memory note" },
+  { id: "usage",       group: "工作区", label: "Token 用量",  hint: "按租户/应用/用户/模型统计 token 消耗" },
 
   // —— Agent 配置:跟某个 agent / skill 绑的资源 ——
   { id: "agents",      group: "Agent 配置", label: "Agents",   hint: "管理 agent 定义 (AGENT/SOUL/MEMORY)" },
@@ -348,7 +687,9 @@ const menuItems = [
   { id: "users",         group: "系统管理", label: "用户",       hint: "用户与角色分配",         permission: "user.manage" },
   { id: "tenants",       group: "系统管理", label: "租户",       hint: "租户与应用",            permission: "tenant.manage" },
   { id: "roles",         group: "系统管理", label: "角色 / 权限", hint: "角色定义与权限集合",     permission: "permission.manage" },
-  { id: "oauth-clients", group: "系统管理", label: "OAuth 应用", hint: "外部应用 client_id/secret", permission: "oauth.client.manage" }
+  { id: "oauth-clients", group: "系统管理", label: "OAuth 应用", hint: "外部应用 client_id/secret", permission: "oauth.client.manage" },
+  { id: "lab",           group: "系统管理", label: "Agent 实验室", hint: "AI 自动迭代设计 Agent / Skill", permission: "menu.lab" },
+  { id: "admin-sessions",group: "系统管理", label: "会话审计",     hint: "跨租户/用户/应用的会话列表 + run 复盘", permission: "session.read.tenant" }
 ];
 
 // 按权限过滤后再按 group 拆分;空组不渲染。匿名期一律放行,SUPER_ADMIN 自然啥都看得见。
@@ -432,8 +773,24 @@ function flattenScopeForRequest(scope) {
   };
 }
 
+// 聊天里只该出现:user / assistant / 最终交付物的 tool message(artifact / markdown)。
+// db.query / plan.* / db.schema.inspect 这些中间步骤的 tool message 全部踢出 ——
+// 这种 SQL/rows JSON dump 是给 Run 复盘 / admin 查的内部数据,糊在用户气泡里就是噪音。
+// 数据库 session_message 表还是照常存,只是这里渲染前过滤。
+function isUserFacingTranscriptMessage(message) {
+  if (!message) return false;
+  const role = message.role;
+  if (role === "user" || role === "assistant") return true;
+  if (role === "tool") {
+    const payload = parseJson(message.toolResultJson);
+    const dt = payload?.displayType;
+    return dt === "markdown" || dt === "artifact";
+  }
+  return false;
+}
+
 const transcriptMessages = computed(() => {
-  const persisted = state.session?.messages || [];
+  const persisted = (state.session?.messages || []).filter(isUserFacingTranscriptMessage);
   if (!state.pendingMessages.length) {
     return persisted;
   }
@@ -460,7 +817,9 @@ const transcriptMessages = computed(() => {
 const hasAvailableLlms = computed(() => llms.value.length > 0);
 const selectedRuntimeLlm = computed(() => llms.value.find((item) => item.configId === form.llmConfigId) || null);
 const selectedRuntimeLlmModels = computed(() => parseLlmModelMappings(selectedRuntimeLlm.value?.modelMappingJson, selectedRuntimeLlm.value?.model));
-const chatRunBusy = computed(() => loading.sending || !!currentStream.value || isActiveRunStatus(state.run?.status));
+// 是否有 run 正在跑:只看后端权威信号(state.run.status),不再看是否持有 WebSocket 句柄 ——
+// globalSocket 是登录态长连接,跟 run 状态无关。
+const chatRunBusy = computed(() => loading.sending || isActiveRunStatus(state.run?.status));
 
 // 把 llms × 每个 llm.modelMappingJson 里的 models 数组展平成"LLM-模型"扁平列表,
 // 给单一下拉用。option.value 用 "configId|apiModel" 拼接,display 用 "LLM 名 - 模型名"。
@@ -1433,14 +1792,43 @@ function isTextLikeFile(file) {
   return /\.(txt|md|sql|json|csv|tsv|log|xml|yaml|yml|js|ts)$/i.test(file.name);
 }
 
+// 附件双路径:
+//   - 小文件(< INLINE_THRESHOLD,默认 512KB)且是文本/图片 → base64 内联进 chat 请求,简单快
+//   - 大文件(>= 阈值,或者非文本/图片)→ multipart 流式上传 /api/chat/attachments,落工作区,
+//     chat 请求里只带 {name, path}。doc.normalize / file.read 直接用 path 找文件。
+// 上限 1GB(后端 ChatAttachmentUploadController.MAX_FILE_BYTES + nginx client_max_body_size 1g)。
+const INLINE_THRESHOLD = 512 * 1024;             // 512KB 以下走老 base64 内联
+const MAX_FILE_BYTES = 1024 * 1024 * 1024;       // 1GB 总上限
+
 async function addAttachmentFromFile(file, mode) {
   const imageMode = mode === "image";
-  const sizeLimit = imageMode ? 3 * 1024 * 1024 : 1024 * 1024;
-  if (file.size > sizeLimit) {
-    state.error = `${file.name} 超过大小限制，${imageMode ? "图片" : "文件"}当前支持 ${Math.floor(sizeLimit / 1024 / 1024) || 1}MB 以内`;
+  if (file.size > MAX_FILE_BYTES) {
+    state.error = `${file.name} 超过上限 ${Math.floor(MAX_FILE_BYTES / 1024 / 1024)}MB`;
     return;
   }
   const isText = !imageMode && isTextLikeFile(file);
+
+  // 大文件 / 二进制非图片 → 走 multipart 上传
+  if (!imageMode && (file.size >= INLINE_THRESHOLD || !isText)) {
+    try {
+      const result = await uploadChatAttachment(file, { sessionId: form.sessionId, agentId: form.agentId });
+      const attachment = {
+        name: result.name,
+        displayLabel: nextAttachmentDisplayLabel("file"),
+        contentType: result.contentType || file.type || "application/octet-stream",
+        path: result.path,             // 工作区相对路径,后端 doc.normalize/file.read 都用这个
+        sizeBytes: result.size
+      };
+      form.attachments.push(attachment);
+      appendComposerToken(attachment.displayLabel);
+      return;
+    } catch (error) {
+      state.error = `上传 ${file.name} 失败:${error.message || error}`;
+      return;
+    }
+  }
+
+  // 图片或小文本 → 老路径
   const content = isText ? await file.text() : await fileToDataUrl(file);
   const attachment = {
     name: file.name,
@@ -1451,6 +1839,8 @@ async function addAttachmentFromFile(file, mode) {
   form.attachments.push(attachment);
   appendComposerToken(attachment.displayLabel);
 }
+
+// uploadAttachment 已迁到 api.js 的 uploadChatAttachment,这里直接调。
 
 async function handleImageChange(event) {
   const files = Array.from(event.target.files || []);
@@ -2391,6 +2781,22 @@ function pushEvent(event) {
     state.liveAssistant.content = normalized.content || "";
   }
 
+  if (normalized.type === "TOKEN_USAGE") {
+    // run 结束时后端会发一条 TOKEN_USAGE,content 是 JSON {prompt,completion,total}。
+    // 实时把数字塞到 liveAssistant.tokenUsage,run 终止时 reload 拉到 message 字段后会
+    // 接管显示;短促一两秒的过渡里 live bubble 也能看到最新数字,体验更连贯。
+    try {
+      const payload = JSON.parse(normalized.content || "{}");
+      state.liveAssistant.tokenUsage = {
+        prompt: payload.prompt || 0,
+        completion: payload.completion || 0,
+        total: payload.total || 0
+      };
+    } catch (error) {
+      console.warn("[token_usage.parse_failed]", normalized.content, error);
+    }
+  }
+
   // RUN_STATUS 的 MODEL_OUTPUT phase 事件：每 ~700ms 一条，content 是到目前为止的
   // 完整累积文本。之前为了"避免刷屏"直接丢弃，但这样用户就看不到流式字幕了 —— 短对话
   // 会出现 20s 空白再 poof 一次性全出的糟糕体验。
@@ -2762,24 +3168,31 @@ function extractBalancedJson(text, startIndex) {
   return "";
 }
 
+// 哪些 displayType 配在聊天气泡里直接展示。原则:**只有给用户看的最终交付物**才上聊天。
+//   - markdown / artifact:用户最终产物(报告、文件) → 上
+//   - table / tool_error / 等:db.query 中间结果 / 工具诊断日志 → 不上,只去复盘看
+// 之前所有 displayType 都被塞进聊天,导致 LLM 每次 db.query 的 SQL/rows JSON 直接糊在屏幕上,
+// 用户感觉是"内部迭代日志泄漏"。
+const CHAT_RENDERABLE_DISPLAY_TYPES = new Set(["markdown", "artifact"]);
+
 function toolEventRenderPayload(event) {
   const parsedContent = parseToolEventContent(event?.content);
   const parsed = parseJson(parsedContent.payload);
   if (!parsed?.displayType) {
-    console.warn("[ws.render.payload.missing]", {
-      runId: event?.runId,
-      type: event?.type,
-      summary: parsedContent.summary,
-      content: event?.content
-    });
     return null;
   }
-  return ["table", "echarts", "artifact", "markdown"].includes(parsed.displayType) ? parsed : null;
+  return CHAT_RENDERABLE_DISPLAY_TYPES.has(parsed.displayType) ? parsed : null;
 }
 
-function toolNameForDisplayType(displayType) {
-  if (displayType === "table") return "table.render";
-  if (displayType === "echarts") return "chart.echarts";
+// 从事件 content 的 "tool=X" 抽真实工具名(db.query / artifact.markdown / db.schema.inspect 等)。
+// 之前 displayType="table" 被翻成假工具名 "table.render",误导用户以为有这么个工具
+// —— 实际上是 db.query 在返回 displayType="table" 的展示载荷。
+function toolNameFromEvent(event, displayType) {
+  const content = String(event?.content || "");
+  const match = content.match(/\btool=([\w.-]+)/);
+  if (match) return match[1];
+  // 兜底:实在抽不到才按 displayType 推断,artifact.markdown 仍合法,其它 displayType
+  // 没有真工具名时返 "artifact" 通用标签,避免回到 "table.render"。
   if (displayType === "markdown") return "artifact.markdown";
   return "artifact";
 }
@@ -2796,7 +3209,7 @@ function toolEventRenderMessage(event, runIdOverride) {
     role: "tool",
     messageType: "tool-result",
     content: parseToolEventContent(event.content).summary,
-    toolName: toolNameForDisplayType(payload.displayType),
+    toolName: toolNameFromEvent(event, payload.displayType),
     toolArgsJson: null,
     toolResultJson: JSON.stringify(payload),
     seqNo: 0,
@@ -2817,7 +3230,7 @@ function toolEventRenderMessageForView(event) {
   return {
     id: `tool-event-${event?.id || Date.now()}`,
     runId,
-    toolName: toolNameForDisplayType(payload.displayType),
+    toolName: toolNameFromEvent(event, payload.displayType),
     toolResultJson: JSON.stringify(payload)
   };
 }
@@ -2888,7 +3301,15 @@ function hasPendingRenderedToolForRun(runId, payloadJson) {
 
 async function refreshRecentSessions() {
   try {
-    recentSessions.value = await listSessions(state.resolvedAgentId || form.agentId || undefined);
+    // 真后端分页:每次只拉当前页(默认 15 条),关键字搜索也走后端,翻页/搜索都调接口。
+    const response = await listSessionsPaged({
+      agentId: state.resolvedAgentId || form.agentId || undefined,
+      page: recentSessionsPage.page,
+      size: recentSessionsPage.size,
+      keyword: recentSessionsFilter.keyword
+    });
+    recentSessions.value = response.rows || [];
+    recentSessionsTotal.value = response.total || 0;
   } catch (error) {
     state.error = error.message;
   }
@@ -2899,136 +3320,78 @@ function closeContextMenu() {
   contextMenu.session = null;
 }
 
+// 切会话 / 退出 / 清屏时:清掉本地 chat 视图状态,但**不**关 globalSocket —— 它跟登录一起活,
+// 跟会话无关。globalSocket 的关闭只发生在 logout / 401 时,由 ensureGlobalEventSocket 那一头管。
 function clearStream() {
-  // 用户主动切会话 / 退出时 —— 必须先取消待定的重连 timer,否则老 session 的 run
-  // 会在切换后几秒被重新 attach,把老事件串到新 UI 上。
-  cancelReconnect();
-  if (currentStream.value?.close) {
-    currentStream.value.close();
-  }
-  if (currentStream.value instanceof WebSocket) {
-    currentStream.value.close();
-  }
-  currentStream.value = null;
+  // 这里只是个钩子,真要清空 chat 视图状态(transcript / events / liveAssistant)请调
+  // resetChatViewState 之类。保留这个函数是为了不破坏旧调用点;暂时是 no-op。
 }
 
-function armReconnect({ runId, sessionId, agentId, userId }) {
-  if (reconnectCtl.timer) {
-    clearTimeout(reconnectCtl.timer);
-  }
-  reconnectCtl.runId = runId || "";
-  reconnectCtl.sessionId = sessionId || "";
-  reconnectCtl.agentId = agentId || "";
-  reconnectCtl.userId = userId || "anonymous";
-  reconnectCtl.attempts = 0;
-  reconnectCtl.cancelled = false;
-  reconnectCtl.timer = null;
-}
-
-function cancelReconnect() {
-  if (reconnectCtl.timer) {
-    clearTimeout(reconnectCtl.timer);
-    reconnectCtl.timer = null;
-  }
-  reconnectCtl.cancelled = true;
-  reconnectCtl.runId = "";
-}
-
-// WS 断开后决定要不要重连。只在 run 仍然非终态时才重连 —— 否则 RUN_COMPLETED 后
-// 服务端优雅关闭,我们不应再尝试 attach。用 getRun 查 DB 作为"run 是否还活着"的
-// 权威来源,不依赖本地状态(本地 state.run 可能还没刷新到终态)。
-async function onStreamClosedMaybeReconnect() {
-  const ctl = reconnectCtl;
-  if (ctl.cancelled || !ctl.runId) {
-    return;
-  }
-  if (ctl.attempts >= RECONNECT_MAX_ATTEMPTS) {
-    console.warn("[ws.reconnect.max_attempts_reached]", ctl.runId);
-    state.error = "WebSocket 多次重连失败,请手动刷新";
-    return;
-  }
-  try {
-    const run = await getRun(ctl.runId);
-    if (run && !isActiveRunStatus(run.status)) {
-      console.log("[ws.reconnect.skip_terminal]", { runId: ctl.runId, status: run.status });
-      // Run 已终止,走一遍正常的结束处理(刷新数据),然后不再重连。
-      refreshRun();
-      refreshSession();
-      return;
-    }
-  } catch (error) {
-    // getRun 失败可能就是后端挂了或网络抖了 —— 仍然继续尝试重连,失败 10 次才停。
-    console.warn("[ws.reconnect.getRun_failed]", error?.message || error);
-  }
-  const delay = Math.min(1000 * (2 ** ctl.attempts), RECONNECT_MAX_DELAY_MS);
-  ctl.attempts += 1;
-  console.log("[ws.reconnect.scheduled]", { attempt: ctl.attempts, delayMs: delay, runId: ctl.runId });
-  ctl.timer = setTimeout(() => {
-    ctl.timer = null;
-    if (ctl.cancelled || !ctl.runId) return;
-    openAttachStream({
-      runId: ctl.runId,
-      sessionId: ctl.sessionId,
-      agentId: ctl.agentId,
-      userId: ctl.userId,
-      isReconnect: true
-    });
-  }, delay);
-}
-
-// 真正创建 attach 流的单点 —— armReconnect 之后走这里,断线重连时也走这里。
-function openAttachStream({ runId, sessionId, agentId, userId, isReconnect }) {
-  const subscribedSessionId = sessionId;
-  if (currentStream.value?.close) {
-    try { currentStream.value.close(); } catch (_) { /* ignore */ }
-  }
-  currentStream.value = createWebSocketStream({
-    sessionId,
-    agentId: agentId || undefined,
-    userId: userId || "anonymous",
-    message: "",
-    runId,
-    attach: true,
+/**
+ * 启动 / 维护持久 WebSocket。已经存在就不再开,断了由 openGlobalEventSocket 内部指数退避重连。
+ * onMounted 拿到 authUser 之后调一次,logout / 401 时 closeGlobalEventSocket。
+ */
+function ensureGlobalEventSocket() {
+  if (globalSocket.value) return;
+  console.log("[global.ws.ensure]");
+  globalSocket.value = openGlobalEventSocket({
     onOpen: () => {
-      if (reconnectCtl.runId === runId) {
-        reconnectCtl.attempts = 0;
-      }
-      if (isReconnect) {
-        console.log("[ws.reconnect.success]", runId);
-      }
-      // 一旦真的连上,清掉先前可能误报的"连接中断"banner。
-      if (state.error && /连接|流中断|重连/.test(state.error)) {
+      // 真连上之后清掉可能残留的"连接中断"banner
+      if (state.error && /连接|流中断|重连|WebSocket/.test(state.error)) {
         state.error = "";
       }
     },
-    onEvent: (event) => {
-      if (event?.sessionId && subscribedSessionId && event.sessionId !== subscribedSessionId) {
-        console.log("[ws.event.dropped_attach_closure]", {
-          eventSessionId: event.sessionId,
-          subscribedSessionId,
-          type: event.type
-        });
-        return;
-      }
-      pushEvent(event);
-      if (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED" || event.type === "RUN_CANCELLED") {
-        cancelReconnect();
-        refreshRun();
-        refreshSession();
-        refreshMemories();
-        refreshRecentSessions();
-      }
-    },
+    onEvent: dispatchGlobalEvent,
     onClose: () => {
-      currentStream.value = null;
-      onStreamClosedMaybeReconnect();
+      console.log("[global.ws.closed]");
     },
     onError: () => {
-      // WebSocket 协议本身在每次 close 前都会先 fire onerror —— 不直接当真。
-      // 真正"无法连上 / 重连失败"会被 onClose + reconnectCtl.attempts 兜住,在那里报。
-      console.warn("[ws.attach.error_swallowed]", { runId, isReconnect });
+      console.warn("[global.ws.error]");
     }
   });
+}
+
+function closeGlobalEventSocket() {
+  if (globalSocket.value?.close) {
+    try { globalSocket.value.close(); } catch (_) { /* ignore */ }
+  }
+  globalSocket.value = null;
+}
+
+/**
+ * 全局事件分发器:globalSocket 收到的每条事件都先过这里。
+ *
+ * 路由规则:
+ *   1) event.sessionId === 当前打开的 form.sessionId → 喂给 pushEvent,刷主对话流
+ *   2) 否则只记 sidebar 活动 / 终态红点,不污染当前视图
+ *   3) RUN_COMPLETED/FAILED/CANCELLED 时不管是不是当前 session,都顺手刷 sessionRunStatus
+ *      缓存(refreshRunStatuses 会做),确保 sidebar 标的"任务执行中"badge 跟 DB 一致
+ */
+function dispatchGlobalEvent(event) {
+  if (!event || !event.sessionId) return;
+  const isCurrent = event.sessionId === form.sessionId;
+  if (isCurrent) {
+    pushEvent(event);
+    if (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED" || event.type === "RUN_CANCELLED") {
+      refreshRun();
+      refreshSession();
+      refreshMemories();
+      refreshRecentSessions();
+    }
+    return;
+  }
+  // 不是当前 session 的事件:别去碰主对话流,只更新 sidebar 元数据
+  const slot = sessionActivity[event.sessionId] || { lastEventAt: 0, terminalType: null, runId: null };
+  slot.lastEventAt = Date.now();
+  slot.runId = event.runId || slot.runId;
+  if (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED" || event.type === "RUN_CANCELLED") {
+    slot.terminalType = event.type;
+  }
+  sessionActivity[event.sessionId] = slot;
+  // 终态时也顺便刷一下最近会话列表 / 该 session 的 run status,sidebar 的"执行中"角标该掉色就掉色
+  if (slot.terminalType) {
+    refreshRecentSessions();
+  }
 }
 
 function scheduleSessionRefresh(delay = 300) {
@@ -3063,7 +3426,7 @@ async function executeChatRequest(payload) {
       writeDropdownCache("llms", fresh);
     } catch { /* swallow, continue */ }
   }
-  if (currentStream.value) {
+  if (isActiveRunStatus(state.run?.status)) {
     state.error = "当前会话已有运行中的任务，请等待完成后再发送。";
     return;
   }
@@ -3110,6 +3473,27 @@ async function executeChatRequest(payload) {
       references: outgoingReferences,
       attachments: outgoingAttachments
     });
+    // 后端检测到 session 已经有 run 在跑 → 返回那个 run 的 runId + status="already_running"。
+    // 不消费用户输入(消息留在 composer 里给他完成后重发),直接 attach 到正在跑的 run,把它的
+    // 事件流接到当前 UI,让用户能看到正在做什么。比单纯弹一个"session is busy"有用得多。
+    if (accepted && accepted.status === "already_running") {
+      console.log("[chat.send.already_running] attach to", accepted.runId);
+      form.sessionId = accepted.sessionId;
+      state.error = "当前会话有正在运行的任务，已接入它的实时事件流。完成后请重新发送您的消息。";
+      try {
+        await attachWebSocketRun({
+          runId: accepted.runId,
+          sessionId: accepted.sessionId,
+          agentId: accepted.agentId,
+          llmConfigId: accepted.llmConfigId,
+          llmModel: accepted.llmModel,
+          userId: payload.userId || form.userId
+        });
+      } catch (attachErr) {
+        console.warn("[chat.send.already_running.attach_failed]", attachErr?.message || attachErr);
+      }
+      return;
+    }
     lastSentRequest.value = {
       message: outgoingMessage,
       references: outgoingReferences,
@@ -3153,84 +3537,10 @@ async function executeChatRequest(payload) {
     });
     await refreshRecentSessions();
 
-    const streamPayload = {
-      sessionId: accepted.sessionId,
-      agentId: accepted.agentId,
-      llmConfigId: accepted.llmConfigId || form.llmConfigId || undefined,
-      llmModel: payload.llmModel || form.llmModel || accepted.llmModel || undefined,
-      userId: form.userId || "anonymous",
-      message: outgoingMessage,
-      runId: accepted.runId
-    };
-
-    // 闭包层:记住这条 WS 订阅时的 sessionId,事件来了先对比 —— 挡住后端可能复用
-    // 同一底层连接或网络层串包的极端情况,也防住 pushEvent 那层 form.sessionId
-    // 被用户切换改动后窗口期的事件泄漏。
-    const subscribedSessionId = streamPayload.sessionId;
-    const gatedOnEvent = (event) => {
-      if (event?.sessionId && subscribedSessionId && event.sessionId !== subscribedSessionId) {
-        console.log("[ws.event.dropped_closure]", {
-          eventSessionId: event.sessionId,
-          subscribedSessionId,
-          type: event.type
-        });
-        return;
-      }
-      pushEvent(event);
-      if (event.type === "RUN_COMPLETED" || event.type === "RUN_FAILED" || event.type === "RUN_CANCELLED") {
-        cancelReconnect();
-        refreshRun();
-        refreshSession();
-        refreshMemories();
-        refreshRecentSessions();
-      }
-    };
-
-    if (transport.value === "websocket") {
-      // Arm reconnect state:这条 WS 意外断开后,WS onClose 会查 run 是否还活着;
-      // 活着就指数退避重连(后续连接走 attach_existing 分支,拿 replay + live 流)。
-      armReconnect({
-        runId: accepted.runId,
-        sessionId: accepted.sessionId,
-        agentId: accepted.agentId,
-        userId: streamPayload.userId
-      });
-      currentStream.value = createWebSocketStream({
-        ...streamPayload,
-        onOpen: () => {
-          if (reconnectCtl.runId === accepted.runId) {
-            reconnectCtl.attempts = 0;
-          }
-          if (state.error && /连接|流中断|重连/.test(state.error)) {
-            state.error = "";
-          }
-        },
-        onEvent: gatedOnEvent,
-        onClose: () => {
-          currentStream.value = null;
-          onStreamClosedMaybeReconnect();
-        },
-        onError: () => {
-          // 同上:WS 协议在每次 close 前先 fire error。重连判定全交给 onClose/reconnectCtl。
-          console.warn("[ws.send.error_swallowed]", { runId: accepted.runId });
-        }
-      });
-    } else {
-      // SSE 路径当前不做自动重连,保持原有语义(浏览器 EventSource 自己会重试)。
-      currentStream.value = createSseStream({
-        ...streamPayload,
-        onEvent: gatedOnEvent,
-        onError: () => {
-          // 浏览器 EventSource 在初次握手抖动时也会 fire error,但会自己重连。
-          // 不做 banner —— 真正终端状态由 RUN_COMPLETED/FAILED/CANCELLED 事件触发刷新。
-          console.warn("[sse.error_swallowed]", { runId: accepted.runId });
-          refreshRun();
-          refreshSession();
-          refreshMemories();
-          refreshRecentSessions();
-        }
-      });
-    }
+    // 新通信架构:不再开 per-run / per-session WebSocket。POST 已经让后端 fire-and-forget 启动
+    // run,事件会通过常驻的 globalSocket 推过来(dispatchGlobalEvent 路由到当前 form.sessionId
+    // 的视图刷新)。前端只负责确保 globalSocket 在跑就行。
+    ensureGlobalEventSocket();
 
     navigateToMenu("chat", { sessionId: accepted.sessionId, agentId: accepted.agentId });
   } catch (error) {
@@ -3279,6 +3589,8 @@ async function resendLastUserRequest() {
 async function refreshSession() {
   if (!form.sessionId) return;
   loading.session = true;
+  // 不再开 session-level WS,实时事件由 globalSocket 总线推过来 —— 这里只确保它已经在跑。
+  ensureGlobalEventSocket();
   try {
     state.session = await getSession(form.sessionId);
     syncPendingMessagesWithSession();
@@ -3287,8 +3599,39 @@ async function refreshSession() {
       refreshRecentSessions(),
       refreshRunStatuses()
     ]);
+    // 进入 / 刷新会话时,如果有 active run,先把它累积到现在的事件 snapshot 拉一份灌进 state.events,
+    // 这样 UI 立刻能看到当前进度;之后新事件由 globalSocket 自然续上,processedEventSigs 去重。
+    try {
+      await recoverActiveRunForSession();
+    } catch (recoverErr) {
+      console.warn("[refreshSession.recover_failed]", recoverErr?.message || recoverErr);
+    }
   } catch (error) {
-    state.error = error.message;
+    // session 不在(404 / 被删除 / 跨租户访问被拒)→ 静默回落到"新对话"状态。
+    // 但**有个关键陷阱**:刚发完新消息时,后端那一边 createSession 的事务还没 commit,
+    // 这个瞬间 GET /api/sessions/{id} 会短暂 404 —— 此时绝对不能跳新对话(会把用户
+    // 刚发的消息整个吞掉)。判定逻辑:只有在"页面已经持续显示这个 sessionId 一段时间
+    // 都拉不到"才认为真不在。
+    //   - state.currentRunId 存在 → 当前肯定刚发了消息 / 有活跃 run,这段时间内的 404
+    //     都是事务延迟,要重试不要跳新对话
+    //   - state.pendingMessages 非空 → 用户消息还没 echo 回来,同理
+    //   - 否则才安全跳新对话(纯粹是地址栏里塞了个老 sessionId / localStorage 缓存里有个
+    //     被别人删掉的 sessionId)。
+    const status = error?.status;
+    const looksLikeNotFound = status === 404
+      || /not\s*found|不存在|无此会话|does not exist/i.test(String(error?.message || ""));
+    const justSentOrRunning = !!state.currentRunId || state.pendingMessages.length > 0;
+    if (looksLikeNotFound && !justSentOrRunning) {
+      console.info("[refreshSession.fallback_new]", form.sessionId, status);
+      try { clearLastSessionId(); } catch (_) { /* ignore */ }
+      createNewSession();
+      return;
+    }
+    // 事务延迟造成的瞬时 404 不报错也不跳走 —— 下一次 scheduleSessionRefresh(250)
+    // 自然就拉到了。只在确实不是 404 / 不是事务延迟的场景才把错误条挂出来。
+    if (!looksLikeNotFound) {
+      state.error = error.message;
+    }
   } finally {
     loading.session = false;
   }
@@ -3429,10 +3772,18 @@ function isActiveRunStatus(status) {
   ].includes(String(status || ""));
 }
 
-function attachWebSocketRun(run) {
-  if (!run?.runId || currentStream.value) {
-    return;
-  }
+/**
+ * "刷新 / 切回会话时把 active run 状态接进来"的轻量版本。
+ *
+ * 不再开 WebSocket —— globalSocket 会自然推 live 事件;这里只做两件:
+ *   1) 把 state.currentRunId / state.run / liveAssistant 同步成那个 run 的视图
+ *   2) HTTP 拉 run 累积的事件 snapshot 灌进 state.events,让用户立刻看到当前进度
+ *
+ * 接下来 live 事件由 globalSocket 自然续上,processedEventSigs 内部按
+ * type|runId|timestamp|content 去重,snapshot 跟 globalSocket 推过来的重叠不会双计。
+ */
+async function attachWebSocketRun(run) {
+  if (!run?.runId) return;
   state.currentRunId = run.runId;
   state.run = run;
   state.resolvedAgentId = run.agentId || state.resolvedAgentId || form.agentId;
@@ -3440,36 +3791,26 @@ function attachWebSocketRun(run) {
   searchForm.sessionId = run.sessionId || form.sessionId;
   searchForm.agentId = run.agentId || searchForm.agentId;
   state.liveAssistant.runId = run.runId;
-  const attachSessionId = run.sessionId || form.sessionId;
-  const attachAgentId = run.agentId || form.agentId;
-  const attachUserId = form.userId || run.userId || "anonymous";
-  armReconnect({
-    runId: run.runId,
-    sessionId: attachSessionId,
-    agentId: attachAgentId,
-    userId: attachUserId
-  });
-  openAttachStream({
-    runId: run.runId,
-    sessionId: attachSessionId,
-    agentId: attachAgentId,
-    userId: attachUserId,
-    isReconnect: false
-  });
+  try {
+    const events = await getRunEventSnapshot(run.runId);
+    if (Array.isArray(events) && events.length) {
+      for (const evt of events) {
+        pushEvent(evt);
+      }
+    }
+  } catch (err) {
+    console.warn("[run.snapshot.failed]", run.runId, err?.message || err);
+  }
 }
 
 async function recoverActiveRunForSession() {
-  if (!form.sessionId || currentStream.value) {
-    return;
-  }
+  if (!form.sessionId) return;
   try {
     const activeRun = await getActiveRun(form.sessionId);
     if (activeRun && isActiveRunStatus(activeRun.status)) {
-      attachWebSocketRun(activeRun);
+      await attachWebSocketRun(activeRun);
     }
   } catch (error) {
-    // 进入会话时的 active-run 探查失败不该提示给用户(404 / 网络抖动 / 鉴权过期都属于"页面级噪音")。
-    // 真正 401 已经被 fetch 拦截派 auth:unauthorized 跳登录;其它情况静默,日志保留。
     console.warn("[recover.active_run.failed]", form.sessionId, error?.message || error);
   }
 }
@@ -3562,6 +3903,158 @@ async function toggleMemoryScope(note) {
     state.error = error.message;
   }
 }
+
+const memorySelection = reactive(new Set());
+// 前端切片分页:页索引 0-based,size 调整时回到第 0 页
+const memoryPage = reactive({ page: 0, size: 12 });
+const pagedMemories = computed(() => {
+  const start = memoryPage.page * memoryPage.size;
+  return state.memories.slice(start, start + memoryPage.size);
+});
+const memoryTotalPages = computed(() =>
+  Math.max(1, Math.ceil(state.memories.length / memoryPage.size))
+);
+const memoryAllSelected = computed(() => {
+  // "全选"指当前页全选(避免选中跨页)
+  if (!pagedMemories.value.length) return false;
+  return pagedMemories.value.every(n => memorySelection.has(n.id));
+});
+function toggleMemorySelection(noteId, checked) {
+  if (checked) memorySelection.add(noteId);
+  else memorySelection.delete(noteId);
+}
+function toggleSelectAllMemories(checked) {
+  if (checked) pagedMemories.value.forEach(n => memorySelection.add(n.id));
+  else pagedMemories.value.forEach(n => memorySelection.delete(n.id));
+}
+// 截断长文本(给列表预览用),完整内容用 :title 鼠标悬浮可看。
+function truncateText(text, max = 100) {
+  if (text == null) return "";
+  const s = String(text);
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+/**
+ * 通用列表分页 + 搜索 + 多选 controller。
+ * 给所有"列表管理"页面统一行为 —— 搜索 / 翻页 / 改 size / 批量选 / 批量删都走同一套 state。
+ *
+ * 用法:
+ *   const ctrl = makePagedList(
+ *     computed(() => state.catalog.agents),     // 反应式 rows 源
+ *     {
+ *       idGetter: r => r.agentId,                // 唯一 id
+ *       searchFields: ["agentId", "displayName", "description"],
+ *       size: 12
+ *     }
+ *   );
+ * 模板里:
+ *   v-for="row in ctrl.paged.value"
+ *   <input type="checkbox" :checked="ctrl.selection.has(ctrl.idOf(row))" @change="ctrl.toggle(ctrl.idOf(row), $event.target.checked)" />
+ */
+function makePagedList(rowsRef, opts) {
+  const idGetter = opts.idGetter;
+  const searchFields = opts.searchFields || [];
+  const state = reactive({
+    page: 0,
+    size: opts.size || 12,
+    keyword: ""
+  });
+  const selection = reactive(new Set());
+  const filtered = computed(() => {
+    const kw = state.keyword.trim().toLowerCase();
+    if (!kw) return rowsRef.value || [];
+    return (rowsRef.value || []).filter(row =>
+      searchFields.some(f => String(row[f] ?? "").toLowerCase().includes(kw))
+    );
+  });
+  const paged = computed(() => {
+    const start = state.page * state.size;
+    return filtered.value.slice(start, start + state.size);
+  });
+  const totalPages = computed(() => Math.max(1, Math.ceil(filtered.value.length / state.size)));
+  const allSelected = computed(() =>
+    paged.value.length > 0 && paged.value.every(r => selection.has(idGetter(r)))
+  );
+  function toggle(id, checked) {
+    if (checked) selection.add(id);
+    else selection.delete(id);
+  }
+  function toggleAll(checked) {
+    if (checked) paged.value.forEach(r => selection.add(idGetter(r)));
+    else paged.value.forEach(r => selection.delete(idGetter(r)));
+  }
+  // keyword 改 → 回到第 1 页 (在 watch 里实现)
+  watch(() => state.keyword, () => { state.page = 0; });
+  return { state, selection, filtered, paged, totalPages, allSelected, toggle, toggleAll, idOf: idGetter };
+}
+
+async function batchDeleteMemories() {
+  const ids = Array.from(memorySelection);
+  if (!ids.length) return;
+  if (!confirm(`确认批量删除 ${ids.length} 条 memory note?不可恢复。`)) return;
+  let failed = 0;
+  for (const id of ids) {
+    try { await deleteMemoryNoteAdmin(id); }
+    catch (error) { failed++; console.warn("[memory.batch_delete_failed]", id, error); }
+  }
+  memorySelection.clear();
+  await refreshMemories();
+  if (failed > 0) state.error = `批量删除 ${ids.length - failed} 条成功,${failed} 条失败`;
+}
+
+// 通用 scope 归属判定 —— 跟 SessionVisibility 三档一致:
+//   sysadmin (session.read.all)        → 看到/管理所有
+//   tenant-admin (session.read.tenant) → 仅本租户
+//   普通用户                            → 仅本人 scope
+// 用在 LLM/Skill/Knowledge/Tool/Datasource/Agent 等带 scope 字段的资源。
+function canManageScoped(row) {
+  const v = sessionVisibilityForUi.value;
+  if (v.readAll) return true;
+  const t = row.scopeType || row.scope?.scopeType || "PUBLIC";
+  if (t === "PUBLIC") return v.readAll; // 公共资源仅 sysadmin 能改
+  const tenantId = row.scopeTenantId || row.scope?.scopeTenantId || "";
+  const userId = row.scopeUserId || row.scope?.scopeUserId || "";
+  if (v.readTenant) return tenantId === v.tenantId;
+  if (t === "USER") return userId === v.userId;
+  return false;
+}
+
+// ===== 各列表统一控制器(分页/搜索/多选)=====
+const agentsList     = makePagedList(computed(() => state.catalog.agents),       { idGetter: r => r.agentId,  searchFields: ["agentId", "displayName", "description"], size: 12 });
+const llmsList       = makePagedList(computed(() => state.catalog.llms),         { idGetter: r => r.id,       searchFields: ["id", "displayName", "model", "provider", "baseUrl"], size: 12 });
+const knowledgeList  = makePagedList(computed(() => state.catalog.knowledge),    { idGetter: r => r.id,       searchFields: ["id", "title", "content", "source"], size: 12 });
+const toolsList      = makePagedList(computed(() => state.catalog.tools),        { idGetter: r => r.id,       searchFields: ["id", "toolName", "displayName", "description"], size: 12 });
+const skillsList     = makePagedList(computed(() => state.catalog.skills),       { idGetter: r => r.id,       searchFields: ["id", "skillName", "description", "agentId"], size: 12 });
+const datasourcesList= makePagedList(computed(() => state.catalog.datasources),  { idGetter: r => r.id,       searchFields: ["id", "displayName", "jdbcUrl", "username", "dialect"], size: 12 });
+const usersList      = makePagedList(computed(() => state.catalog.users),        { idGetter: r => r.id,       searchFields: ["id", "username", "displayName", "email", "preferredTenantId"], size: 12 });
+const tenantsList    = makePagedList(computed(() => state.catalog.tenants),      { idGetter: r => r.id,       searchFields: ["id", "code", "name", "kind", "description"], size: 12 });
+const rolesList      = makePagedList(computed(() => state.catalog.roles),        { idGetter: r => r.id,       searchFields: ["id", "code", "name", "description", "tenantId"], size: 12 });
+const oauthClientsList = makePagedList(computed(() => state.catalog.oauthClients), { idGetter: r => r.clientId, searchFields: ["clientId", "displayName", "ownerUserId", "description"], size: 12 });
+
+// ===== 通用批量删除模板:每个列表一个 =====
+async function runBatchDelete(list, label, deleter, refresher) {
+  const ids = Array.from(list.selection).filter(Boolean);
+  if (!ids.length) return;
+  if (!confirm(`确认批量删除 ${ids.length} 条${label}?不可恢复。`)) return;
+  let failed = 0;
+  for (const id of ids) {
+    try { await deleter(id); }
+    catch (error) { failed++; console.warn(`[${label}.batch_delete_failed]`, id, error); }
+  }
+  list.selection.clear();
+  await refresher();
+  if (failed > 0) state.error = `批量删除 ${ids.length - failed} 条成功,${failed} 条失败`;
+}
+const batchDeleteAgents      = () => runBatchDelete(agentsList,     "Agent",      deleteAgentDefinitionAdmin, async () => { await refreshCatalog(); agents.value = await listAgents(); });
+const batchDeleteLlms        = () => runBatchDelete(llmsList,       "LLM 配置",   deleteAdminLlm,             async () => { await refreshCatalog(); llms.value = await listLlms(); writeDropdownCache("llms", llms.value); });
+const batchDeleteKnowledge   = () => runBatchDelete(knowledgeList,  "知识条目",   deleteKnowledgeEntry,       refreshCatalog);
+const batchDeleteTools       = () => runBatchDelete(toolsList,      "工具定义",   deleteToolDefinition,       refreshCatalog);
+const batchDeleteSkills      = () => runBatchDelete(skillsList,     "Skill 定义", deleteSkillDefinition,      refreshCatalog);
+const batchDeleteDatasources = () => runBatchDelete(datasourcesList,"数据源",     deleteDatasource,           refreshCatalog);
+const batchDeleteUsers       = () => runBatchDelete(usersList,      "用户",       async (id) => { if (id === "admin") throw new Error("内置 admin 不可删"); await adminDeleteUser(id); }, refreshAdminCatalog);
+const batchDeleteTenants     = () => runBatchDelete(tenantsList,    "租户",       async (id) => { if (id === "system") throw new Error("system 租户不可删"); await adminDeleteTenant(id); }, refreshAdminCatalog);
+const batchDeleteRoles       = () => runBatchDelete(rolesList,      "角色",       async (id) => { if (id === "system-super-admin" || id === "system-user") throw new Error("内置角色不可删"); await adminDeleteRole(id); }, refreshAdminCatalog);
+const batchDeleteOauthClients= () => runBatchDelete(oauthClientsList,"OAuth 客户端", adminDeleteOauthClient, refreshAdminCatalog);
 
 async function removeMemoryNote(note) {
   if (!confirm(`删除这条 memory note？\n\n${note.content.slice(0, 120)}`)) {
@@ -3670,22 +4163,664 @@ async function refreshApprovals() {
   }
 }
 
+// Token 用量页:把 range 选项映射到 [from,to] ISO 字符串,然后并行拉三组数据。
+// summary 按当前 groupBy 维度;timeseries 用 day 桶在 30d 用 hour 不太合理,固定 day;
+// recent 拿最近 50 条明细。任一失败把 error 显示在面板顶部。
+async function reloadUsage() {
+  usageState.loading = true;
+  usageState.error = "";
+  try {
+    const now = new Date();
+    const rangeMs = usageState.range === "1d" ? 86400_000
+                  : usageState.range === "30d" ? 30 * 86400_000
+                  : 7 * 86400_000;
+    const fromIso = new Date(now.getTime() - rangeMs).toISOString();
+    const toIso = now.toISOString();
+    const interval = usageState.range === "1d" ? "hour" : "day";
+    const [summary, timeseries, recent] = await Promise.all([
+      fetchUsageSummary({ from: fromIso, to: toIso, groupBy: usageState.groupBy }),
+      fetchUsageTimeseries({ from: fromIso, to: toIso, interval, groupBy: "none" }),
+      fetchUsageRecent({ limit: 50 })
+    ]);
+    usageState.summary = Array.isArray(summary) ? summary : [];
+    usageState.timeseries = Array.isArray(timeseries) ? timeseries : [];
+    usageState.recent = Array.isArray(recent) ? recent : [];
+  } catch (error) {
+    usageState.error = error.message || "load usage failed";
+  } finally {
+    usageState.loading = false;
+  }
+}
+
+// 总计 = 当前 summary 全部行求和;groupBy='none' 时 summary 只有 1 行,直接拿即可。
+const usageTotal = computed(() => {
+  let prompt = 0, completion = 0, total = 0, msg = 0, run = 0, sess = 0;
+  for (const row of usageState.summary) {
+    prompt += row.promptTokens;
+    completion += row.completionTokens;
+    total += row.totalTokens;
+    msg += row.messageCount;
+    run += row.runCount;
+    sess += row.sessionCount;
+  }
+  return { promptTokens: prompt, completionTokens: completion, totalTokens: total,
+           messageCount: msg, runCount: run, sessionCount: sess };
+});
+
+// 时间序列折线图 ECharts option。groupBy='none' 时一条线;否则按维度多条线。
+// 当前简化:只画 totalTokens 一条 series,prompt/completion 留给表格细看。
+const usageChartOption = computed(() => {
+  const points = usageState.timeseries;
+  if (!points.length) return null;
+  const xs = points.map(p => p.bucketStart.replace("T", " ").slice(0, 16));
+  const ys = points.map(p => p.totalTokens);
+  return {
+    tooltip: { trigger: "axis" },
+    grid: { left: 56, right: 16, top: 16, bottom: 32 },
+    xAxis: { type: "category", data: xs, axisLabel: { rotate: 30 } },
+    yAxis: { type: "value", name: "tokens" },
+    series: [{ name: "total", type: "line", data: ys, smooth: true, areaStyle: {} }]
+  };
+});
+
+const usageGroupByLabel = computed(() => ({
+  none: "总计", tenant: "租户", app: "应用", user: "用户", agent: "Agent", model: "模型"
+})[usageState.groupBy] || usageState.groupBy);
+
+// ---------------------------------------------------------------------------------------
+// Agent 实验室 methods
+
+async function labReload() {
+  labState.loading = true;
+  labState.error = "";
+  try {
+    const [tasks, skills] = await Promise.all([
+      labListTasks(),
+      labState.allSkills.length ? Promise.resolve(labState.allSkills) : labListAllSkills().catch(() => [])
+    ]);
+    labState.tasks = tasks;
+    if (skills && Array.isArray(skills)) labState.allSkills = skills;
+  } catch (error) {
+    labState.error = error.message || "load tasks failed";
+  } finally {
+    labState.loading = false;
+  }
+}
+
+async function labOpenDetail(taskId) {
+  // 切换详情页 + 启动轮询(只在 task 仍在跑时轮询,终止后停)
+  labStopPolling();
+  labState.currentDetail = null;
+  // 切详情时清空编辑器 taskId,labReloadDetail 才会重新 prefill
+  labDetailEditor.taskId = "";
+  if (!taskId) {
+    if (route.name === "lab" && route.params.taskId) {
+      router.push({ name: "lab" });
+    }
+    return;
+  }
+  router.push({ name: "lab", params: { taskId } });
+  await labReloadDetail(taskId);
+  if (labIsRunning(labState.currentDetail?.task)) {
+    labStartPolling(taskId);
+  }
+}
+
+async function labReloadDetail(taskId) {
+  try {
+    labState.currentDetail = await labTaskDetail(taskId);
+    // 详情页内嵌编辑器跟着 task 同步:每次拉到新 detail 就 prefill 最新值,
+    // 避免用户手改了一半我们覆盖 → 只在 taskId 切换时重置
+    if (labDetailEditor.taskId !== taskId) {
+      labLoadDetailEditor(labState.currentDetail.task);
+    }
+    if (!labIsRunning(labState.currentDetail.task)) {
+      labStopPolling();
+    }
+  } catch (error) {
+    labState.error = error.message || "load detail failed";
+    labStopPolling();
+  }
+}
+
+function labIsRunning(task) {
+  if (!task) return false;
+  return task.status === "PENDING" || task.status === "RUNNING";
+}
+
+function labStartPolling(taskId) {
+  labStopPolling();
+  labState.pollingTimer = setInterval(() => labReloadDetail(taskId), 3000);
+}
+
+function labStopPolling() {
+  if (labState.pollingTimer) {
+    clearInterval(labState.pollingTimer);
+    labState.pollingTimer = null;
+  }
+}
+
+// (V38: 旧的 labStructuredTestCasesToJson / labJsonToStructuredTestCases 已删除 ——
+//  用户不再手写测试用例,改成写 constraintRules,由后端 meta-LLM 派生场景。)
+// 打开创建 modal 前强制刷一次 admin catalog,保证 LLM/Agent 下拉源是最新的。
+// 之前只信任 init 时的 refreshCatalog,如果用户中途新增 LLM 然后打开 lab,下拉里就少。
+async function labOpenCreateModal() {
+  labShowCreate.value = true;
+  try {
+    await Promise.all([
+      refreshCatalog(),
+      llms.value && llms.value.length === 0 ? listLlms().then(v => { llms.value = v; }) : Promise.resolve()
+    ]);
+  } catch (err) {
+    console.warn("[lab.open_create.refresh_failed]", err);
+  }
+}
+
+// (V38: labAddTestCase 已删除 —— UI 不再有 "+ 添加用例" 按钮。)
+
+// === "AI 帮我完善目标描述" 临时对话 state ===
+// 不持久化,关 modal 就丢。chat 记 [{role:'user|assistant', content}],
+// candidate 是 AI 给出的最新草稿(用户点 "采用此版本" 时整段替换 labForm.goalDescription)。
+// llmKey 是这个面板自己的 (configId|apiModel),独立于父 modal 的 metaLlmKey,
+// 用户可以临时换一个更适合"扩写文本"的 LLM 来辅助写目标描述。
+const labGoalChat = reactive({
+  visible: false,
+  loading: false,
+  error: "",
+  history: [],
+  candidate: "",
+  inputBuffer: "",
+  llmKey: ""           // "configId|apiModel";空 = "|" = default
+});
+
+function labOpenGoalChat() {
+  labGoalChat.visible = true;
+  labGoalChat.error = "";
+  labGoalChat.candidate = labForm.goalDescription || "";
+  labGoalChat.inputBuffer = "";
+  // LLM 默认值优先级:
+  //   1) 父 modal 已选的 Meta-LLM (labForm.metaLlm*)
+  //   2) labLlmOptions 第一条(避免 default 走到 application-default 的兜底坏 token)
+  //   3) "|"(让后端走 LlmProvider 的 default)
+  if (!labGoalChat.llmKey) {
+    if (labForm.metaLlmConfigId) {
+      labGoalChat.llmKey = `${labForm.metaLlmConfigId}|${labForm.metaLlmModel || ""}`;
+    } else if (labLlmOptions.value.length > 0) {
+      labGoalChat.llmKey = labLlmOptions.value[0].key;
+    } else {
+      labGoalChat.llmKey = "|";
+    }
+  }
+  if (!labGoalChat.history.length) {
+    labGoalChat.history = [{
+      role: "assistant",
+      content: "我可以帮你把目标描述写得更具体、更完整。你可以告诉我:输入是什么 / 期望输出什么 / 用到哪些工具或数据。我会基于当前草稿改一版给你看,你不满意可以继续让我改。"
+    }];
+  }
+}
+
+function labCloseGoalChat(commitDraft) {
+  if (commitDraft && labGoalChat.candidate && labGoalChat.candidate !== labForm.goalDescription) {
+    labForm.goalDescription = labGoalChat.candidate;
+  }
+  labGoalChat.visible = false;
+}
+
+function labResetGoalChat() {
+  labGoalChat.history = [];
+  labGoalChat.candidate = labForm.goalDescription || "";
+  labGoalChat.error = "";
+  labGoalChat.inputBuffer = "";
+}
+
+async function labSendGoalChat() {
+  const msg = labGoalChat.inputBuffer.trim();
+  if (!msg || labGoalChat.loading) return;
+  labGoalChat.loading = true;
+  labGoalChat.error = "";
+  // 即时插入用户气泡(失败时也保留,方便用户看自己问了啥)
+  labGoalChat.history.push({ role: "user", content: msg });
+  labGoalChat.inputBuffer = "";
+  try {
+    // history 给后端只发对话(不含本轮),draft 用当前 candidate(AI 上一轮给的或 form 里现有的)
+    const historyForServer = labGoalChat.history
+      .slice(0, -1)   // 排除刚 push 的本轮 user 消息
+      .filter(t => t && t.role && t.content);
+    const [chatConfigId, chatModel] = String(labGoalChat.llmKey || "|").split("|");
+    const resp = await labRefineGoal({
+      draft: labGoalChat.candidate || labForm.goalDescription || "",
+      userMessage: msg,
+      history: historyForServer,
+      llmConfigId: chatConfigId || null,
+      llmModel: chatModel || null
+    });
+    if (resp.refinedGoal) {
+      labGoalChat.candidate = resp.refinedGoal;
+    }
+    labGoalChat.history.push({
+      role: "assistant",
+      content: resp.assistantMessage || "(AI 没有提供解释)"
+    });
+  } catch (err) {
+    labGoalChat.error = err.message || "调用失败";
+    // 失败的本轮 user 消息留下,加一条 assistant 错误提示
+    labGoalChat.history.push({
+      role: "assistant",
+      content: "❌ 调用失败:" + (err.message || "未知错误") + " —— 检查 Meta-LLM 配置或网络后再试。"
+    });
+  } finally {
+    labGoalChat.loading = false;
+  }
+}
+// (V38: labRemoveTestCase / labToggleTestCasesAdvanced 已删除 —— 用户不写用例了。)
+
+async function labSubmitCreate() {
+  if (!labForm.constraintRules.trim()) {
+    labState.error = "约束规则不能为空 —— 用自然语言写若干规则,AI 据此派生测试场景";
+    return;
+  }
+  if (!labForm.title.trim() || !labForm.goalDescription.trim()) {
+    labState.error = "任务标题、目标描述都不能为空";
+    return;
+  }
+  try {
+    labCreateModal.submitting = true;
+    const created = await labCreateTask({
+      title: labForm.title.trim(),
+      goalDescription: labForm.goalDescription.trim(),
+      constraintRules: labForm.constraintRules.trim(),
+      referenceDocuments: labForm.referenceDocuments.trim() || null,
+      maxIterations: labForm.maxIterations,
+      mode: labForm.mode,
+      hostAgentMode: labForm.hostAgentMode,
+      hostAgentId: labForm.hostAgentMode === "EXISTING" ? (labForm.hostAgentId.trim() || null) : null,
+      newHostAgentId: labForm.hostAgentMode !== "EXISTING" ? (labForm.newHostAgentId.trim() || null) : null,
+      newHostAgentDisplayName: labForm.hostAgentMode !== "EXISTING" ? (labForm.newHostAgentDisplayName.trim() || null) : null,
+      newHostAgentSeedPrompt: labForm.hostAgentMode === "NEW" ? (labForm.newHostAgentSeedPrompt.trim() || null) : null,
+      newHostAgentScopeType: labForm.hostAgentMode !== "EXISTING" ? labForm.newHostAgentScopeType : null,
+      newHostAgentScopeTenantId: labForm.hostAgentMode !== "EXISTING" ? (labForm.newHostAgentScopeTenantId.trim() || null) : null,
+      cloneFromHostAgentId: labForm.hostAgentMode === "CLONE_FROM" ? (labForm.cloneFromHostAgentId.trim() || null) : null,
+      targetSkillName: labForm.targetSkillName.trim() || null,
+      newSkillName: labForm.newSkillName.trim() || null,
+      cloneFromSkillName: labForm.cloneFromSkillName.trim() || null,
+      targetScopeType: labForm.targetScopeType,
+      targetScopeTenantId: labForm.targetScopeTenantId.trim() || null,
+      allowAgentEvolution: !!labForm.allowAgentEvolution,
+      metaLlmConfigId: labForm.metaLlmConfigId.trim() || null,
+      metaLlmModel: labForm.metaLlmModel.trim() || null,
+      testLlmConfigId: labForm.testLlmConfigId.trim() || null,
+      testLlmModel: labForm.testLlmModel.trim() || null
+    });
+    // 不关 modal —— 状态面板嵌在 modal 底部,实时显示进度 + 允许停/重启/改写规则。
+    labCreateModal.activeTaskId = created.id;
+    labCreateModal.detail = null;
+    labStartCreateModalPolling(created.id);
+    await labReload();
+  } catch (error) {
+    labState.error = error.message || "create failed";
+  } finally {
+    labCreateModal.submitting = false;
+  }
+}
+
+async function labCancel(taskId) {
+  if (!confirm("确认取消该任务?当前轮迭代会被中断")) return;
+  try {
+    await labCancelTask(taskId);
+    await labReloadDetail(taskId);
+    await labReload();
+  } catch (error) {
+    labState.error = error.message;
+  }
+}
+
+async function labRestart(taskId) {
+  if (!confirm("重启会从第 1 轮重新设计 + 测试,已有迭代记录会保留")) return;
+  try {
+    await labRestartTask(taskId);
+    await labReloadDetail(taskId);
+    await labReload();
+    labStartPolling(taskId);
+  } catch (error) {
+    labState.error = error.message;
+  }
+}
+
+// 切到 /lab 时初次加载;路由参数变化时切换详情
+watch(
+  () => [activeMenu.value, route.params?.taskId],
+  ([menu, taskId]) => {
+    if (menu !== "lab") {
+      labStopPolling();
+      return;
+    }
+    labReload();
+    if (taskId) labReloadDetail(taskId);
+  },
+  { immediate: false }
+);
+
+// ---------------------------------------------------------------------------------------
+// 管理员会话审计 methods
+
+// 一次性加载租户/应用/agent 三个数据源,给筛选下拉用。
+// 错误不阻塞主流程 —— 任一失败下拉就退化成"全部"选项。
+async function adminLoadCatalog() {
+  if (adminSessionsState.catalogLoaded) return;
+  const [tRes, cRes, aRes] = await Promise.allSettled([
+    adminListTenants(),
+    adminListOauthClients(),
+    listAgentDefinitionsAdmin()
+  ]);
+  if (tRes.status === "fulfilled") adminSessionsState.tenants = tRes.value || [];
+  if (cRes.status === "fulfilled") adminSessionsState.oauthClients = cRes.value || [];
+  if (aRes.status === "fulfilled") adminSessionsState.agents = aRes.value || [];
+  adminSessionsState.catalogLoaded = true;
+}
+
+// 应用下拉:租户筛选过的;租户选"全部"则展示全部应用
+const adminAppsForSelect = computed(() => {
+  const selectedTenant = adminSessionsFilter.tenantId;
+  const all = adminSessionsState.oauthClients;
+  if (!selectedTenant) return all;
+  return all.filter(c => c.tenantId === selectedTenant);
+});
+
+// agent 下拉:租户 + 应用一起 filter;两者都"全部"则展示全部 agent
+const adminAgentsForSelect = computed(() => {
+  const selectedTenant = adminSessionsFilter.tenantId;
+  const selectedApp = adminSessionsFilter.appId;
+  return adminSessionsState.agents.filter(a => {
+    if (selectedTenant && a.scopeTenantId && a.scopeTenantId !== selectedTenant) return false;
+    if (selectedApp && a.appId && a.appId !== selectedApp) return false;
+    return true;
+  });
+});
+
+async function adminSessionsReload() {
+  adminSessionsState.loading = true;
+  adminSessionsState.error = "";
+  try {
+    await adminLoadCatalog();
+    const days = parseInt(adminSessionsFilter.fromDays, 10) || 0;
+    const fromIso = days > 0
+      ? new Date(Date.now() - days * 86400000).toISOString()
+      : null;
+    const response = await adminListSessions({
+      userId: adminSessionsFilter.userId.trim() || null,
+      tenantId: adminSessionsFilter.tenantId.trim() || null,
+      appId: adminSessionsFilter.appId.trim() || null,
+      agentId: adminSessionsFilter.agentId.trim() || null,
+      from: fromIso,
+      page: adminSessionsState.page,
+      size: adminSessionsState.size
+    });
+    adminSessionsState.rows = response.rows || [];
+    adminSessionsState.totalSessions = response.totalSessions || 0;
+    adminSessionsState.totalRuns = response.totalRuns || 0;
+    adminSessionsState.totalMessages = response.totalMessages || 0;
+    adminSessionsState.totalTokens = response.totalTokens || 0;
+  } catch (error) {
+    adminSessionsState.error = error.message || "load sessions failed";
+  } finally {
+    adminSessionsState.loading = false;
+  }
+}
+
+function toggleAdminSessionSelection(sessionId, checked) {
+  if (checked) adminSessionsSelection.add(sessionId);
+  else adminSessionsSelection.delete(sessionId);
+}
+function toggleAdminSessionsAllSelected(checked) {
+  // 全选只针对当前用户能管理的行,没权限的不会被选中(避免后端 403 一片)
+  if (checked) manageableAdminSessions.value.forEach(r => adminSessionsSelection.add(r.sessionId));
+  else manageableAdminSessions.value.forEach(r => adminSessionsSelection.delete(r.sessionId));
+}
+async function adminBatchDeleteSessions() {
+  const ids = Array.from(adminSessionsSelection);
+  if (!ids.length) return;
+  if (!confirm(`确认批量删除 ${ids.length} 个会话?这会一并删除消息 / run / event log,不可恢复。`)) {
+    return;
+  }
+  adminSessionsState.loading = true;
+  let failed = 0;
+  for (const id of ids) {
+    try { await deleteSession(id); }
+    catch (error) { failed++; console.warn("[admin.batch_delete_session_failed]", id, error); }
+  }
+  adminSessionsSelection.clear();
+  await adminSessionsReload();
+  if (failed > 0) adminSessionsState.error = `批量删除 ${ids.length - failed} 成功,${failed} 失败`;
+}
+
+// 删除会话(管理员):走已有的 deleteSession API
+async function adminDeleteSession(sessionId, sessionTitle) {
+  if (!confirm(`确认删除会话?\n\n标题:${sessionTitle || '(无标题)'}\nID:${sessionId}\n\n会话下的所有消息、run、event log 都会一并删除,不可恢复。`)) {
+    return;
+  }
+  try {
+    await deleteSession(sessionId);
+    await adminSessionsReload();
+  } catch (error) {
+    adminSessionsState.error = error.message || "delete failed";
+  }
+}
+
+// 列出 session 下所有 run,让管理员从中挑一个复盘
+async function adminOpenSessionRuns(sessionId, sessionTitle) {
+  adminRunsModal.open = true;
+  adminRunsModal.sessionId = sessionId;
+  adminRunsModal.sessionTitle = sessionTitle || "";
+  adminRunsModal.loading = true;
+  adminRunsModal.runs = [];
+  adminRunsModal.error = "";
+  try {
+    adminRunsModal.runs = await adminListSessionRuns(sessionId);
+  } catch (error) {
+    adminRunsModal.error = error.message || "load runs failed";
+  } finally {
+    adminRunsModal.loading = false;
+  }
+}
+
+function adminCloseSessionRuns() {
+  adminRunsModal.open = false;
+  adminRunsModal.runs = [];
+  adminRunsModal.sessionId = "";
+}
+
+// 从 run 列表 modal 点击"复盘"时:关掉 list modal,弹 replay modal
+async function adminOpenReplayFromList(runId) {
+  adminCloseSessionRuns();
+  await adminOpenReplay(runId);
+}
+
+async function adminOpenReplay(runId) {
+  adminReplayState.open = true;
+  adminReplayState.loading = true;
+  adminReplayState.runId = runId;
+  adminReplayState.data = null;
+  adminReplayState.steps = [];
+  adminReplayState.error = "";
+  try {
+    // 头部信息 + 行级事件并发拉。steps 是 V42 主路径,server 已经分好类;
+    // 老 run 服务端会代为解析 event_log_json 拆成同样的行结构返回。
+    const [header, steps] = await Promise.all([
+      adminGetRunReplay(runId),
+      adminGetRunSteps(runId, null).catch(() => [])
+    ]);
+    adminReplayState.data = header;
+    adminReplayState.steps = Array.isArray(steps) ? steps : [];
+  } catch (error) {
+    adminReplayState.error = error.message || "load replay failed";
+  } finally {
+    adminReplayState.loading = false;
+  }
+}
+
+function adminCloseReplay() {
+  adminReplayState.open = false;
+  adminReplayState.data = null;
+  adminReplayState.steps = [];
+  adminReplayState.runId = "";
+}
+
+// 事件源:优先 V42 行级 steps(后端 SQL 已分类、可过滤),fallback 才解析整段 JSON。
+// 都归一到 {seq, ts, type, data, _category} 这一种形状,模板下游无需感知数据源。
+const adminReplayEvents = computed(() => {
+  if (Array.isArray(adminReplayState.steps) && adminReplayState.steps.length) {
+    return adminReplayState.steps.map(s => {
+      let data = {};
+      if (s.payloadJson) {
+        try { data = JSON.parse(s.payloadJson) || {}; } catch (_e) { data = {}; }
+      }
+      return {
+        seq: s.seq,
+        ts: s.ts,
+        type: s.eventType,
+        data,
+        _category: s.category,
+        _toolName: s.toolName || null,
+        _summary: s.summary || ""
+      };
+    });
+  }
+  // 老路径兜底:服务端没拆行 + 没解析 JSON 的极端情况(理论上 service 已经代为解析,这里基本不会走)
+  const raw = adminReplayState.data?.eventLogJson;
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.map(evt => ({ ...evt, _category: classifyReplayEvent(evt) }));
+  } catch (error) {
+    return [];
+  }
+});
+
+// 把单条事件归到一个分类。toolName 来自 data.content 里的 "tool=xxx" 片段,
+// 或 data.toolName 字段。
+function classifyReplayEvent(evt) {
+  const type = evt?.type || "";
+  const content = typeof evt?.data?.content === "string" ? evt.data.content : "";
+  const toolName = extractToolName(content) || evt?.data?.toolName || "";
+  // 1. AI 调用
+  if (type === "PROMPT_SENT" || type === "LLM_RESPONSE" || type === "LLM_ATTEMPT_FAILED") return "ai";
+  // 2. 工具相关 —— 进一步按 tool 名细分
+  if (type === "TOOL_REQUESTED" || type === "TOOL_STARTED" || type === "TOOL_COMPLETED"
+      || type === "TOOL_EXECUTED" || type === "TOOL_POLICY_DECISION" || type === "APPROVAL_REQUIRED") {
+    if (toolName.startsWith("db.") || toolName === "database.query") return "db";
+    if (toolName.startsWith("file.") || toolName === "workspace.path"
+        || toolName === "doc.normalize" || toolName.startsWith("workspace.")) return "file";
+    if (toolName.startsWith("artifact.")) return "artifact";
+    return "tool-other";
+  }
+  // 3. 计划 / 阶段切换
+  if (type === "PLAN_UPDATED") return "plan";
+  // 4. RUN_STATUS:看 phase 标签里有没有 MODEL_THINKING / MODEL_RETRY,有就归 AI;否则 lifecycle
+  if (type === "RUN_STATUS") {
+    if (content.includes("phase=MODEL_THINKING") || content.includes("phase=MODEL_RETRY")) return "ai";
+    return "lifecycle";
+  }
+  // 5. 运行生命周期 + token usage 总结
+  if (type === "RUN_STARTED" || type === "RUN_COMPLETED" || type === "RUN_FAILED"
+      || type === "RUN_CANCELLED" || type === "TOKEN_USAGE") return "lifecycle";
+  return "tool-other";
+}
+
+function extractToolName(content) {
+  if (!content) return null;
+  const m = content.match(/tool=([\w.-]+)/);
+  return m ? m[1] : null;
+}
+
+// 过滤后的事件
+const adminReplayEventsFiltered = computed(() =>
+  adminReplayEvents.value.filter(e => adminReplayState.activeCategories.has(e._category))
+);
+
+// 每个分类在当前 run 里的事件数(给 chip 显示徽章)
+const adminReplayCategoryCounts = computed(() => {
+  const counts = { ai: 0, db: 0, file: 0, artifact: 0, plan: 0, "tool-other": 0, lifecycle: 0 };
+  for (const e of adminReplayEvents.value) {
+    if (counts[e._category] !== undefined) counts[e._category]++;
+  }
+  return counts;
+});
+
+function adminToggleReplayCategory(cat) {
+  if (adminReplayState.activeCategories.has(cat)) {
+    adminReplayState.activeCategories.delete(cat);
+  } else {
+    adminReplayState.activeCategories.add(cat);
+  }
+}
+function adminReplaySetCategories(cats) {
+  adminReplayState.activeCategories = new Set(cats);
+}
+function replayCategoryLabel(cat) {
+  return {
+    ai: "AI",
+    db: "数据库",
+    file: "文件",
+    artifact: "产物",
+    plan: "Plan",
+    "tool-other": "工具",
+    lifecycle: "生命周期"
+  }[cat] || cat;
+}
+
+// 切到会话审计页时初次加载;改 filter / page 时也 reload
+watch(
+  () => [activeMenu.value, adminSessionsState.page, adminSessionsState.size],
+  ([menu]) => {
+    if (menu === "admin-sessions") adminSessionsReload();
+  },
+  { immediate: false }
+);
+
+// 联动:切租户时清空当前 app/agent(如果它们不在新的过滤集合里);
+// 切 app 时清空 agent(如果不再匹配)。
+watch(
+  () => adminSessionsFilter.tenantId,
+  () => {
+    if (adminSessionsFilter.appId &&
+        !adminAppsForSelect.value.some(c => c.clientId === adminSessionsFilter.appId)) {
+      adminSessionsFilter.appId = "";
+    }
+    if (adminSessionsFilter.agentId &&
+        !adminAgentsForSelect.value.some(a => a.agentId === adminSessionsFilter.agentId)) {
+      adminSessionsFilter.agentId = "";
+    }
+  }
+);
+watch(
+  () => adminSessionsFilter.appId,
+  () => {
+    if (adminSessionsFilter.agentId &&
+        !adminAgentsForSelect.value.some(a => a.agentId === adminSessionsFilter.agentId)) {
+      adminSessionsFilter.agentId = "";
+    }
+  }
+);
+
 async function refreshCatalog() {
   loading.catalog = true;
   try {
     state.catalog.llms = await listAdminLlms();
     state.catalog.datasources = await listDatasources();
     state.catalog.agents = await listAgentDefinitionsAdmin();
+    // Skills 拉<b>全量</b>(传空 agentId,后端 listSkillDefinitions(null) 走 findAll + scope 过滤)。
+    // 这样 lab 创建的 skill 也能在 Skills 管理页看到 —— 之前按当前 chat agent 过滤会把 lab-host 的
+    // skill 漏掉。Knowledge / Tools 暂时仍按当前 agent 过滤(它们的接口要求 agentId 必填)。
+    state.catalog.skills = await listSkillDefinitions("");
     const agentId = state.resolvedAgentId || form.agentId;
     if (agentId) {
-      const [knowledge, tools, skills] = await Promise.all([
+      const [knowledge, tools] = await Promise.all([
         listKnowledgeEntries(agentId),
-        listToolDefinitions(agentId),
-        listSkillDefinitions(agentId)
+        listToolDefinitions(agentId)
       ]);
       state.catalog.knowledge = knowledge;
       state.catalog.tools = tools;
-      state.catalog.skills = skills;
     }
     // 管理后台数据按权限懒加载,缺权限直接放空数组,后端 PermissionGate 也会兜。
     await refreshAdminCatalog();
@@ -3721,6 +4856,24 @@ const recentSessionsDrawer = reactive({ open: false });
 function openRecentSessionsDrawer() { recentSessionsDrawer.open = true; }
 function closeRecentSessionsDrawer() { recentSessionsDrawer.open = false; }
 function toggleRecentSessionsDrawer() { recentSessionsDrawer.open = !recentSessionsDrawer.open; }
+
+// 最近会话搜索 + 真分页:每次都调 /api/sessions/paged 后端接口。
+// keyword + page + size 都参与过滤,后端按 SessionVisibility 过滤后返 total + rows。
+const recentSessionsFilter = reactive({ keyword: "" });
+const recentSessionsPage = reactive({ page: 0, size: 15 });
+const recentSessionsTotal = ref(0);
+const recentSessionsTotalPages = computed(() =>
+  Math.max(1, Math.ceil(recentSessionsTotal.value / recentSessionsPage.size))
+);
+
+// 搜索关键字 / 翻页 / 改 size 时都触发后端 reload(简单 debounce 避免每键打字一次请求)。
+let recentSearchTimer = null;
+watch(() => recentSessionsFilter.keyword, () => {
+  recentSessionsPage.page = 0;
+  if (recentSearchTimer) clearTimeout(recentSearchTimer);
+  recentSearchTimer = setTimeout(() => refreshRecentSessions(), 250);
+});
+watch(() => [recentSessionsPage.page, recentSessionsPage.size], () => refreshRecentSessions());
 
 // 顶部工具栏的"刷新下拉"按钮:用户主动触发,绕过 localStorage 缓存重拉 agents+llms。
 // 失败的请求保持现有 .value,成功的覆盖并写回缓存。loadingDropdownRefresh 让按钮在
@@ -3761,12 +4914,15 @@ function openCurrentSessionInConsole() {
   const sessionId = form.sessionId;
   const agentId = form.agentId || state.resolvedAgentId || "";
   const token = getEmbedAccessToken();
-  const params = new URLSearchParams();
-  if (sessionId) params.set("sessionId", sessionId);
-  if (agentId) params.set("agentId", agentId);
-  if (token) params.set("token", token);
-  const query = params.toString();
-  const href = `${window.location.origin}/chat${query ? "?" + query : ""}`;
+  // sessionId 走 path 参数 —— router 配的就是 /chat/:sessionId?,query string 形式
+  // 进来 route.params.sessionId 取不到,主控台会停在新会话空白态。
+  // agentId / token 仍走 query。
+  const tail = new URLSearchParams();
+  if (agentId) tail.set("agentId", agentId);
+  if (token) tail.set("token", token);
+  const query = tail.toString();
+  const sessionPath = sessionId ? `/chat/${encodeURIComponent(sessionId)}` : `/chat`;
+  const href = `${window.location.origin}${sessionPath}${query ? "?" + query : ""}`;
   // embed 模式新窗口打开,不替换 iframe 自身。非 embed 不显示按钮,这个分支不会走到。
   window.open(href, "_blank", "noopener,noreferrer");
 }
@@ -3818,7 +4974,13 @@ const tenantForm = reactive({ id: "", code: "", name: "", kind: "TENANT", status
 const roleForm = reactive({ id: "", tenantId: "", code: "", name: "", description: "" });
 const oauthClientForm = reactive({
   clientId: "", displayName: "", redirectUris: "[]", scopes: "[]",
-  status: "ACTIVE", ownerUserId: "", description: ""
+  status: "ACTIVE",
+  // displayEnabled = UI 显示开关,跟 status(功能开关)解耦。
+  // status=ACTIVE + displayEnabled=true → xmap 端 AI 按钮显示 + 功能可用
+  // status=ACTIVE + displayEnabled=false → AI 按钮藏(__forceShowAi(true) 可强显),功能可用
+  // status=DISABLED + 任意 displayEnabled → AI 按钮藏,功能禁用(token 颁发都被拒)
+  displayEnabled: true,
+  ownerUserId: "", description: ""
 });
 
 function openCreateUserModal() {
@@ -4176,7 +5338,7 @@ function editRoleHandler(item) {
 function openCreateOauthClientModal() {
   Object.assign(oauthClientForm, {
     clientId: "", displayName: "", redirectUris: "[]", scopes: "[]",
-    status: "ACTIVE", ownerUserId: "", description: ""
+    status: "ACTIVE", displayEnabled: true, ownerUserId: "", description: ""
   });
   openAdminModal("oauth-client");
 }
@@ -4190,7 +5352,7 @@ async function submitOauthClientSave() {
       closeAdminModal();
       Object.assign(oauthClientForm, {
         clientId: "", displayName: "", redirectUris: "[]", scopes: "[]",
-        status: "ACTIVE", ownerUserId: "", description: ""
+        status: "ACTIVE", displayEnabled: true, ownerUserId: "", description: ""
       });
       await refreshAdminCatalog();
     } else {
@@ -4204,7 +5366,7 @@ async function submitOauthClientSave() {
       });
       Object.assign(oauthClientForm, {
         clientId: "", displayName: "", redirectUris: "[]", scopes: "[]",
-        status: "ACTIVE", ownerUserId: "", description: ""
+        status: "ACTIVE", displayEnabled: true, ownerUserId: "", description: ""
       });
       await refreshAdminCatalog();
     }
@@ -4235,7 +5397,9 @@ function editOauthClientHandler(item) {
   Object.assign(oauthClientForm, {
     clientId: item.clientId, displayName: item.displayName,
     redirectUris: item.redirectUris, scopes: item.scopes,
-    status: item.status, ownerUserId: item.ownerUserId || "",
+    status: item.status,
+    displayEnabled: item.displayEnabled !== false,  // 老数据没字段时默认 true(向后兼容)
+    ownerUserId: item.ownerUserId || "",
     description: item.description || ""
   });
   openAdminModal("oauth-client");
@@ -4429,18 +5593,16 @@ async function submitLogin() {
   loginForm.error = "";
   try {
     await apiLogin(loginForm.username.trim(), loginForm.password);
-    await refreshWhoami();
     loginForm.password = "";
-    // 登录成功后必须显式 bootstrap —— router.replace 不会重新触发 onMounted,
-    // 之前的 bug 是登录路径下 agents/llms 永远是初始空数组,UI 直接弹"没有可用 LLM"。
-    // 直接进 /chat (有效 cookie) 那条路径在 onMounted 里已经跑过 initAfterAuth,
-    // 但走登录拿到 cookie 这条路径必须在这儿补上一次。
-    if (!authUser.anonymous) {
-      await initAfterAuth();
-    }
-    // 模板首先按 route.name === 'login' 判断;不跳走的话改密页永远不会渲染。
-    // 一律 replace 到 /chat —— 改密 shell 由 passwordMustChange 自己接管。
-    router.replace({ name: "chat" });
+    // 登录成功直接 **full page reload** 跳 /chat。原因:
+    //  1. token 过期重登场景下,旧 Vue 实例还残留着 currentRunId / pending message / 各种 ref,
+    //     就算 initAfterAuth 把 globalSocket 重连了,旧的 state.events / sidebar 缓存还在,
+    //     表现就是"WebSocket 连上但 UI 看起来卡死,新消息也不显示"
+    //  2. 整页 reload 走一遍 onMounted → whoami → initAfterAuth → ensureGlobalEventSocket
+    //     的全套初始化,带新 cookie 重新拉一切,跟首次登录完全一致
+    //  3. 副作用 = 用户登录界面里输的 username/password 在表单状态里清空(已经发出去登成功了
+    //     不需要保留)、新 token 是 HttpOnly cookie 浏览器自动带,reload 后照样有
+    window.location.href = "/chat";
   } catch (error) {
     loginForm.error = error?.message || String(error);
   } finally {
@@ -4450,6 +5612,9 @@ async function submitLogin() {
 
 async function submitLogout() {
   await apiLogout();
+  // 关掉常驻 WS:不属于这个用户的事件流不该再灌进来,而且后端的 AGENT_TOKEN cookie 也会被 logout
+  // 清掉,继续 reconnect 也只会被 /ws/events 拒绝。
+  closeGlobalEventSocket();
   // 登出清掉所有下拉缓存,避免下个用户首屏看到上一个账号能看到的 LLM/agent 列表。
   // 同时清掉 lastSession,下个账号不要被自动加载到上一个用户的会话上。
   clearDropdownCache();
@@ -4484,16 +5649,11 @@ async function submitChangePassword() {
   passwordChangeForm.error = "";
   try {
     await apiChangePassword(passwordChangeForm.oldPassword, passwordChangeForm.newPassword);
-    await refreshWhoami();
     passwordChangeForm.oldPassword = "";
     passwordChangeForm.newPassword = "";
-    // 首次登录 passwordMustChange=true 的用户改完密后跳 chat,如果 onMounted 当时
-    // 是匿名分支 return 的(没跑过 bootstrap),这里必须显式补一次,否则 agents/llms
-    // 列表全空,UI 弹"没有可用 LLM"。idempotent,即使已经初始化过也安全。
-    if (!authUser.anonymous) {
-      await initAfterAuth();
-    }
-    router.replace({ name: "chat" });
+    // 跟 submitLogin 同样思路:全页 reload 进 /chat。后端改完密 cookie 已经写好,
+    // reload 后走 onMounted → whoami → initAfterAuth 全套初始化,状态干净。
+    window.location.href = "/chat";
   } catch (error) {
     passwordChangeForm.error = error?.message || String(error);
   } finally {
@@ -4699,6 +5859,8 @@ function setupEmbedListener() {
 // 这条路径覆盖"cookie 过期"/"后端被重启 JWT secret 没变但 token 过期"等场景。
 function handleUnauthorized() {
   if (authUser.anonymous && route.name === "login") return;
+  // 鉴权失效:关掉常驻 WS。让它继续 reconnect 没意义,后端会一直拒。
+  closeGlobalEventSocket();
   authUser.loaded = true;
   authUser.anonymous = true;
   authUser.userId = "";
@@ -4719,6 +5881,9 @@ function handleUnauthorized() {
 // idempotent: 重复调用不会重复设 setInterval、不会叠加 click listener。
 let initAfterAuthDone = false;
 async function initAfterAuth() {
+  // 登录成功的第一件事:把全局事件 WebSocket 拉起来。它跟登录态等长,后端推过来的所有
+  // 用户有权看的 session 事件都从这条 socket 走。 idempotent — 已经开了的话 ensure 直接 no-op。
+  ensureGlobalEventSocket();
   await bootstrap();
   // 没显式带 sessionId 进来(URL query 没传)时,看 localStorage 里有没有上次访问的会话。
   // 有就自动恢复 —— 用户重开 iframe / 刷主控台不用每次从空白起步。会话不存在(被删了
@@ -4744,6 +5909,11 @@ async function initAfterAuth() {
       clearLastSessionId();
       form.sessionId = "";
     }
+  }
+  // 没有 sessionId(新登录 / 没缓存)→ 在 chat 菜单下默认进会话列表页,后台拉一份数据
+  if (activeMenu.value === "chat" && !form.sessionId) {
+    await refreshSessionsList(0).catch(error =>
+      console.warn("[initAfterAuth.sessions_list_load_failed]", error?.message || error));
   }
   await refreshMemories();
   await refreshCatalog();
@@ -4830,20 +6000,61 @@ async function refreshActiveRuns() {
   } catch (error) {
     // Don't spam console for transient network blips — just keep last snapshot.
   }
+  // Liveness 兜底:WebSocket 可能静默死(对端 RST 丢失 / 路由黑洞,onclose 没触发),
+  // 导致 chatRunBusy 永久卡在 true(currentStream 没清 + state.run.status 还是 MODEL_RUNNING)。
+  // 这里每 4s 醒一下,如果本地以为还在跑的 run 已经不在后端活跃列表里,直接拉一次 run 详情
+  // 校正状态,把 chatRunBusy 关掉。
+  try {
+    await reconcileBusyAgainstActiveRuns();
+  } catch (error) {
+    console.warn("[chat.reconcile_busy_failed]", error?.message || error);
+  }
+}
+
+async function reconcileBusyAgainstActiveRuns() {
+  const localRunId = state.currentRunId || state.run?.runId;
+  if (!localRunId) return;
+  // 我们以为它在跑(本地 state.run.status active) —— 但活跃列表里没有这个 runId
+  const stillActiveOnServer = (activeRuns.value || []).some(r => r?.runId === localRunId);
+  const localThinksBusy = isActiveRunStatus(state.run?.status);
+  if (!localThinksBusy || stillActiveOnServer) {
+    return;
+  }
+  // 服务端已经不认这个 run 还在跑了 → 强行校正:拉 DB 真值并刷会话
+  try {
+    const run = await getRun(localRunId);
+    if (run && !isActiveRunStatus(run.status)) {
+      console.warn("[chat.reconcile.run_terminal_but_local_busy]", { runId: localRunId, serverStatus: run.status });
+      state.run = run;
+      loading.sending = false;
+      await refreshSession();
+    }
+  } catch (error) {
+    // getRun 失败(可能后端短暂挂)→ 下一轮 4s 再试,不强行清状态
+    console.warn("[chat.reconcile.getRun_failed]", error?.message || error);
+  }
 }
 
 async function terminateRun(runId) {
   if (!runId) return;
-  const ok = window.confirm(`确定要终止 run ${runId.slice(0, 8)}? 后端会在下一轮循环检查时优雅退出。`);
-  if (!ok) return;
+  if (!window.confirm(`终止当前 run (${runId.slice(0, 8)})?`)) return;
+  // UI 立即生效:把当前 run 标 CANCELLED;后端 cancelRun 在后台跑,失败不回滚 UI ——
+  // "点了就停"才是合理体验。事件流由 globalSocket 自然给我们最终终态。
+  if (state.currentRunId === runId) {
+    state.liveAssistant.content = state.liveAssistant.content || "";
+    if (state.run && state.run.runId === runId) {
+      state.run = { ...state.run, status: "CANCELLED", detail: "cancelled by user" };
+    }
+  }
+  // 后端 cancel 异步打,即使失败也不回滚 UI —— 用户点了就该停,服务端走自己的清理路径
   try {
     const result = await cancelRun(runId);
-    await refreshActiveRuns();
-    const detail = result?.message || (result?.signalled ? "cancel 信号已投递" : "已强制 DB 状态");
-    console.info("run.cancel", runId, detail);
+    console.info("run.cancel", runId, result?.message);
   } catch (error) {
-    window.alert(`终止失败: ${error.message || error}`);
+    console.warn("[run.cancel.failed]", runId, error?.message || error);
   }
+  await refreshActiveRuns();
+  await refreshSession();
 }
 
 function shortRunLabel(run) {
@@ -4870,6 +6081,14 @@ watch(
       await refreshSession();
       await refreshApprovals();
       await recoverActiveRunForSession();
+    }
+    // 进入 chat 菜单但没指定 sessionId → 展示会话列表(列表组件 v-if 已经触发了模板切换,
+    // 这里负责拉数据)。比起每次切到列表都重新拉一次,我们只在"从别处进 chat 菜单/从 chat-session
+    // 切回 list"时拉。
+    if (activeMenu.value === "chat" && !form.sessionId) {
+      if (previousMenu !== "chat" || previousSessionId) {
+        await refreshSessionsList(0);
+      }
     }
     if (activeMenu.value !== "chat" && previousMenu === "chat") {
       clearStream();
@@ -4906,6 +6125,16 @@ watch(
   (next) => {
     if (next) writeLastSessionId(next, form.agentId || state.resolvedAgentId || "");
   }
+);
+
+// 切到 Token 用量页或调整 range/groupBy 时自动 reload。range/groupBy 同步触发,
+// 避免用户每改一次还要手动点刷新。
+watch(
+  () => [activeMenu.value, usageState.range, usageState.groupBy],
+  ([menu]) => {
+    if (menu === "usage") reloadUsage();
+  },
+  { immediate: false }
 );
 
 // 切会话时必须清干净的 session 维度 state —— 以前漏了 events / runPlan / liveStatus /
@@ -4962,6 +6191,135 @@ function createNewSession() {
   searchForm.sessionId = "";
   syncComposerEditor();
   navigateToMenu("chat", { sessionId: undefined });
+}
+
+// ============== 会话列表页(activeMenu==='chat' && !form.sessionId) =========================
+// 进入"会话"菜单时不直接打开旧 sessionId 的 chat 视图,而是先展示一个权限范围内的会话列表 +
+// 过滤器。点 row / 进入按钮才把 form.sessionId 设上跳进 chat 视图。
+const sessionsListState = reactive({
+  rows: [],
+  total: 0,
+  page: 0,
+  size: 20,
+  loading: false,
+  error: "",
+  keyword: "",
+  userId: "",
+  tenantId: "",
+  appId: "",
+  agentId: "",
+  runStatus: "all"
+});
+
+async function refreshSessionsList(page = sessionsListState.page) {
+  sessionsListState.loading = true;
+  sessionsListState.error = "";
+  try {
+    const data = await listSessionsPaged({
+      page,
+      size: sessionsListState.size,
+      keyword: sessionsListState.keyword,
+      userId: sessionsListState.userId,
+      tenantId: sessionsListState.tenantId,
+      appId: sessionsListState.appId,
+      agentId: sessionsListState.agentId,
+      runStatus: sessionsListState.runStatus
+    });
+    sessionsListState.rows = data.rows || [];
+    sessionsListState.total = data.total || 0;
+    sessionsListState.page = data.page ?? page;
+    sessionsListState.size = data.size ?? sessionsListState.size;
+  } catch (error) {
+    sessionsListState.error = error?.message || String(error);
+    sessionsListState.rows = [];
+    sessionsListState.total = 0;
+  } finally {
+    sessionsListState.loading = false;
+  }
+}
+
+function resetSessionsListFilters() {
+  sessionsListState.keyword = "";
+  sessionsListState.userId = "";
+  sessionsListState.tenantId = "";
+  sessionsListState.appId = "";
+  sessionsListState.agentId = "";
+  sessionsListState.runStatus = "all";
+  sessionsListState.page = 0;
+  refreshSessionsList(0);
+}
+
+function goSessionsListPage(page) {
+  refreshSessionsList(page);
+}
+
+// 点 row / "进入"按钮 → 真正切到 chat-session 视图。
+async function enterSessionFromList(sessionId, agentId) {
+  if (!sessionId) return;
+  resetSessionScopedState();
+  form.sessionId = sessionId;
+  searchForm.sessionId = sessionId;
+  if (agentId) {
+    form.agentId = agentId;
+    state.resolvedAgentId = agentId;
+    searchForm.agentId = agentId;
+  }
+  navigateToMenu("chat", { sessionId, agentId });
+  // 进入后立刻拉会话详情 + 接 active run 历史 snapshot,globalSocket 自动推 live 事件
+  try {
+    await refreshSession();
+  } catch (error) {
+    state.error = error?.message || String(error);
+  }
+}
+
+// 在列表页点"新建会话":本质就是 createNewSession,然后路由不变(因为 sessionId 仍空,template
+// 还是会显示列表 —— 但 composer 已经清空。用户在 composer 里发第一条消息时 sendChat 会建出新
+// session,系统跳到 chat-session 视图。
+function openNewSessionFromList() {
+  createNewSession();
+  // 没立刻进 chat,先让用户在沉浸式输入框里输内容:不,实际上 createNewSession 已经把 form.sessionId
+  // 置空了,template 还是会显示列表页。我们要给"用户期望立刻看到一个空白对话框"的体验 —— 走
+  // sendChat 路径太重(要先输内容)。最简单:直接构造一个临时 sessionId 进 chat 视图。
+  const tempId = generateClientSessionId();
+  enterSessionFromList(tempId, form.agentId || state.resolvedAgentId || "");
+}
+
+function generateClientSessionId() {
+  // 前端预生成 UUID,sendChat 时会用这个 id 真的注册到后端。规则跟后端 UUID.randomUUID() 兼容。
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // 兜底:时间戳 + 随机数,够用。
+  return "fe-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+// 在 chat-session 视图里点"← 返回会话列表":真的离开 chat 状态。
+// 后续 globalSocket 收到当前 session 的事件 dispatchGlobalEvent 会因为 form.sessionId 空而静默丢弃,
+// 不污染列表页。run 还在跑(POST send 已经 fire-and-forget),回到列表会看到它在"运行中"过滤里。
+function leaveSessionToList() {
+  resetSessionScopedState();
+  form.sessionId = "";
+  searchForm.sessionId = "";
+  navigateToMenu("chat", { sessionId: undefined });
+  refreshSessionsList(sessionsListState.page);
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return String(ts);
+    return d.toLocaleString();
+  } catch (_) {
+    return String(ts);
+  }
+}
+
+function shortText(text, max = 20) {
+  if (text == null) return "";
+  const s = String(text);
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
 
 function resetLlmForm() {
@@ -5562,15 +6920,26 @@ function formatTimelineEventContent(event) {
             <div class="active-run-info">
               <strong :title="run.runId">{{ shortRunLabel(run) }}</strong>
               <span class="active-run-status">{{ run.status || "running" }}</span>
+              <span v-if="run.userId" class="active-run-owner" :title="run.userId">{{ shortText(run.userId, 12) }}</span>
             </div>
-            <button
-              type="button"
-              class="active-run-cancel"
-              @click="terminateRun(run.runId)"
-              title="终止这个 run"
-            >
-              终止
-            </button>
+            <div class="active-run-actions">
+              <button
+                type="button"
+                class="active-run-enter"
+                @click="enterSessionFromList(run.sessionId, run.agentId)"
+                title="进入此会话"
+              >
+                进入
+              </button>
+              <button
+                type="button"
+                class="active-run-cancel"
+                @click="terminateRun(run.runId)"
+                title="终止这个 run"
+              >
+                终止
+              </button>
+            </div>
           </li>
         </ul>
       </div>
@@ -5589,7 +6958,98 @@ function formatTimelineEventContent(event) {
         </div>
       </header>
 
-      <section v-if="activeMenu === 'chat'" class="workspace-panel chat-workspace">
+      <section v-if="activeMenu === 'chat' && !form.sessionId" class="workspace-panel sessions-list-panel">
+        <header class="sessions-list-header">
+          <div>
+            <h2>会话列表</h2>
+            <p class="sessions-list-sub">当前权限范围内的所有会话。选一行进入会话视图。</p>
+          </div>
+          <button class="primary" @click="openNewSessionFromList">新建会话</button>
+        </header>
+        <div class="sessions-list-filters">
+          <label class="sessions-filter-field">
+            <span>关键字</span>
+            <input v-model="sessionsListState.keyword" placeholder="搜 title / sessionId / agentId"
+                   @keyup.enter="refreshSessionsList()">
+          </label>
+          <label class="sessions-filter-field">
+            <span>用户 ID</span>
+            <input v-model="sessionsListState.userId" placeholder="精确匹配"
+                   @keyup.enter="refreshSessionsList()">
+          </label>
+          <label class="sessions-filter-field">
+            <span>租户 ID</span>
+            <input v-model="sessionsListState.tenantId" placeholder="精确匹配(仅 sysadmin)"
+                   @keyup.enter="refreshSessionsList()">
+          </label>
+          <label class="sessions-filter-field">
+            <span>App ID</span>
+            <input v-model="sessionsListState.appId" placeholder="精确匹配"
+                   @keyup.enter="refreshSessionsList()">
+          </label>
+          <label class="sessions-filter-field">
+            <span>Agent</span>
+            <select v-model="sessionsListState.agentId" @change="refreshSessionsList()">
+              <option value="">全部</option>
+              <option v-for="a in agents" :key="a.agentId" :value="a.agentId">
+                {{ a.displayName || a.agentId }}
+              </option>
+            </select>
+          </label>
+          <label class="sessions-filter-field">
+            <span>运行状态</span>
+            <select v-model="sessionsListState.runStatus" @change="refreshSessionsList()">
+              <option value="all">全部</option>
+              <option value="running">运行中</option>
+              <option value="idle">空闲</option>
+            </select>
+          </label>
+          <button class="sessions-filter-apply" @click="refreshSessionsList()">应用</button>
+          <button class="sessions-filter-reset" @click="resetSessionsListFilters()">重置</button>
+        </div>
+        <div v-if="sessionsListState.loading" class="sessions-list-loading">加载中…</div>
+        <div v-else-if="sessionsListState.error" class="sessions-list-error">{{ sessionsListState.error }}</div>
+        <div v-else-if="!sessionsListState.rows.length" class="sessions-list-empty">
+          没有符合条件的会话。点击"新建会话"创建一个。
+        </div>
+        <table v-else class="sessions-list-table">
+          <thead>
+            <tr>
+              <th>会话</th>
+              <th>Agent</th>
+              <th>用户</th>
+              <th>最近更新</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in sessionsListState.rows" :key="row.sessionId" class="sessions-list-row"
+                @click="enterSessionFromList(row.sessionId, row.agentId)">
+              <td>
+                <div class="sessions-list-title">{{ row.title || '(无标题)' }}</div>
+                <div class="sessions-list-id">{{ row.sessionId }}</div>
+              </td>
+              <td>{{ row.agentId }}</td>
+              <td>{{ row.userId }}</td>
+              <td>{{ formatTimestamp(row.updatedAt) }}</td>
+              <td>
+                <button class="sessions-list-enter" @click.stop="enterSessionFromList(row.sessionId, row.agentId)">进入</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="sessionsListState.total > sessionsListState.size" class="sessions-list-pager">
+          <button :disabled="sessionsListState.page <= 0" @click="goSessionsListPage(sessionsListState.page - 1)">上一页</button>
+          <span>第 {{ sessionsListState.page + 1 }} / {{ Math.ceil(sessionsListState.total / sessionsListState.size) }} 页 · 共 {{ sessionsListState.total }} 条</span>
+          <button :disabled="(sessionsListState.page + 1) * sessionsListState.size >= sessionsListState.total"
+                  @click="goSessionsListPage(sessionsListState.page + 1)">下一页</button>
+        </div>
+      </section>
+
+      <section v-if="activeMenu === 'chat' && form.sessionId" class="workspace-panel chat-workspace">
+        <div class="chat-back-bar">
+          <button class="chat-back-button" @click="leaveSessionToList">← 返回会话列表</button>
+        </div>
         <aside v-if="isPlanPanelVisible" class="run-plan-panel" :class="{ collapsed: state.runPlan.collapsed }">
           <header class="run-plan-header">
             <span class="run-plan-dot" aria-hidden="true"></span>
@@ -5652,13 +7112,7 @@ function formatTimelineEventContent(event) {
                   </option>
                 </select>
               </label>
-              <!-- embed 模式下默认 WebSocket,不让用户切传输方式 -->
-              <label v-if="!embedMode" class="bar-field bar-field-compact bar-field-plain">
-                <select v-model="transport">
-                  <option value="sse">SSE</option>
-                  <option value="websocket">WebSocket</option>
-                </select>
-              </label>
+              <!-- transport 切换 UI 已删:新通信架构下统一走 globalSocket(WebSocket),SSE 路径已下线 -->
               <!-- 刷新下拉:绕过 localStorage 缓存重拉 agents+llms,用户主动触发的兜底 -->
               <button
                 type="button"
@@ -5776,7 +7230,19 @@ function formatTimelineEventContent(event) {
                       </div>
                     </div>
                   </template>
-                  <pre v-else-if="block.message.toolResultJson" class="tool-payload">{{ block.message.toolResultJson }}</pre>
+                  <!-- 这里之前有个 <pre> 兜底,把 db.query 的整段 rows/sql JSON dump 到聊天里 ——
+                       彻底删掉。中间工具结果不应该出现在聊天,只有用户最终交付物(artifact / markdown)
+                       才走上面的 template 分支显示出来。transcriptMessages 也已经在源头过滤,
+                       这里是双保险:即使错放进 transcriptMessages 也不再 dump JSON。 -->
+                  <!-- 本次 LLM 调用 token 用量。仅 assistant 气泡且后端返回了 usage 才显示。 -->
+                  <div
+                    v-if="block.message.role === 'assistant' && block.message.totalTokens"
+                    class="bubble-token-usage"
+                  >
+                    ↳ 本次消耗 {{ block.message.totalTokens.toLocaleString() }} tokens
+                    (输入 {{ (block.message.promptTokens || 0).toLocaleString() }} /
+                     输出 {{ (block.message.completionTokens || 0).toLocaleString() }})
+                  </div>
                 </article>
                 <article v-else-if="block.kind === 'live'" class="bubble assistant live">
                   <div class="bubble-meta">
@@ -5874,7 +7340,8 @@ function formatTimelineEventContent(event) {
                         </div>
                       </div>
                     </template>
-                    <pre v-else-if="parseToolEventContent(block.event.content).payload" class="tool-payload">{{ parseToolEventContent(block.event.content).payload }}</pre>
+                    <!-- 没有 <pre> 兜底:db.query 的 table JSON / tool_error 等内部数据不再 dump 到聊天。
+                         上方 summary 一句话足够提示"这步工具完成了";要看完整 payload 去 Run 复盘。 -->
                   </template>
                   <template v-else-if="block.event.dynamic">
                     <p class="loading-line">
@@ -6124,14 +7591,32 @@ function formatTimelineEventContent(event) {
         <div class="panel-title">
           <h3>长期记忆</h3>
           <span>{{ state.memories.length }} notes</span>
-          <button class="primary" @click="openMemoryEditor(null)">新增</button>
+          <button class="primary" style="margin-left:auto;" @click="openMemoryEditor(null)">新增</button>
+        </div>
+        <!-- 工具栏(全选 + 批量删除)单独一行,避开 .panel-actions button 28px 压扁规则 -->
+        <div class="memory-toolbar">
+          <label class="memory-toolbar-check">
+            <input type="checkbox" :checked="memoryAllSelected" @change="toggleSelectAllMemories($event.target.checked)" />
+            全选
+          </label>
+          <button :disabled="!memorySelection.size" class="memory-batch-delete"
+                  @click="batchDeleteMemories">
+            批量删除 ({{ memorySelection.size }})
+          </button>
         </div>
         <p class="empty-state" style="margin:0 0 10px; padding:8px 12px;">
           <strong>scope=agent</strong> 的备注跨所有会话可见（类似"长期记忆"）；<strong>scope=session</strong> 仅本会话可见（避免跨会话数据泄露）。
           一键点击"pin/unpin"可在两者间切换。
         </p>
         <div class="memory-grid">
-          <article v-for="note in state.memories" :key="note.id" class="memory-note">
+          <article v-for="note in pagedMemories" :key="note.id" class="memory-note"
+                   :class="{ 'memory-note-selected': memorySelection.has(note.id) }">
+            <button class="memory-select-toggle"
+                    :class="{ 'on': memorySelection.has(note.id) }"
+                    :title="memorySelection.has(note.id) ? '取消选择' : '选择此条用于批量删除'"
+                    @click="toggleMemorySelection(note.id, !memorySelection.has(note.id))">
+              {{ memorySelection.has(note.id) ? '✓' : '○' }}
+            </button>
             <div class="bubble-meta">
               <strong>
                 <span :class="['event-chip', note.scope === 'agent' ? 'scope-agent' : note.scope === 'global' ? 'scope-global' : 'scope-session']">
@@ -6141,7 +7626,7 @@ function formatTimelineEventContent(event) {
               </strong>
               <span>{{ note.updatedAt || note.createdAt }}</span>
             </div>
-            <p>{{ note.content }}</p>
+            <p class="memory-note-content" :title="note.content">{{ truncateText(note.content, 100) }}</p>
             <div class="catalog-row-actions">
               <button @click="toggleMemoryScope(note)">
                 {{ note.scope === 'agent' ? 'unpin（降回 session）' : 'pin（升到 agent）' }}
@@ -6152,7 +7637,983 @@ function formatTimelineEventContent(event) {
           </article>
           <div v-if="!state.memories.length" class="empty-state">当前 agent 还没有持久化 memory note。</div>
         </div>
+        <!-- 长期记忆分页:前端切片,数据量大时仍是全量拉但 UI 不卡 -->
+        <div v-if="state.memories.length > memoryPage.size" class="list-pager">
+          <button @click="memoryPage.page = Math.max(0, memoryPage.page - 1)" :disabled="memoryPage.page === 0">上一页</button>
+          <span>第 {{ memoryPage.page + 1 }} / {{ memoryTotalPages }} 页 · 共 {{ state.memories.length }} 条</span>
+          <button @click="memoryPage.page = Math.min(memoryTotalPages - 1, memoryPage.page + 1)"
+                  :disabled="memoryPage.page >= memoryTotalPages - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="memoryPage.size" @change="memoryPage.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
+        </div>
       </section>
+
+      <section v-if="activeMenu === 'usage'" class="workspace-panel usage-panel">
+        <div class="panel-title">
+          <h3>Token 用量</h3>
+          <div class="usage-controls">
+            <select v-model="usageState.range">
+              <option value="1d">最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+              <option value="30d">最近 30 天</option>
+            </select>
+            <select v-model="usageState.groupBy">
+              <option value="none">总计(不分组)</option>
+              <option value="tenant">按租户</option>
+              <option value="app">按应用</option>
+              <option value="user">按用户</option>
+              <option value="agent">按 Agent</option>
+              <option value="model">按模型</option>
+            </select>
+            <button @click="reloadUsage" :disabled="usageState.loading">{{ usageState.loading ? '加载中...' : '刷新' }}</button>
+          </div>
+        </div>
+        <div v-if="usageState.error" class="empty-state" style="color:#c0392b;">{{ usageState.error }}</div>
+
+        <!-- 概览卡片 -->
+        <div class="usage-summary-cards">
+          <div class="usage-card">
+            <div class="usage-card-label">总 token</div>
+            <div class="usage-card-value">{{ usageTotal.totalTokens.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">输入 token</div>
+            <div class="usage-card-value">{{ usageTotal.promptTokens.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">输出 token</div>
+            <div class="usage-card-value">{{ usageTotal.completionTokens.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">会话 / Run / 消息</div>
+            <div class="usage-card-value">{{ usageTotal.sessionCount }} / {{ usageTotal.runCount }} / {{ usageTotal.messageCount }}</div>
+          </div>
+        </div>
+
+        <!-- 时间序列折线 -->
+        <div v-if="usageChartOption" class="usage-chart-block">
+          <EchartsBlock :option="usageChartOption" />
+        </div>
+        <div v-else-if="!usageState.loading" class="empty-state">该时间范围无数据。</div>
+
+        <!-- 分组聚合表(groupBy=none 跳过表格,只显示概览) -->
+        <table v-if="usageState.summary.length && usageState.groupBy !== 'none'" class="usage-table">
+          <thead>
+            <tr>
+              <th>{{ usageGroupByLabel }}</th>
+              <th>输入</th>
+              <th>输出</th>
+              <th>总计</th>
+              <th>消息数</th>
+              <th>Run 数</th>
+              <th>会话数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in usageState.summary" :key="(row.groupValue || '_null') + row.groupKey">
+              <td>{{ row.groupValue || '(未设置)' }}</td>
+              <td>{{ row.promptTokens.toLocaleString() }}</td>
+              <td>{{ row.completionTokens.toLocaleString() }}</td>
+              <td><strong>{{ row.totalTokens.toLocaleString() }}</strong></td>
+              <td>{{ row.messageCount }}</td>
+              <td>{{ row.runCount }}</td>
+              <td>{{ row.sessionCount }}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- 最近明细 -->
+        <h4 style="margin: 24px 0 12px;">最近明细 (50 条)</h4>
+        <table v-if="usageState.recent.length" class="usage-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>会话</th>
+              <th>租户 / 应用 / 用户</th>
+              <th>Agent</th>
+              <th>输入</th>
+              <th>输出</th>
+              <th>总计</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in usageState.recent" :key="row.messageId">
+              <td>{{ row.createdAt.replace('T', ' ').slice(0, 16) }}</td>
+              <td><code>{{ row.sessionTitle || row.sessionId.slice(0, 8) }}</code></td>
+              <td>{{ row.tenantId || '-' }} / {{ row.appId || '-' }} / {{ row.userId || '-' }}</td>
+              <td>{{ row.agentId }}</td>
+              <td>{{ (row.promptTokens || 0).toLocaleString() }}</td>
+              <td>{{ (row.completionTokens || 0).toLocaleString() }}</td>
+              <td><strong>{{ (row.totalTokens || 0).toLocaleString() }}</strong></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else-if="!usageState.loading" class="empty-state">暂无明细。</div>
+      </section>
+
+      <section v-if="activeMenu === 'lab'" class="workspace-panel lab-panel">
+        <div class="panel-title">
+          <h3>Agent 实验室</h3>
+          <span class="hint">用 AI 自动迭代设计 Agent / Skill,直到通过你给的测试用例</span>
+          <div class="panel-actions">
+            <button @click="labReload" :disabled="labState.loading">{{ labState.loading ? '加载中...' : '刷新' }}</button>
+            <button class="primary" @click="labOpenCreateModal">新建任务</button>
+          </div>
+        </div>
+        <div v-if="labState.error" class="empty-state" style="color:#c0392b;">{{ labState.error }}</div>
+
+        <!-- 详情视图(选中某个 task 时):任务概览 + iteration 时间线 -->
+        <div v-if="labState.currentDetail" class="lab-detail">
+          <div class="lab-detail-head">
+            <button @click="labOpenDetail(null)">← 返回列表</button>
+            <h4>{{ labState.currentDetail.task.title }}</h4>
+            <span class="lab-status" :class="'status-' + (labState.currentDetail.task.status || '').toLowerCase()">{{ labState.currentDetail.task.status }}</span>
+            <div class="panel-actions" style="margin-left:auto;">
+              <button v-if="labIsRunning(labState.currentDetail.task)" @click="labCancel(labState.currentDetail.task.id)">⏹ 取消运行</button>
+              <!-- 不再放裸"重启"按钮 —— 失败的任务原参数重跑只会再失败一次。
+                   用户改 LLM / 规则后从下方"调参面板"提交 → 自动重启。 -->
+            </div>
+          </div>
+          <div class="lab-detail-meta">
+            <div><strong>目标:</strong> {{ labState.currentDetail.task.goalDescription }}</div>
+            <div v-if="(labState.currentDetail.task.targetType || 'SKILL') === 'SKILL'">
+              <strong>模式:</strong> {{ labState.currentDetail.task.mode }}
+              · <strong>Host Agent:</strong> <code>{{ labState.currentDetail.task.targetAgentId }}</code>
+              · <strong>目标 Skill:</strong> <code>{{ labState.currentDetail.task.targetSkillName || '(未设)' }}</code>
+              <span v-if="labState.currentDetail.task.cloneFromSkillName">
+                · <strong>克隆自:</strong> <code>{{ labState.currentDetail.task.cloneFromSkillName }}</code>
+              </span>
+              <span v-if="labState.currentDetail.task.targetScopeType">
+                · <strong>scope:</strong> {{ labState.currentDetail.task.targetScopeType }}<span v-if="labState.currentDetail.task.targetScopeTenantId">/{{ labState.currentDetail.task.targetScopeTenantId }}</span>
+              </span>
+            </div>
+            <div v-else>
+              <strong>模式:</strong> AGENT-{{ labState.currentDetail.task.mode }}
+              · <strong>目标 Agent:</strong> <code>{{ labState.currentDetail.task.targetAgentId }}</code>
+              <span v-if="labState.currentDetail.task.cloneFromAgentId">
+                · <strong>克隆自:</strong> <code>{{ labState.currentDetail.task.cloneFromAgentId }}</code>
+              </span>
+              <span class="lab-legacy-tag">(老任务)</span>
+            </div>
+            <div>
+              <strong>Meta-LLM:</strong> <code>{{ labState.currentDetail.task.metaLlmConfigId || labState.currentDetail.task.llmConfigId || '(default)' }}</code>
+              · <strong>Test-LLM:</strong> <code>{{ labState.currentDetail.task.testLlmConfigId || '(Agent 默认)' }}</code>
+              · <strong>迭代:</strong> {{ labState.currentDetail.task.currentIteration }} / {{ labState.currentDetail.task.maxIterations }}
+            </div>
+            <div v-if="labState.currentDetail.task.finalSummary"><strong>结果:</strong> {{ labState.currentDetail.task.finalSummary }}</div>
+            <div v-if="labState.currentDetail.task.errorDetail" style="color:#c0392b;"><strong>错误:</strong> {{ labState.currentDetail.task.errorDetail }}</div>
+          </div>
+
+          <!-- 详情页内嵌"编辑+重启"面板:换 LLM / 改约束规则 / 改参考文档,一键覆盖+重跑 -->
+          <details class="lab-detail-editor"
+                   :class="{ 'lab-detail-editor-failed': ['FAILED','FAILED_META_LLM','CANCELLED'].includes((labState.currentDetail.task.status||'').toUpperCase()) }"
+                   :open="labDetailEditor.expanded"
+                   @toggle="labDetailEditor.expanded = $event.target.open">
+            <summary>
+              <strong>✏️ 调整 LLM / 约束规则后重新运行</strong>
+              <span class="lab-field-hint">
+                改任意一项后点底部"保存并重启迭代",AI 会按新设置重新派生测试场景并从第 1 轮跑。
+                已有迭代记录保留。
+              </span>
+            </summary>
+            <!-- 失败 / 取消态简短提示 -->
+            <div v-if="['FAILED','FAILED_META_LLM','CANCELLED'].includes((labState.currentDetail.task.status||'').toUpperCase())"
+                 class="lab-detail-editor-fail-banner">
+              ⚠ 上次失败,改 LLM 或规则后重新运行。
+            </div>
+            <div class="lab-detail-editor-body">
+              <div class="lab-form-row">
+                <label class="lab-field" style="flex: 2 1 0;">
+                  <span class="lab-field-label">任务标题</span>
+                  <input v-model="labDetailEditor.title" placeholder="任务标题(可改)" />
+                </label>
+                <label class="lab-field" style="flex: 0 0 160px;">
+                  <span class="lab-field-label">最大迭代次数</span>
+                  <input type="number" v-model.number="labDetailEditor.maxIterations" min="1" max="20" />
+                </label>
+              </div>
+              <label class="lab-field">
+                <span class="lab-field-label">目标描述</span>
+                <textarea v-model="labDetailEditor.goalDescription" rows="3"
+                          placeholder="任务目标:输入是什么、期望输出什么、用到哪些工具/数据"></textarea>
+              </label>
+              <div class="lab-form-row">
+                <label class="lab-field">
+                  <span class="lab-field-label">Meta-LLM(设计师)</span>
+                  <select v-model="labDetailEditor.metaLlmKey">
+                    <option value="|">— default —</option>
+                    <option v-for="opt in labLlmOptions" :key="'detail-meta-' + opt.key" :value="opt.key">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                </label>
+                <label class="lab-field">
+                  <span class="lab-field-label">Test-LLM(跑测试)</span>
+                  <select v-model="labDetailEditor.testLlmKey">
+                    <option value="|">— Agent 默认 —</option>
+                    <option v-for="opt in labLlmOptions" :key="'detail-test-' + opt.key" :value="opt.key">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                </label>
+              </div>
+              <label class="lab-field">
+                <span class="lab-field-label">约束规则 <em>*</em></span>
+                <textarea v-model="labDetailEditor.constraintRules" rows="6"
+                          placeholder="自然语言写若干约束规则,AI 据此派生测试场景"></textarea>
+              </label>
+              <label class="lab-field">
+                <span class="lab-field-label">参考文档(可选)</span>
+                <textarea v-model="labDetailEditor.referenceDocuments" rows="4"
+                          placeholder="数据字典 / 业务规范 / 样例;留空 = 清空"></textarea>
+              </label>
+              <div class="lab-detail-editor-actions">
+                <button class="primary"
+                        :disabled="labDetailEditor.saving"
+                        @click="labDetailEditorSaveAndRestart">
+                  {{ labDetailEditor.saving ? '提交中...' : '🚀 保存并重新运行' }}
+                </button>
+                <button @click="labLoadDetailEditor(labState.currentDetail.task)" :disabled="labDetailEditor.saving">
+                  ↺ 重置为当前任务值
+                </button>
+                <span class="lab-field-hint" style="flex:1;">
+                  当前 LLM:Meta=<code>{{ labState.currentDetail.task.metaLlmConfigId || '(default)' }}</code>
+                  · Test=<code>{{ labState.currentDetail.task.testLlmConfigId || '(Agent 默认)' }}</code>
+                </span>
+              </div>
+            </div>
+          </details>
+
+          <h4 style="margin: 24px 0 12px;">迭代时间线 ({{ labState.currentDetail.iterations.length }} 轮)</h4>
+          <div v-for="iter in labState.currentDetail.iterations" :key="iter.id" class="lab-iter-card"
+               :class="{ 'lab-iter-running': iter.status === 'IN_PROGRESS' }">
+            <div class="lab-iter-head">
+              <strong>第 {{ iter.iterationNo }} 轮</strong>
+              <span class="lab-iter-status" :class="'status-' + (iter.status || '').toLowerCase()">{{ iter.status }}</span>
+              <span v-if="iter.totalCount !== null" class="lab-iter-pass">{{ iter.passedCount }} / {{ iter.totalCount }} 通过</span>
+              <span class="lab-iter-time">{{ (iter.createdAt || '').replace('T', ' ').slice(0, 19) }}</span>
+            </div>
+            <!-- 实时进度:IN_PROGRESS 时显示 progressStep,让用户知道正在做什么 -->
+            <div v-if="iter.status === 'IN_PROGRESS' && iter.progressStep" class="lab-iter-progress">
+              <span class="lab-iter-progress-spinner">⏳</span> {{ iter.progressStep }}
+            </div>
+            <div v-if="iter.evaluationSummary" class="lab-iter-summary">{{ iter.evaluationSummary }}</div>
+            <div v-if="iter.metaLlmError" style="color:#c0392b; padding:8px 0;">meta-LLM 错误: {{ iter.metaLlmError }}</div>
+            <details class="lab-iter-details" :open="iter.status === 'IN_PROGRESS'">
+              <summary>{{ iter.status === 'IN_PROGRESS' ? '本轮已产出(实时刷)' : '查看本轮 Agent / Skill / 测试结果' }}</summary>
+              <div class="lab-snapshot-block">
+                <div class="lab-snapshot-label">Agent 配置</div>
+                <pre v-if="iter.agentSnapshotJson">{{ iter.agentSnapshotJson }}</pre>
+                <div v-else class="muted" style="padding:6px 0;font-style:italic;">(meta-LLM 还没返回)</div>
+              </div>
+              <div class="lab-snapshot-block">
+                <div class="lab-snapshot-label">Skill 列表</div>
+                <pre v-if="iter.skillSnapshotsJson && iter.skillSnapshotsJson !== '[]'">{{ iter.skillSnapshotsJson }}</pre>
+                <div v-else class="muted" style="padding:6px 0;font-style:italic;">(meta-LLM 还没返回)</div>
+              </div>
+              <div class="lab-snapshot-block">
+                <div class="lab-snapshot-label">测试结果(规则评估)</div>
+                <pre v-if="iter.testResultsJson">{{ iter.testResultsJson }}</pre>
+                <div v-else class="muted" style="padding:6px 0;font-style:italic;">(还没跑测试场景)</div>
+              </div>
+              <div class="lab-snapshot-block">
+                <div class="lab-snapshot-label">完整运行 trace(每个用例的真实 chat run / tool 调用 / SkillGuard 决策)</div>
+                <pre v-if="iter.runTracesJson">{{ iter.runTracesJson }}</pre>
+                <div v-else class="muted" style="padding:6px 0;font-style:italic;">(还没跑测试场景)</div>
+              </div>
+              <div v-if="iter.fixPlanJson" class="lab-snapshot-block">
+                <div class="lab-snapshot-label">下一轮修复建议</div>
+                <pre>{{ iter.fixPlanJson }}</pre>
+              </div>
+            </details>
+          </div>
+          <div v-if="!labState.currentDetail.iterations.length" class="empty-state">还没有迭代,可能 meta-LLM 调用还在进行中...</div>
+        </div>
+
+        <!-- 列表视图(默认):任务表格 -->
+        <table v-else-if="labState.tasks.length" class="usage-table lab-task-table">
+          <thead>
+            <tr>
+              <th>标题</th>
+              <th>状态</th>
+              <th>迭代</th>
+              <th>创建时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="task in labState.tasks" :key="task.id">
+              <td>
+                <a @click="labOpenDetail(task.id)" style="cursor:pointer; color:#1a73e8;">{{ task.title }}</a>
+                <div style="font-size:11px; color:rgba(0,0,0,0.4);">{{ task.id }}</div>
+              </td>
+              <td><span class="lab-status" :class="'status-' + (task.status || '').toLowerCase()">{{ task.status }}</span></td>
+              <td>{{ task.currentIteration }} / {{ task.maxIterations }}</td>
+              <td>{{ task.createdAt.replace('T', ' ').slice(0, 19) }}</td>
+              <td>
+                <button @click="labOpenDetail(task.id)">详情</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else-if="!labState.loading" class="empty-state">还没有任务,点"新建任务"开始。</div>
+      </section>
+
+      <section v-if="activeMenu === 'admin-sessions'" class="workspace-panel admin-sessions-panel">
+        <div class="panel-title">
+          <h3>会话审计</h3>
+          <span class="hint">系统/租户管理员可见。后端按 SessionVisibility 自动过滤(系统管理员看全;租户管理员看本租户)。</span>
+          <div class="panel-actions">
+            <button @click="adminSessionsReload" :disabled="adminSessionsState.loading">{{ adminSessionsState.loading ? '加载中...' : '刷新' }}</button>
+          </div>
+        </div>
+        <div v-if="adminSessionsState.error" class="empty-state" style="color:#c0392b;">{{ adminSessionsState.error }}</div>
+
+        <!-- 筛选区(租户 → 应用 → agent 三级联动,改一级清空下游) -->
+        <div class="admin-sessions-filters">
+          <label class="lab-field"><span class="lab-field-label">租户</span>
+            <select v-model="adminSessionsFilter.tenantId">
+              <option value="">— 全部 —</option>
+              <option v-for="t in adminSessionsState.tenants" :key="t.id" :value="t.id">
+                {{ t.name || t.id }} ({{ t.id }})
+              </option>
+            </select>
+          </label>
+          <label class="lab-field"><span class="lab-field-label">应用</span>
+            <select v-model="adminSessionsFilter.appId">
+              <option value="">— 全部 —</option>
+              <option v-for="c in adminAppsForSelect" :key="c.clientId" :value="c.clientId">
+                {{ c.displayName || c.clientId }} ({{ c.clientId }})
+              </option>
+            </select>
+          </label>
+          <label class="lab-field"><span class="lab-field-label">Agent</span>
+            <select v-model="adminSessionsFilter.agentId">
+              <option value="">— 全部 —</option>
+              <option v-for="a in adminAgentsForSelect" :key="a.agentId" :value="a.agentId">
+                {{ a.displayName || a.agentId }} ({{ a.agentId }})
+              </option>
+            </select>
+          </label>
+          <label class="lab-field"><span class="lab-field-label">user_id</span>
+            <input v-model="adminSessionsFilter.userId" placeholder="(可选)手填用户 id" /></label>
+          <label class="lab-field"><span class="lab-field-label">时间范围</span>
+            <select v-model="adminSessionsFilter.fromDays">
+              <option :value="1">最近 24 小时</option>
+              <option :value="7">最近 7 天</option>
+              <option :value="30">最近 30 天</option>
+              <option :value="0">不限</option>
+            </select>
+          </label>
+          <button class="primary admin-filter-apply"
+                  @click="adminSessionsState.page = 0; adminSessionsReload()">应用筛选</button>
+          <button :disabled="!adminSessionsSelection.size"
+                  class="memory-batch-delete admin-filter-apply"
+                  @click="adminBatchDeleteSessions">
+            批量删除 ({{ adminSessionsSelection.size }})
+          </button>
+        </div>
+
+        <!-- 统计卡 -->
+        <div class="usage-summary-cards">
+          <div class="usage-card">
+            <div class="usage-card-label">会话数</div>
+            <div class="usage-card-value">{{ adminSessionsState.totalSessions.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">Run 数</div>
+            <div class="usage-card-value">{{ adminSessionsState.totalRuns.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">消息数</div>
+            <div class="usage-card-value">{{ adminSessionsState.totalMessages.toLocaleString() }}</div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-card-label">总 token</div>
+            <div class="usage-card-value">{{ adminSessionsState.totalTokens.toLocaleString() }}</div>
+          </div>
+        </div>
+
+        <!-- 列表表格 -->
+        <table v-if="adminSessionsState.rows.length" class="usage-table admin-sessions-table">
+          <thead>
+            <tr>
+              <th style="width:32px;" :title="manageableAdminSessions.length ? '全选(仅当前用户可管理的行)' : ''">
+                <input type="checkbox" :disabled="!manageableAdminSessions.length"
+                       :checked="adminSessionsAllSelected"
+                       @change="toggleAdminSessionsAllSelected($event.target.checked)" />
+              </th>
+              <th>会话</th>
+              <th>租户 / 应用 / 用户</th>
+              <th>Agent</th>
+              <th>状态</th>
+              <th>消息 / Run / Token</th>
+              <th>更新</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in adminSessionsState.rows" :key="row.sessionId"
+                :class="{ 'row-selected': adminSessionsSelection.has(row.sessionId) }">
+              <td>
+                <input type="checkbox"
+                       v-if="canManageSession(row)"
+                       :checked="adminSessionsSelection.has(row.sessionId)"
+                       @change="toggleAdminSessionSelection(row.sessionId, $event.target.checked)" />
+                <span v-else class="text-muted-tiny" title="无权限管理此会话">—</span>
+              </td>
+              <td>
+                <div>{{ row.title || '(无标题)' }}</div>
+                <div style="font-size:11px; color:rgba(0,0,0,0.4); font-family: monospace;">{{ row.sessionId }}</div>
+              </td>
+              <td>{{ row.tenantId || '-' }} / {{ row.appId || '-' }} / {{ row.userId || '-' }}</td>
+              <td><code>{{ row.agentId }}</code></td>
+              <td><span class="lab-status" :class="'status-' + (row.status || '').toLowerCase()">{{ row.status }}</span></td>
+              <td>{{ row.messageCount }} / {{ row.runCount }} / {{ row.totalTokens.toLocaleString() }}</td>
+              <td>{{ (row.updatedAt || '').replace('T', ' ').slice(0, 16) }}</td>
+              <td>
+                <button @click="navigateToMenu('chat', { sessionId: row.sessionId, agentId: row.agentId })">进入会话</button>
+                <button @click="adminOpenSessionRuns(row.sessionId, row.title)" style="margin-left:6px;">查看 Run 列表</button>
+                <button v-if="canManageSession(row)"
+                        @click="adminDeleteSession(row.sessionId, row.title)"
+                        style="margin-left:6px; color:#c0392b;">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else-if="!adminSessionsState.loading" class="empty-state">无符合条件的会话。</div>
+
+        <!-- 简单分页 -->
+        <div v-if="adminSessionsState.rows.length" class="admin-sessions-pager">
+          <button @click="adminSessionsState.page = Math.max(0, adminSessionsState.page - 1)"
+                  :disabled="adminSessionsState.page === 0">上一页</button>
+          <span>第 {{ adminSessionsState.page + 1 }} 页 (每页 {{ adminSessionsState.size }})</span>
+          <button @click="adminSessionsState.page = adminSessionsState.page + 1"
+                  :disabled="adminSessionsState.rows.length < adminSessionsState.size">下一页</button>
+          <span style="margin-left: 16px;">每页:</span>
+          <select v-model.number="adminSessionsState.size" @change="adminSessionsState.page = 0">
+            <option :value="20">20</option>
+            <option :value="50">50</option>
+            <option :value="100">100</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- Session 下 run 列表 modal:管理员选一个 run 进入复盘 -->
+      <div v-if="adminRunsModal.open" class="modal-backdrop" @click.self="adminCloseSessionRuns">
+        <div class="modal-card catalog-modal" style="max-width: 900px;">
+          <div class="panel-title">
+            <h3>选择要复盘的 Run</h3>
+            <div class="panel-actions">
+              <button @click="adminCloseSessionRuns" title="关闭">✕</button>
+            </div>
+          </div>
+          <div class="lab-detail-meta" style="margin-top: 0;">
+            <div><strong>Session:</strong> {{ adminRunsModal.sessionTitle || '(无标题)' }}</div>
+            <div style="font-family: monospace; font-size: 11px; color: rgba(0,0,0,0.4);">{{ adminRunsModal.sessionId }}</div>
+          </div>
+          <div v-if="adminRunsModal.loading" class="empty-state">加载中...</div>
+          <div v-else-if="adminRunsModal.error" class="empty-state" style="color:#c0392b;">{{ adminRunsModal.error }}</div>
+          <table v-else-if="adminRunsModal.runs.length" class="usage-table">
+            <thead>
+              <tr>
+                <th>Run ID</th>
+                <th>状态</th>
+                <th>LLM</th>
+                <th>事件数</th>
+                <th>时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="run in adminRunsModal.runs" :key="run.runId">
+                <td><code style="font-size: 11px;">{{ run.runId }}</code></td>
+                <td><span class="lab-status" :class="'status-' + (run.status || '').toLowerCase()">{{ run.status }}</span></td>
+                <td>{{ run.llmModel || run.llmConfigId || '-' }}</td>
+                <td>
+                  <span v-if="run.hasEventLog">{{ run.eventCount }} 条</span>
+                  <span v-else style="color: rgba(0,0,0,0.3);">无 log</span>
+                </td>
+                <td>{{ (run.createdAt || '').replace('T', ' ').slice(0, 19) }}</td>
+                <td>
+                  <button class="primary" @click="adminOpenReplayFromList(run.runId)" :disabled="!run.hasEventLog">
+                    {{ run.hasEventLog ? '复盘' : '无可用 log' }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty-state">该会话下还没有 run。</div>
+        </div>
+      </div>
+
+      <!-- Run 复盘 modal:展示 event_log 的时间线 -->
+      <div v-if="adminReplayState.open" class="modal-backdrop" @click.self="adminCloseReplay">
+        <div class="modal-card catalog-modal lab-create-modal">
+          <div class="panel-title">
+            <h3>Run 复盘 <code style="font-size:13px; font-weight:400;">{{ adminReplayState.runId }}</code></h3>
+            <div class="panel-actions">
+              <button @click="adminCloseReplay" title="关闭">✕</button>
+            </div>
+          </div>
+          <div class="lab-form" style="padding: 0;">
+            <div v-if="adminReplayState.loading" class="empty-state">加载中...</div>
+            <div v-else-if="adminReplayState.error" class="empty-state" style="color:#c0392b;">{{ adminReplayState.error }}</div>
+            <template v-else-if="adminReplayState.data">
+              <div class="lab-detail-meta">
+                <div><strong>Session:</strong> <code>{{ adminReplayState.data.sessionId }}</code></div>
+                <div>
+                  <strong>租户:</strong> {{ adminReplayState.data.tenantId || '-' }}
+                  · <strong>应用:</strong> {{ adminReplayState.data.appId || '-' }}
+                  · <strong>用户:</strong> {{ adminReplayState.data.userId || '-' }}
+                </div>
+                <div>
+                  <strong>Agent:</strong> <code>{{ adminReplayState.data.agentId }}</code>
+                  · <strong>LLM:</strong> {{ adminReplayState.data.llmConfigId || '-' }} ({{ adminReplayState.data.llmModel || '-' }})
+                  · <strong>状态:</strong> {{ adminReplayState.data.status }}
+                </div>
+                <div v-if="adminReplayState.data.detail" style="white-space: pre-wrap;">
+                  <strong>详情:</strong> {{ adminReplayState.data.detail }}
+                </div>
+                <div v-if="adminReplayState.data.requestMessage">
+                  <strong>用户输入:</strong>
+                  <pre style="white-space: pre-wrap; margin: 4px 0; background: #f7f9fc; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto;">{{ adminReplayState.data.requestMessage }}</pre>
+                </div>
+              </div>
+
+              <h4 style="margin: 24px 0 12px;">
+                运行时间线 (显示 {{ adminReplayEventsFiltered.length }} / 共 {{ adminReplayEvents.length }} 个事件)
+              </h4>
+              <!-- 分类过滤 chip:点一下切换该分类的可见性 -->
+              <div v-if="adminReplayEvents.length" class="replay-filter-bar">
+                <span class="replay-filter-label">按类型过滤:</span>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('ai') }"
+                        @click="adminToggleReplayCategory('ai')">
+                  🤖 AI 调用 <span class="replay-filter-count">{{ adminReplayCategoryCounts.ai }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('db') }"
+                        @click="adminToggleReplayCategory('db')">
+                  🗄 数据库 <span class="replay-filter-count">{{ adminReplayCategoryCounts.db }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('file') }"
+                        @click="adminToggleReplayCategory('file')">
+                  📁 文件 <span class="replay-filter-count">{{ adminReplayCategoryCounts.file }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('artifact') }"
+                        @click="adminToggleReplayCategory('artifact')">
+                  📄 产物 <span class="replay-filter-count">{{ adminReplayCategoryCounts.artifact }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('plan') }"
+                        @click="adminToggleReplayCategory('plan')">
+                  📋 Plan <span class="replay-filter-count">{{ adminReplayCategoryCounts.plan }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('tool-other') }"
+                        @click="adminToggleReplayCategory('tool-other')">
+                  🔧 其它工具 <span class="replay-filter-count">{{ adminReplayCategoryCounts['tool-other'] }}</span>
+                </button>
+                <button class="replay-filter-chip" :class="{ active: adminReplayState.activeCategories.has('lifecycle') }"
+                        @click="adminToggleReplayCategory('lifecycle')">
+                  🟢 生命周期 <span class="replay-filter-count">{{ adminReplayCategoryCounts.lifecycle }}</span>
+                </button>
+                <span class="replay-filter-spacer"></span>
+                <button class="replay-filter-quick" @click="adminReplaySetCategories(['ai','db','file','artifact','plan','tool-other','lifecycle'])">全选</button>
+                <button class="replay-filter-quick" @click="adminReplaySetCategories(['ai'])">只看 AI</button>
+                <button class="replay-filter-quick" @click="adminReplaySetCategories(['db','file','artifact','tool-other'])">只看工具</button>
+              </div>
+              <div v-if="!adminReplayEvents.length" class="empty-state">该 run 没有 event log(可能是迁移后旧数据,或运行未完成)</div>
+              <div v-else-if="!adminReplayEventsFiltered.length" class="empty-state">当前过滤条件下没有事件 —— 点上面的类型 chip 重新打开</div>
+              <div v-else class="replay-timeline">
+                <div v-for="evt in adminReplayEventsFiltered" :key="evt.seq" class="replay-event"
+                     :class="['replay-event-' + (evt.type || '').toLowerCase(), 'replay-cat-' + evt._category]">
+                  <div class="replay-event-head">
+                    <span class="replay-event-seq">#{{ evt.seq }}</span>
+                    <span :class="['replay-cat-badge', 'replay-cat-' + evt._category]">{{ replayCategoryLabel(evt._category) }}</span>
+                    <span class="replay-event-type">{{ evt.type }}</span>
+                    <span v-if="evt._toolName || extractToolName(evt?.data?.content) || evt?.data?.toolName" class="replay-event-tool">
+                      🔧 {{ evt._toolName || extractToolName(evt?.data?.content) || evt?.data?.toolName }}
+                    </span>
+                    <span class="replay-event-ts">{{ (evt.ts || '').replace('T', ' ').slice(0, 19) }}</span>
+                  </div>
+                  <div v-if="evt._summary" class="replay-event-summary">{{ evt._summary }}</div>
+                  <details class="replay-event-data" v-if="evt.data && Object.keys(evt.data).length">
+                    <summary>data ({{ Object.keys(evt.data).length }} 字段)</summary>
+                    <pre>{{ JSON.stringify(evt.data, null, 2) }}</pre>
+                  </details>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- 新建 lab 任务 modal(全屏化方便长表单 + 同时看错误反馈) -->
+      <div v-if="labShowCreate" class="modal-backdrop" @click.self="labCloseCreateModal">
+        <div class="modal-card catalog-modal lab-create-modal">
+          <div class="panel-title">
+            <h3>{{ labCreateModal.activeTaskId ? '调试中:' + (labCreateModal.detail?.task?.title || '') : '新建 Agent 实验室任务' }}</h3>
+            <div class="panel-actions">
+              <button @click="labCloseCreateModal" title="关闭(任务在后台继续运行)">✕</button>
+            </div>
+          </div>
+          <div class="lab-form">
+            <!-- 第 1 段:基础信息 -->
+            <div class="lab-form-section">
+              <label class="lab-field">
+                <span class="lab-field-label">任务标题 <em>*</em></span>
+                <input v-model="labForm.title" placeholder="例如:盘龙区覆盖分析报告生成" />
+              </label>
+              <label class="lab-field">
+                <span class="lab-field-label">
+                  目标描述 <em>*</em>
+                  <button type="button" class="goal-refine-btn" @click="labOpenGoalChat">
+                    💬 让 AI 帮我完善
+                  </button>
+                </span>
+                <span class="lab-field-hint">
+                  写清楚:输入是什么、期望输出什么、用到哪些工具/数据。
+                  写不完整也没关系 —— 点上面的按钮跟 AI 临时对话,它会一边问你一边把描述补完整。
+                </span>
+                <textarea v-model="labForm.goalDescription" rows="6"
+                  placeholder="例如:用户给一段文字,Agent 调用 db.query 查盘龙区覆盖率,然后调用 artifact.markdown 生成结构化报告..."></textarea>
+              </label>
+            </div>
+
+            <!-- AI 帮我完善目标描述 — 临时对话面板 -->
+            <div v-if="labGoalChat.visible" class="goal-chat-overlay" @click.self="labCloseGoalChat(false)">
+              <div class="goal-chat-card">
+                <div class="goal-chat-head">
+                  <strong>💬 AI 帮我完善目标描述</strong>
+                  <label class="goal-chat-llm-pick">
+                    <span>用哪个 LLM:</span>
+                    <select v-model="labGoalChat.llmKey">
+                      <option value="|">— default —</option>
+                      <option v-for="opt in labLlmOptions" :key="'goal-' + opt.key" :value="opt.key">
+                        {{ opt.label }}
+                      </option>
+                    </select>
+                  </label>
+                  <span class="lab-field-hint" style="flex:1;">不影响表单其它字段;关闭时可选择是否采用</span>
+                  <button type="button" class="goal-chat-close" @click="labCloseGoalChat(false)">✕</button>
+                </div>
+                <div class="goal-chat-body">
+                  <!-- 左:对话气泡 -->
+                  <div class="goal-chat-thread">
+                    <div v-for="(turn, i) in labGoalChat.history" :key="i"
+                         :class="['goal-chat-bubble', turn.role === 'user' ? 'role-user' : 'role-assistant']">
+                      <div class="goal-chat-role">{{ turn.role === 'user' ? '你' : 'AI' }}</div>
+                      <div class="goal-chat-content">{{ turn.content }}</div>
+                    </div>
+                    <div v-if="labGoalChat.loading" class="goal-chat-bubble role-assistant">
+                      <div class="goal-chat-role">AI</div>
+                      <div class="goal-chat-content"><em>思考中...</em></div>
+                    </div>
+                    <div v-if="labGoalChat.error" class="goal-chat-error">{{ labGoalChat.error }}</div>
+                  </div>
+                  <!-- 右:候选目标描述 -->
+                  <div class="goal-chat-candidate">
+                    <div class="goal-chat-candidate-head">
+                      <strong>当前 AI 草稿</strong>
+                      <span class="lab-field-hint">最新一轮的 refinedGoal,点 "采用此版本" 替换表单里的目标描述</span>
+                    </div>
+                    <textarea v-model="labGoalChat.candidate" rows="14" class="goal-chat-candidate-text"></textarea>
+                  </div>
+                </div>
+                <div class="goal-chat-footer">
+                  <input v-model="labGoalChat.inputBuffer" class="goal-chat-input"
+                         placeholder="再具体一点 / 加上覆盖率指标计算口径 / 输出加 markdown 表格 ..."
+                         @keydown.enter.exact.prevent="labSendGoalChat()" />
+                  <button type="button" class="primary" :disabled="labGoalChat.loading || !labGoalChat.inputBuffer.trim()"
+                          @click="labSendGoalChat">{{ labGoalChat.loading ? '调用中...' : '发送' }}</button>
+                  <span style="flex:1;"></span>
+                  <button type="button" @click="labResetGoalChat">清空对话</button>
+                  <button type="button" class="primary" @click="labCloseGoalChat(true)"
+                          :disabled="!labGoalChat.candidate || labGoalChat.candidate === labForm.goalDescription">
+                    采用此版本
+                  </button>
+                  <button type="button" @click="labCloseGoalChat(false)">取消</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 第 2 段:目标 Skill -->
+            <div class="lab-form-section">
+              <div class="lab-section-head">
+                <strong>目标 Skill</strong>
+                <span class="lab-field-hint">每轮 meta-LLM 只改这一个 Skill 的 promptTemplate / configJson;Host Agent 不动。</span>
+              </div>
+
+              <label class="lab-field">
+                <span class="lab-field-label">模式</span>
+                <select v-model="labForm.mode">
+                  <option value="NEW">NEW — 新建 Skill,meta-LLM 从零设计</option>
+                  <option value="EXISTING">EXISTING — 调试已有 Skill(覆盖式修改)</option>
+                  <option value="CLONE_FROM">CLONE_FROM — 从源 Skill 克隆配置作为起点(源不动)</option>
+                </select>
+              </label>
+
+              <label class="lab-field">
+                <span class="lab-field-label">Host Agent 来源 <em>*</em></span>
+                <span class="lab-field-hint">Skill 必须挂在一个 Agent 上才能被触发。默认情况下这个 Agent 不会被 meta-LLM 修改。</span>
+                <select v-model="labForm.hostAgentMode">
+                  <option value="EXISTING">EXISTING — 选已有 Agent</option>
+                  <option value="NEW">NEW — 新建 Agent(可写一句种子提示词)</option>
+                  <option value="CLONE_FROM">CLONE_FROM — 从已有 Agent 克隆配置</option>
+                </select>
+              </label>
+
+              <label v-if="labForm.hostAgentMode === 'EXISTING'" class="lab-field">
+                <span class="lab-field-label">已有 Agent <em>*</em></span>
+                <select v-model="labForm.hostAgentId">
+                  <option value="">— 请选择 —</option>
+                  <option v-for="a in agents" :key="a.agentId" :value="a.agentId">
+                    {{ a.displayName || a.agentId }} ({{ a.agentId }})
+                  </option>
+                </select>
+              </label>
+
+              <label v-if="labForm.hostAgentMode === 'CLONE_FROM'" class="lab-field">
+                <span class="lab-field-label">源 Agent(克隆起点)<em>*</em></span>
+                <span class="lab-field-hint">复制源 Agent 的 systemPrompt 作为新 Agent 的起点,源不会被修改</span>
+                <select v-model="labForm.cloneFromHostAgentId">
+                  <option value="">— 请选择 —</option>
+                  <option v-for="a in agents" :key="a.agentId" :value="a.agentId">
+                    {{ a.displayName || a.agentId }} ({{ a.agentId }})
+                  </option>
+                </select>
+              </label>
+
+              <template v-if="labForm.hostAgentMode === 'NEW' || labForm.hostAgentMode === 'CLONE_FROM'">
+                <label class="lab-field">
+                  <span class="lab-field-label">新 Agent ID</span>
+                  <span class="lab-field-hint">
+                    可选:留空后端按"任务标题 slug + 6 位 uuid"自动生成
+                    (形如 <code>lab-host-{slug}-a3f1c2</code>)。手填需 <code>[a-z0-9-]+</code>。
+                  </span>
+                  <input v-model="labForm.newHostAgentId" placeholder="留空自动生成" />
+                </label>
+                <label class="lab-field">
+                  <span class="lab-field-label">Agent 显示名</span>
+                  <span class="lab-field-hint">留空时用任务标题</span>
+                  <input v-model="labForm.newHostAgentDisplayName" placeholder="留空用任务标题" />
+                </label>
+                <label v-if="labForm.hostAgentMode === 'NEW'" class="lab-field">
+                  <span class="lab-field-label">种子提示词(可选)</span>
+                  <span class="lab-field-hint">写一句话描述这个 Agent 的角色 / 背景 / 输出风格。留空 = 完全由 meta-LLM 自由设计(需开"允许同时优化 Host Agent")</span>
+                  <textarea v-model="labForm.newHostAgentSeedPrompt" rows="3"
+                    placeholder="例如:你是一个专门做电信网络覆盖分析的助手,擅长解读 RSRP / RSRQ 等无线指标..."></textarea>
+                </label>
+                <label class="lab-field">
+                  <span class="lab-field-label">新 Agent 的 scope</span>
+                  <select v-model="labForm.newHostAgentScopeType">
+                    <option value="SYSTEM">SYSTEM — 系统全局可见</option>
+                    <option value="TENANT">TENANT — 仅本租户可见</option>
+                    <option value="USER">USER — 仅自己可见</option>
+                  </select>
+                </label>
+                <label v-if="labForm.newHostAgentScopeType === 'TENANT'" class="lab-field">
+                  <span class="lab-field-label">租户 id <em>*</em></span>
+                  <input v-model="labForm.newHostAgentScopeTenantId" placeholder="例如 tenant-xmap" />
+                </label>
+              </template>
+
+              <label class="lab-field lab-field-checkbox">
+                <input type="checkbox" v-model="labForm.allowAgentEvolution" />
+                <span class="lab-field-label" style="display:inline; font-weight:600;">允许在迭代过程中同时优化 Host Agent</span>
+                <span class="lab-field-hint">
+                  默认关:每轮 meta-LLM 只改 Skill,Host Agent 保持创建时的配置不动。
+                  开启后:每轮 meta-LLM 同时输出 Agent 和 Skill 的修订,两者都被覆盖
+                  (适用于"种子提示词需要扩写"或"想让 Agent prompt 跟 Skill 一起进化"的场景)。
+                </span>
+              </label>
+
+              <label v-if="labForm.mode === 'EXISTING'" class="lab-field">
+                <span class="lab-field-label">选择已有 Skill <em>*</em></span>
+                <select v-model="labForm.targetSkillName">
+                  <option value="">— 请选择 —</option>
+                  <option v-for="s in labState.allSkills" :key="s.skillName + (s.id || '')" :value="s.skillName">
+                    {{ s.skillName }}<span v-if="s.description"> — {{ (s.description || '').slice(0, 50) }}</span>
+                  </option>
+                </select>
+              </label>
+
+              <label v-if="labForm.mode === 'CLONE_FROM'" class="lab-field">
+                <span class="lab-field-label">源 Skill(克隆起点)<em>*</em></span>
+                <select v-model="labForm.cloneFromSkillName">
+                  <option value="">— 请选择 —</option>
+                  <option v-for="s in labState.allSkills" :key="s.skillName + (s.id || '')" :value="s.skillName">
+                    {{ s.skillName }}<span v-if="s.description"> — {{ (s.description || '').slice(0, 50) }}</span>
+                  </option>
+                </select>
+              </label>
+
+              <label v-if="labForm.mode === 'NEW' || labForm.mode === 'CLONE_FROM'" class="lab-field">
+                <span class="lab-field-label">新 Skill 名</span>
+                <span class="lab-field-hint">
+                  可选:留空后端按"任务标题 slug + 6 位 uuid"自动生成
+                  (形如 <code>skill.lab.{slug}.a3f1c2</code>)。统一前缀 <code>skill.lab.</code> 便于在管理页一眼区分。
+                </span>
+                <input v-model="labForm.newSkillName" placeholder="留空自动生成" />
+              </label>
+
+              <label v-if="labForm.mode === 'NEW' || labForm.mode === 'CLONE_FROM'" class="lab-field">
+                <span class="lab-field-label">新 Skill 的 scope</span>
+                <select v-model="labForm.targetScopeType">
+                  <option value="SYSTEM">SYSTEM — 系统全局可见</option>
+                  <option value="TENANT">TENANT — 仅本租户可见</option>
+                  <option value="USER">USER — 仅自己可见</option>
+                </select>
+              </label>
+
+              <label v-if="(labForm.mode === 'NEW' || labForm.mode === 'CLONE_FROM') && labForm.targetScopeType === 'TENANT'"
+                     class="lab-field">
+                <span class="lab-field-label">租户 id <em>*</em></span>
+                <input v-model="labForm.targetScopeTenantId" placeholder="例如 tenant-xmap" />
+              </label>
+            </div>
+
+            <!-- 第 3 段:约束规则 + 参考文档 —— 用户不再手写测试用例。
+                 写若干自然语言约束规则(必填),可选粘贴参考文档,
+                 后端 meta-LLM 据此自动派生 ~3 条测试场景并迭代调试。 -->
+            <div class="lab-form-section">
+              <div class="lab-section-head">
+                <strong>约束规则 <em>*</em></strong>
+                <span class="lab-field-hint">
+                  用<strong>自然语言</strong>写若干约束规则,一行一条或写成段落都行。
+                  AI 会据规则 + 目标 + 参考文档自己派生测试场景,跑设计 + 调试 + 评估的完整循环。
+                  你只描述"应该满足什么",不描述"应该怎么实现"。
+                </span>
+              </div>
+              <label class="lab-field">
+                <span class="lab-field-label">约束规则文本 <em>*</em></span>
+                <textarea v-model="labForm.constraintRules" rows="8"
+                          placeholder="例如(每行一条):&#10;- 输出必须是 markdown 格式的报告&#10;- 必须包含整体覆盖率 / 弱覆盖区域占比 / TOP3 弱覆盖小区&#10;- 涉及区县时必须做县级过滤,不能拿全省数据&#10;- 不要寒暄,直接给报告"></textarea>
+              </label>
+              <label class="lab-field">
+                <span class="lab-field-label">参考文档(可选)</span>
+                <span class="lab-field-hint">粘贴数据字典 / 业务规范 / 样例报告等;AI 派生测试场景时一并参考。</span>
+                <textarea v-model="labForm.referenceDocuments" rows="6"
+                          placeholder="可粘贴样例报告、字段说明、业务口径解释等;留空也可以。"></textarea>
+              </label>
+            </div>
+
+            <!-- 第 4 段:LLM 配置 + 迭代上限 -->
+            <div class="lab-form-section">
+              <div class="lab-section-head">
+                <strong>LLM 配置</strong>
+                <span class="lab-field-hint">
+                  Meta-LLM 当"设计师"改 Skill;Test-LLM 跑测试用例时驱动 Agent ·
+                  <strong>当前可选 LLM:{{ labLlmOptions.length }} 个</strong>
+                  <span v-if="labLlmOptions.length === 0" style="color:#c0392b;"> ← catalog 还没加载,点关闭再试</span>
+                </span>
+              </div>
+              <div class="lab-form-row">
+                <label class="lab-field">
+                  <span class="lab-field-label">Meta-LLM(设计师)</span>
+                  <span class="lab-field-hint">改 Skill prompt / configJson 用。留空走 default(is_default=true)</span>
+                  <select v-model="labMetaLlmKey">
+                    <option value="|">— default —</option>
+                    <option v-for="opt in labLlmOptions" :key="'meta-' + opt.key" :value="opt.key">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                </label>
+                <label class="lab-field">
+                  <span class="lab-field-label">Test-LLM(跑测试)</span>
+                  <span class="lab-field-hint">跑测试用例时 Agent 实际用的 LLM。留空 = Agent 自己绑的默认</span>
+                  <select v-model="labTestLlmKey">
+                    <option value="|">— Agent 默认 —</option>
+                    <option v-for="opt in labLlmOptions" :key="'test-' + opt.key" :value="opt.key">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                </label>
+              </div>
+              <label class="lab-field" style="max-width: 220px;">
+                <span class="lab-field-label">最大迭代次数</span>
+                <input type="number" v-model.number="labForm.maxIterations" min="1" max="20" />
+              </label>
+            </div>
+
+            <!-- 第 5 段:运行状态面板 —— 提交后实时刷,允许停 / 重启 / 改写约束规则后再调试 -->
+            <div v-if="labCreateModal.activeTaskId" class="lab-form-section lab-status-panel">
+              <div class="lab-section-head">
+                <strong>📊 运行状态</strong>
+                <span class="lab-field-hint">每 3 秒自动刷;关 modal 不影响后台继续跑。</span>
+                <span class="lab-status-badge"
+                      :class="'status-' + (labCreateModal.detail?.task?.status || 'pending').toLowerCase()">
+                  {{ labCreateModal.detail?.task?.status || 'PENDING' }}
+                </span>
+              </div>
+              <div v-if="labCreateModal.pollError" class="empty-state" style="color:#c0392b;">
+                轮询出错:{{ labCreateModal.pollError }}
+              </div>
+              <div class="lab-status-meta">
+                <div><strong>任务 ID:</strong> <code>{{ labCreateModal.activeTaskId }}</code></div>
+                <div v-if="labCreateModal.detail">
+                  <strong>当前轮:</strong> {{ labCreateModal.detail.task.currentIteration }} / {{ labCreateModal.detail.task.maxIterations }}
+                  · <strong>已完成:</strong> {{ labCreateModal.detail.iterations?.length || 0 }} 轮
+                </div>
+                <div v-if="labCreateModal.detail?.task?.finalSummary">
+                  <strong>结果:</strong> {{ labCreateModal.detail.task.finalSummary }}
+                </div>
+                <div v-if="labCreateModal.detail?.task?.errorDetail" style="color:#c0392b;">
+                  <strong>错误:</strong> {{ labCreateModal.detail.task.errorDetail }}
+                </div>
+              </div>
+
+              <!-- 迭代摘要列表(从新到旧) -->
+              <div v-if="labCreateModal.detail?.iterations?.length" class="lab-status-iters">
+                <div v-for="iter in [...labCreateModal.detail.iterations].reverse()" :key="iter.id"
+                     class="lab-status-iter">
+                  <div class="lab-status-iter-head">
+                    <strong>第 {{ iter.iterationNo }} 轮</strong>
+                    <span class="lab-iter-status" :class="'status-' + (iter.status || '').toLowerCase()">
+                      {{ iter.status }}
+                    </span>
+                    <span v-if="iter.totalCount !== null" class="lab-iter-pass">
+                      {{ iter.passedCount }} / {{ iter.totalCount }} 通过
+                    </span>
+                    <span class="lab-iter-time">{{ (iter.createdAt || '').replace('T', ' ').slice(0, 19) }}</span>
+                  </div>
+                  <div v-if="iter.status === 'IN_PROGRESS' && iter.progressStep" class="lab-status-iter-progress">
+                    <span class="lab-iter-progress-spinner">⏳</span> {{ iter.progressStep }}
+                  </div>
+                  <div v-if="iter.evaluationSummary" class="lab-status-iter-summary">
+                    {{ iter.evaluationSummary }}
+                  </div>
+                  <div v-if="iter.metaLlmError" style="color:#c0392b; font-size:12px; margin-top:4px;">
+                    meta-LLM 错误:{{ iter.metaLlmError }}
+                  </div>
+                </div>
+              </div>
+
+              <!-- 状态面板自带操作按钮 -->
+              <div class="lab-status-actions">
+                <button v-if="['PENDING','RUNNING'].includes(labCreateModal.detail?.task?.status)"
+                        @click="labCreateModalCancel">⏹ 停止</button>
+                <button v-else @click="labCreateModalRestart">🔁 同规则重跑</button>
+                <button :disabled="labCreateModal.refining" @click="labCreateModalRefineRules">
+                  {{ labCreateModal.refining ? '提交中...' : '✏️ 改写规则后再调试' }}
+                </button>
+                <span class="lab-field-hint" style="flex:1;">
+                  改了上方"约束规则"或"参考文档"后,点 ✏️ AI 会重新派生测试场景并从第 1 轮跑。
+                </span>
+              </div>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button @click="labCloseCreateModal">{{ labCreateModal.activeTaskId ? '关闭(后台继续跑)' : '取消' }}</button>
+            <button v-if="!labCreateModal.activeTaskId" class="primary"
+                    :disabled="labCreateModal.submitting" @click="labSubmitCreate">
+              {{ labCreateModal.submitting ? '创建中...' : '创建并开始迭代' }}
+            </button>
+          </div>
+        </div>
+      </div>
 
       <div v-if="memoryEditor.visible" class="modal-backdrop" @click.self="closeMemoryEditor">
         <div class="modal-card catalog-modal">
@@ -6196,33 +8657,53 @@ function formatTimelineEventContent(event) {
           <h3>Agents（共 {{ state.catalog.agents.length }}）</h3>
           <button class="primary" @click="openAgentEditor(null)">新增 Agent</button>
         </div>
-        <p class="empty-state" style="margin:0 0 12px; padding:8px 12px;">
-          Agent 定义是所有 skill / 知识 / 记忆的主键维度。<strong>systemPrompt</strong> 是喂给 LLM 的 role=system 文本；
-          <strong>agentMarkdown</strong> 写 agent 职责说明（会注入 prompt 的 AGENT.md 段）；
-          <strong>memoryMarkdown</strong> 是补充型永久注释（MEMORY.md 段），跨 session 共享。
-          这三个字段原来在 <code>workspaces/&lt;agent&gt;/</code> 目录文件里，现在从数据库读，前端直接编辑。
-        </p>
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.agents" :key="item.agentId" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.displayName }}</strong>
-                <span>{{ item.agentId }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="openAgentEditor(item)">编辑</button>
-                <button @click="removeAgentDefinition(item)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">{{ item.description || "(未填写描述)" }}</p>
-            <div class="chart-meta">
-              <span>{{ item.enabled ? "enabled" : "disabled" }}</span>
-              <span>systemPrompt {{ (item.systemPrompt || "").length }} 字符</span>
-              <span>AGENT.md {{ (item.agentMarkdown || "").length }} 字符</span>
-              <span>MEMORY.md {{ (item.memoryMarkdown || "").length }} 字符</span>
-            </div>
-          </article>
-          <div v-if="!state.catalog.agents.length" class="empty-state">还没有 agent 定义。</div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="agentsList.state.keyword" placeholder="搜索 agentId / 名称 / 描述" />
+          <button :disabled="!agentsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteAgents">
+            批量删除 ({{ agentsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="agentsList.allSelected.value" @change="agentsList.toggleAll($event.target.checked)" /></th>
+              <th>Agent ID</th>
+              <th>显示名</th>
+              <th>描述</th>
+              <th>状态</th>
+              <th>提示词长度</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in agentsList.paged.value" :key="item.agentId" :class="{ 'row-selected': agentsList.selection.has(item.agentId) }">
+              <td class="col-check"><input type="checkbox" :checked="agentsList.selection.has(item.agentId)" @change="agentsList.toggle(item.agentId, $event.target.checked)" /></td>
+              <td><code>{{ item.agentId }}</code></td>
+              <td>{{ item.displayName }}</td>
+              <td class="col-ellipsis" :title="item.description">{{ item.description || "—" }}</td>
+              <td>{{ item.enabled ? "enabled" : "disabled" }}</td>
+              <td>sys {{ (item.systemPrompt || "").length }} · AGENT {{ (item.agentMarkdown || "").length }} · MEM {{ (item.memoryMarkdown || "").length }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="openAgentEditor(item)">编辑</button>
+                  <button @click="removeAgentDefinition(item)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!agentsList.filtered.value.length"><td colspan="7" class="empty-row">{{ state.catalog.agents.length ? "没有匹配的 agent。" : "还没有 agent 定义。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="agentsList.filtered.value.length > agentsList.state.size" class="list-pager">
+          <button @click="agentsList.state.page = Math.max(0, agentsList.state.page - 1)" :disabled="agentsList.state.page === 0">上一页</button>
+          <span>第 {{ agentsList.state.page + 1 }} / {{ agentsList.totalPages.value }} 页 · 共 {{ agentsList.filtered.value.length }} 条</span>
+          <button @click="agentsList.state.page = Math.min(agentsList.totalPages.value - 1, agentsList.state.page + 1)" :disabled="agentsList.state.page >= agentsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="agentsList.state.size" @change="agentsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
@@ -6269,122 +8750,265 @@ function formatTimelineEventContent(event) {
       </div>
 
       <section v-if="activeMenu === 'llms'" class="workspace-panel catalog-page">
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.llms" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.displayName }} · {{ item.model }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editLlm(item)">编辑</button>
-                <button @click="removeLlm(item.id)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">{{ item.provider }} · {{ item.baseUrl }}</p>
-            <div class="chart-meta">
-              <span>{{ item.id }}</span>
-              <span>{{ item.stream ? "stream" : "non-stream" }}</span>
-              <span>{{ item.enabled ? "enabled" : "disabled" }}</span>
-              <span>{{ item.defaultConfig ? "default" : "optional" }}</span>
-            </div>
-          </article>
-          <div v-if="!state.catalog.llms.length" class="empty-state">当前没有 LLM 配置。</div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="llmsList.state.keyword" placeholder="搜索 id / 名称 / model / provider" />
+          <button :disabled="!llmsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteLlms">
+            批量删除 ({{ llmsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="llmsList.allSelected.value" @change="llmsList.toggleAll($event.target.checked)" /></th>
+              <th>ID</th>
+              <th>显示名</th>
+              <th>Provider / Model</th>
+              <th>Base URL</th>
+              <th>属性</th>
+              <th>更新时间</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in llmsList.paged.value" :key="item.id" :class="{ 'row-selected': llmsList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :checked="llmsList.selection.has(item.id)" @change="llmsList.toggle(item.id, $event.target.checked)" /></td>
+              <td><code>{{ item.id }}</code></td>
+              <td>{{ item.displayName }}</td>
+              <td>{{ item.provider }} · {{ item.model }}</td>
+              <td class="col-ellipsis" :title="item.baseUrl"><code>{{ item.baseUrl }}</code></td>
+              <td>{{ item.stream ? "stream" : "non-stream" }} · {{ item.enabled ? "启用" : "停用" }}<span v-if="item.defaultConfig"> · default</span></td>
+              <td>{{ item.updatedAt }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="editLlm(item)">编辑</button>
+                  <button @click="removeLlm(item.id)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!llmsList.filtered.value.length"><td colspan="8" class="empty-row">{{ state.catalog.llms.length ? "没有匹配的 LLM 配置。" : "当前没有 LLM 配置。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="llmsList.filtered.value.length > llmsList.state.size" class="list-pager">
+          <button @click="llmsList.state.page = Math.max(0, llmsList.state.page - 1)" :disabled="llmsList.state.page === 0">上一页</button>
+          <span>第 {{ llmsList.state.page + 1 }} / {{ llmsList.totalPages.value }} 页 · 共 {{ llmsList.filtered.value.length }} 条</span>
+          <button @click="llmsList.state.page = Math.min(llmsList.totalPages.value - 1, llmsList.state.page + 1)" :disabled="llmsList.state.page >= llmsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="llmsList.state.size" @change="llmsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
       <section v-if="activeMenu === 'knowledge'" class="workspace-panel catalog-page">
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.knowledge" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.title }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editKnowledge(item)">编辑</button>
-                <button @click="removeKnowledge(item.id)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">{{ item.content }}</p>
-          </article>
-          <div v-if="!state.catalog.knowledge.length" class="empty-state">当前没有知识条目。</div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="knowledgeList.state.keyword" placeholder="搜索标题 / 内容 / 来源" />
+          <button :disabled="!knowledgeList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteKnowledge">
+            批量删除 ({{ knowledgeList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="knowledgeList.allSelected.value" @change="knowledgeList.toggleAll($event.target.checked)" /></th>
+              <th>标题</th>
+              <th>内容(前 100 字)</th>
+              <th>来源</th>
+              <th>更新时间</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in knowledgeList.paged.value" :key="item.id" :class="{ 'row-selected': knowledgeList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :checked="knowledgeList.selection.has(item.id)" @change="knowledgeList.toggle(item.id, $event.target.checked)" /></td>
+              <td>{{ item.title }}</td>
+              <td class="col-ellipsis" :title="item.content">{{ truncateText(item.content, 100) }}</td>
+              <td>{{ item.source || "—" }}</td>
+              <td>{{ item.updatedAt }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="editKnowledge(item)">编辑</button>
+                  <button @click="removeKnowledge(item.id)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!knowledgeList.filtered.value.length"><td colspan="6" class="empty-row">{{ state.catalog.knowledge.length ? "没有匹配的知识条目。" : "当前没有知识条目。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="knowledgeList.filtered.value.length > knowledgeList.state.size" class="list-pager">
+          <button @click="knowledgeList.state.page = Math.max(0, knowledgeList.state.page - 1)" :disabled="knowledgeList.state.page === 0">上一页</button>
+          <span>第 {{ knowledgeList.state.page + 1 }} / {{ knowledgeList.totalPages.value }} 页 · 共 {{ knowledgeList.filtered.value.length }} 条</span>
+          <button @click="knowledgeList.state.page = Math.min(knowledgeList.totalPages.value - 1, knowledgeList.state.page + 1)" :disabled="knowledgeList.state.page >= knowledgeList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="knowledgeList.state.size" @change="knowledgeList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
       <section v-if="activeMenu === 'tools'" class="workspace-panel catalog-page">
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.tools" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.displayName }} · {{ item.toolName }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editTool(item)">编辑</button>
-                <button @click="removeTool(item.id)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">{{ item.description }}</p>
-          </article>
-          <div v-if="!state.catalog.tools.length" class="empty-state">当前没有工具定义。</div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="toolsList.state.keyword" placeholder="搜索 toolName / 名称 / 描述" />
+          <button :disabled="!toolsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteTools">
+            批量删除 ({{ toolsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="toolsList.allSelected.value" @change="toolsList.toggleAll($event.target.checked)" /></th>
+              <th>Tool Name</th>
+              <th>显示名</th>
+              <th>描述</th>
+              <th>更新时间</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in toolsList.paged.value" :key="item.id" :class="{ 'row-selected': toolsList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :checked="toolsList.selection.has(item.id)" @change="toolsList.toggle(item.id, $event.target.checked)" /></td>
+              <td><code>{{ item.toolName }}</code></td>
+              <td>{{ item.displayName }}</td>
+              <td class="col-ellipsis" :title="item.description">{{ item.description || "—" }}</td>
+              <td>{{ item.updatedAt }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="editTool(item)">编辑</button>
+                  <button @click="removeTool(item.id)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!toolsList.filtered.value.length"><td colspan="6" class="empty-row">{{ state.catalog.tools.length ? "没有匹配的工具。" : "当前没有工具定义。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="toolsList.filtered.value.length > toolsList.state.size" class="list-pager">
+          <button @click="toolsList.state.page = Math.max(0, toolsList.state.page - 1)" :disabled="toolsList.state.page === 0">上一页</button>
+          <span>第 {{ toolsList.state.page + 1 }} / {{ toolsList.totalPages.value }} 页 · 共 {{ toolsList.filtered.value.length }} 条</span>
+          <button @click="toolsList.state.page = Math.min(toolsList.totalPages.value - 1, toolsList.state.page + 1)" :disabled="toolsList.state.page >= toolsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="toolsList.state.size" @change="toolsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
       <section v-if="activeMenu === 'skills'" class="workspace-panel catalog-page">
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.skills" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.skillName }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editSkill(item)">编辑</button>
-                <button @click="removeSkill(item.id)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">{{ item.description }}</p>
-            <div class="catalog-card-meta">
-              <span class="catalog-card-tag" v-for="agentId in (item.agentIds && item.agentIds.length ? item.agentIds : [item.agentId]).filter(Boolean)" :key="agentId">
-                {{ agentId }}
-              </span>
-              <span v-if="!item.agentIds?.length && !item.agentId" class="muted">未绑定</span>
-              <span v-if="item.triggerKeywords && item.triggerKeywords !== '[]'" class="catalog-card-trigger">
-                triggers: {{ item.triggerKeywords }}
-              </span>
-              <span v-if="!item.enabled" class="catalog-card-disabled">disabled</span>
-            </div>
-          </article>
-          <div v-if="!state.catalog.skills.length" class="empty-state">当前没有 Skill 定义。</div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="skillsList.state.keyword" placeholder="搜索 skillName / 描述 / agentId" />
+          <button :disabled="!skillsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteSkills">
+            批量删除 ({{ skillsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="skillsList.allSelected.value" @change="skillsList.toggleAll($event.target.checked)" /></th>
+              <th>Skill Name</th>
+              <th>描述</th>
+              <th>绑定 Agent</th>
+              <th>触发词</th>
+              <th>状态</th>
+              <th>更新时间</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in skillsList.paged.value" :key="item.id" :class="{ 'row-selected': skillsList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :checked="skillsList.selection.has(item.id)" @change="skillsList.toggle(item.id, $event.target.checked)" /></td>
+              <td><strong>{{ item.skillName }}</strong></td>
+              <td class="col-ellipsis" :title="item.description">{{ item.description || "—" }}</td>
+              <td>
+                <span v-for="agentId in (item.agentIds && item.agentIds.length ? item.agentIds : [item.agentId]).filter(Boolean)" :key="agentId" class="catalog-card-tag">{{ agentId }}</span>
+                <span v-if="!item.agentIds?.length && !item.agentId" class="muted">未绑定</span>
+              </td>
+              <td class="col-ellipsis" :title="item.triggerKeywords">
+                <code v-if="item.triggerKeywords && item.triggerKeywords !== '[]'">{{ item.triggerKeywords }}</code>
+                <span v-else class="muted">—</span>
+              </td>
+              <td>{{ item.enabled ? "enabled" : "disabled" }}</td>
+              <td>{{ item.updatedAt }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="editSkill(item)">编辑</button>
+                  <button @click="removeSkill(item.id)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!skillsList.filtered.value.length"><td colspan="8" class="empty-row">{{ state.catalog.skills.length ? "没有匹配的 Skill。" : "当前没有 Skill 定义。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="skillsList.filtered.value.length > skillsList.state.size" class="list-pager">
+          <button @click="skillsList.state.page = Math.max(0, skillsList.state.page - 1)" :disabled="skillsList.state.page === 0">上一页</button>
+          <span>第 {{ skillsList.state.page + 1 }} / {{ skillsList.totalPages.value }} 页 · 共 {{ skillsList.filtered.value.length }} 条</span>
+          <button @click="skillsList.state.page = Math.min(skillsList.totalPages.value - 1, skillsList.state.page + 1)" :disabled="skillsList.state.page >= skillsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="skillsList.state.size" @change="skillsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
       <section v-if="activeMenu === 'datasources'" class="workspace-panel catalog-page">
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.datasources" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.displayName || item.id }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editDatasource(item)">编辑</button>
-                <button @click="removeDatasource(item.id)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">
-              <code>{{ item.jdbcUrl }}</code>
-              · user: {{ item.username }}
-              · password: {{ item.passwordSet ? '已设置' : '未设置' }}
-              · {{ item.dialect || '—' }}
-              · {{ item.enabled ? '启用' : '停用' }}
-            </p>
-            <p v-if="item.description" class="catalog-card-content">{{ item.description }}</p>
-          </article>
-          <div v-if="!state.catalog.datasources.length" class="empty-state">
-            当前没有数据源。skill 用到的 JDBC 连接都应在此注册，LLM 只看 jdbcUrl，后端自动注入凭证。
-          </div>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="datasourcesList.state.keyword" placeholder="搜索 id / 名称 / jdbcUrl / dialect" />
+          <button :disabled="!datasourcesList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteDatasources">
+            批量删除 ({{ datasourcesList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="datasourcesList.allSelected.value" @change="datasourcesList.toggleAll($event.target.checked)" /></th>
+              <th>ID</th>
+              <th>显示名</th>
+              <th>JDBC URL</th>
+              <th>用户名</th>
+              <th>方言</th>
+              <th>状态</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in datasourcesList.paged.value" :key="item.id" :class="{ 'row-selected': datasourcesList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :checked="datasourcesList.selection.has(item.id)" @change="datasourcesList.toggle(item.id, $event.target.checked)" /></td>
+              <td><code>{{ item.id }}</code></td>
+              <td>{{ item.displayName || "—" }}</td>
+              <td class="col-ellipsis" :title="item.jdbcUrl"><code>{{ item.jdbcUrl }}</code></td>
+              <td>{{ item.username }} <span v-if="item.passwordSet" class="muted">/ pwd ✓</span><span v-else class="muted">/ pwd —</span></td>
+              <td>{{ item.dialect || "—" }}</td>
+              <td>{{ item.enabled ? "启用" : "停用" }}</td>
+              <td class="col-actions">
+                <template v-if="canManageScoped(item)">
+                  <button @click="editDatasource(item)">编辑</button>
+                  <button @click="removeDatasource(item.id)">删除</button>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
+            </tr>
+            <tr v-if="!datasourcesList.filtered.value.length"><td colspan="8" class="empty-row">{{ state.catalog.datasources.length ? "没有匹配的数据源。" : "当前没有数据源。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="datasourcesList.filtered.value.length > datasourcesList.state.size" class="list-pager">
+          <button @click="datasourcesList.state.page = Math.max(0, datasourcesList.state.page - 1)" :disabled="datasourcesList.state.page === 0">上一页</button>
+          <span>第 {{ datasourcesList.state.page + 1 }} / {{ datasourcesList.totalPages.value }} 页 · 共 {{ datasourcesList.filtered.value.length }} 条</span>
+          <button @click="datasourcesList.state.page = Math.min(datasourcesList.totalPages.value - 1, datasourcesList.state.page + 1)" :disabled="datasourcesList.state.page >= datasourcesList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="datasourcesList.state.size" @change="datasourcesList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
@@ -6394,30 +9018,54 @@ function formatTimelineEventContent(event) {
           <button class="primary" @click="openCreateUserModal">+ 新建用户</button>
           <button @click="openImportUsersModal">批量导入</button>
         </div>
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.users" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.username }} · {{ item.displayName }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="usersList.state.keyword" placeholder="搜索 id / 用户名 / 显示名 / email" />
+          <button :disabled="!usersList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteUsers">
+            批量删除 ({{ usersList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="usersList.allSelected.value" @change="usersList.toggleAll($event.target.checked)" /></th>
+              <th>用户名</th>
+              <th>显示名</th>
+              <th>Email</th>
+              <th>租户</th>
+              <th>状态</th>
+              <th>最近登录</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in usersList.paged.value" :key="item.id" :class="{ 'row-selected': usersList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :disabled="item.id === 'admin'" :checked="usersList.selection.has(item.id)" @change="usersList.toggle(item.id, $event.target.checked)" /></td>
+              <td><strong>{{ item.username }}</strong> <span class="muted">({{ item.id }})</span></td>
+              <td>{{ item.displayName || "—" }}</td>
+              <td>{{ item.email || "—" }}</td>
+              <td>{{ item.preferredTenantId || "—" }}</td>
+              <td>{{ item.status }}<span v-if="item.passwordMustChange" title="待改密" class="muted"> ⚠</span></td>
+              <td>{{ item.lastLoginAt || "—" }}</td>
+              <td class="col-actions">
                 <button @click="openEditUserModal(item)">编辑</button>
-                <button @click="assignUserRolesHandler(item)">分配角色</button>
+                <button @click="assignUserRolesHandler(item)">角色</button>
                 <button @click="resetUserPasswordHandler(item.id)">重置密码</button>
                 <button @click="deleteUserHandler(item.id)" :disabled="item.id === 'admin'">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">
-              id: <code>{{ item.id }}</code>
-              · status: {{ item.status }}
-              · tenant: {{ item.preferredTenantId || '—' }}
-              <span v-if="item.passwordMustChange"> · ⚠ 待改密</span>
-              · last_login: {{ item.lastLoginAt || '—' }}
-            </p>
-            <p v-if="item.email" class="catalog-card-content">📧 {{ item.email }}</p>
-          </article>
-          <div v-if="!state.catalog.users.length" class="empty-state">还没有用户。</div>
+              </td>
+            </tr>
+            <tr v-if="!usersList.filtered.value.length"><td colspan="8" class="empty-row">{{ state.catalog.users.length ? "没有匹配的用户。" : "还没有用户。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="usersList.filtered.value.length > usersList.state.size" class="list-pager">
+          <button @click="usersList.state.page = Math.max(0, usersList.state.page - 1)" :disabled="usersList.state.page === 0">上一页</button>
+          <span>第 {{ usersList.state.page + 1 }} / {{ usersList.totalPages.value }} 页 · 共 {{ usersList.filtered.value.length }} 条</span>
+          <button @click="usersList.state.page = Math.min(usersList.totalPages.value - 1, usersList.state.page + 1)" :disabled="usersList.state.page >= usersList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="usersList.state.size" @change="usersList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
@@ -6426,25 +9074,52 @@ function formatTimelineEventContent(event) {
         <div class="admin-toolbar">
           <button class="primary" @click="openCreateTenantModal">+ 新建租户</button>
         </div>
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.tenants" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.name }} · {{ item.code }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="tenantsList.state.keyword" placeholder="搜索 id / code / 名称 / 描述" />
+          <button :disabled="!tenantsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteTenants">
+            批量删除 ({{ tenantsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="tenantsList.allSelected.value" @change="tenantsList.toggleAll($event.target.checked)" /></th>
+              <th>ID</th>
+              <th>Code</th>
+              <th>名称</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>描述</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in tenantsList.paged.value" :key="item.id" :class="{ 'row-selected': tenantsList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :disabled="item.id === 'system'" :checked="tenantsList.selection.has(item.id)" @change="tenantsList.toggle(item.id, $event.target.checked)" /></td>
+              <td><code>{{ item.id }}</code></td>
+              <td>{{ item.code }}</td>
+              <td><strong>{{ item.name }}</strong></td>
+              <td>{{ item.kind }}</td>
+              <td>{{ item.status }}</td>
+              <td class="col-ellipsis" :title="item.description">{{ item.description || "—" }}</td>
+              <td class="col-actions">
                 <button @click="editTenantHandler(item)">编辑</button>
                 <button @click="deleteTenantHandler(item.id)" :disabled="item.id === 'system'">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">
-              id: <code>{{ item.id }}</code>
-              · kind: {{ item.kind }} · status: {{ item.status }}
-            </p>
-            <p v-if="item.description" class="catalog-card-content">{{ item.description }}</p>
-          </article>
-          <div v-if="!state.catalog.tenants.length" class="empty-state">还没有租户。</div>
+              </td>
+            </tr>
+            <tr v-if="!tenantsList.filtered.value.length"><td colspan="8" class="empty-row">{{ state.catalog.tenants.length ? "没有匹配的租户。" : "还没有租户。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="tenantsList.filtered.value.length > tenantsList.state.size" class="list-pager">
+          <button @click="tenantsList.state.page = Math.max(0, tenantsList.state.page - 1)" :disabled="tenantsList.state.page === 0">上一页</button>
+          <span>第 {{ tenantsList.state.page + 1 }} / {{ tenantsList.totalPages.value }} 页 · 共 {{ tenantsList.filtered.value.length }} 条</span>
+          <button @click="tenantsList.state.page = Math.min(tenantsList.totalPages.value - 1, tenantsList.state.page + 1)" :disabled="tenantsList.state.page >= tenantsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="tenantsList.state.size" @change="tenantsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
@@ -6453,35 +9128,65 @@ function formatTimelineEventContent(event) {
         <div class="admin-toolbar">
           <button class="primary" @click="openCreateRoleModal">+ 新建角色</button>
         </div>
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.roles" :key="item.id" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.name }} · {{ item.code }}</strong>
-                <span>tenant: {{ item.tenantId }}</span>
-              </div>
-              <div class="catalog-row-actions">
-                <button @click="editRolePermissionsHandler(item)">编辑权限</button>
-                <button @click="editRoleHandler(item)">编辑</button>
-                <button @click="deleteRoleHandler(item.id)"
-                        :disabled="item.id === 'system-super-admin' || item.id === 'system-user'">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">id: <code>{{ item.id }}</code></p>
-            <p v-if="item.description" class="catalog-card-content">{{ item.description }}</p>
-          </article>
-          <div v-if="!state.catalog.roles.length" class="empty-state">还没有角色。</div>
-          <article class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title"><strong>权限目录（只读）</strong></div>
-            </div>
-            <p class="catalog-card-content" style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;">
-              <span v-for="p in state.catalog.permissions" :key="p.code">
-                <code>{{ p.code }}</code> [{{ p.category }}] —— {{ p.description }}<br />
-              </span>
-            </p>
-          </article>
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="rolesList.state.keyword" placeholder="搜索 id / code / 名称 / 租户" />
+          <button :disabled="!rolesList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteRoles">
+            批量删除 ({{ rolesList.selection.size }})
+          </button>
         </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="rolesList.allSelected.value" @change="rolesList.toggleAll($event.target.checked)" /></th>
+              <th>ID</th>
+              <th>Code</th>
+              <th>名称</th>
+              <th>租户</th>
+              <th>描述</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in rolesList.paged.value" :key="item.id" :class="{ 'row-selected': rolesList.selection.has(item.id) }">
+              <td class="col-check"><input type="checkbox" :disabled="item.id === 'system-super-admin' || item.id === 'system-user'" :checked="rolesList.selection.has(item.id)" @change="rolesList.toggle(item.id, $event.target.checked)" /></td>
+              <td><code>{{ item.id }}</code></td>
+              <td>{{ item.code }}</td>
+              <td><strong>{{ item.name }}</strong></td>
+              <td>{{ item.tenantId }}</td>
+              <td class="col-ellipsis" :title="item.description">{{ item.description || "—" }}</td>
+              <td class="col-actions">
+                <button @click="editRolePermissionsHandler(item)">权限</button>
+                <button @click="editRoleHandler(item)">编辑</button>
+                <button @click="deleteRoleHandler(item.id)" :disabled="item.id === 'system-super-admin' || item.id === 'system-user'">删除</button>
+              </td>
+            </tr>
+            <tr v-if="!rolesList.filtered.value.length"><td colspan="7" class="empty-row">{{ state.catalog.roles.length ? "没有匹配的角色。" : "还没有角色。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="rolesList.filtered.value.length > rolesList.state.size" class="list-pager">
+          <button @click="rolesList.state.page = Math.max(0, rolesList.state.page - 1)" :disabled="rolesList.state.page === 0">上一页</button>
+          <span>第 {{ rolesList.state.page + 1 }} / {{ rolesList.totalPages.value }} 页 · 共 {{ rolesList.filtered.value.length }} 条</span>
+          <button @click="rolesList.state.page = Math.min(rolesList.totalPages.value - 1, rolesList.state.page + 1)" :disabled="rolesList.state.page >= rolesList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="rolesList.state.size" @change="rolesList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
+        </div>
+        <details style="margin-top:16px;">
+          <summary class="muted" style="cursor:pointer;">权限目录（只读）</summary>
+          <table class="data-table" style="margin-top:8px;">
+            <thead><tr><th>权限码</th><th>分类</th><th>描述</th></tr></thead>
+            <tbody>
+              <tr v-for="p in state.catalog.permissions" :key="p.code">
+                <td><code>{{ p.code }}</code></td>
+                <td>{{ p.category }}</td>
+                <td>{{ p.description }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </details>
       </section>
 
       <!-- ========== P4-B OAuth 客户端管理 ========== -->
@@ -6489,29 +9194,55 @@ function formatTimelineEventContent(event) {
         <div class="admin-toolbar">
           <button class="primary" @click="openCreateOauthClientModal">+ 新建外部应用</button>
         </div>
-        <div class="catalog-list">
-          <article v-for="item in state.catalog.oauthClients" :key="item.clientId" class="catalog-card">
-            <div class="catalog-card-head">
-              <div class="catalog-card-title">
-                <strong>{{ item.displayName }}</strong>
-                <span>{{ item.updatedAt }}</span>
-              </div>
-              <div class="catalog-row-actions">
+        <div class="list-toolbar">
+          <input class="list-toolbar-search" v-model="oauthClientsList.state.keyword" placeholder="搜索 client_id / 显示名 / owner" />
+          <button :disabled="!oauthClientsList.selection.size" class="list-toolbar-batch-delete" @click="batchDeleteOauthClients">
+            批量删除 ({{ oauthClientsList.selection.size }})
+          </button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-check"><input type="checkbox" :checked="oauthClientsList.allSelected.value" @change="oauthClientsList.toggleAll($event.target.checked)" /></th>
+              <th>Client ID</th>
+              <th>显示名</th>
+              <th>状态</th>
+              <th>显示 AI 按钮</th>
+              <th>Owner</th>
+              <th>Redirect URIs</th>
+              <th>Scopes</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in oauthClientsList.paged.value" :key="item.clientId" :class="{ 'row-selected': oauthClientsList.selection.has(item.clientId) }">
+              <td class="col-check"><input type="checkbox" :checked="oauthClientsList.selection.has(item.clientId)" @change="oauthClientsList.toggle(item.clientId, $event.target.checked)" /></td>
+              <td><code>{{ item.clientId }}</code></td>
+              <td><strong>{{ item.displayName }}</strong></td>
+              <td>{{ item.status }}</td>
+              <td>{{ item.displayEnabled === false ? '✗ 隐藏' : '✓ 显示' }}</td>
+              <td>{{ item.ownerUserId || "—" }}</td>
+              <td class="col-ellipsis" :title="item.redirectUris"><code>{{ item.redirectUris }}</code></td>
+              <td class="col-ellipsis" :title="item.scopes"><code>{{ item.scopes }}</code></td>
+              <td class="col-actions">
                 <button @click="editOauthClientHandler(item)">编辑</button>
-                <button @click="rotateOauthSecretHandler(item.clientId)">重新生成 secret</button>
+                <button @click="rotateOauthSecretHandler(item.clientId)">轮换 secret</button>
                 <button @click="deleteOauthClientHandler(item.clientId)">删除</button>
-              </div>
-            </div>
-            <p class="catalog-card-content">
-              client_id: <code>{{ item.clientId }}</code>
-              · status: {{ item.status }}
-              · owner: {{ item.ownerUserId || '—' }}
-            </p>
-            <p class="catalog-card-content"><strong>redirect_uris:</strong> <code>{{ item.redirectUris }}</code></p>
-            <p class="catalog-card-content"><strong>scopes:</strong> <code>{{ item.scopes }}</code></p>
-            <p v-if="item.description" class="catalog-card-content">{{ item.description }}</p>
-          </article>
-          <div v-if="!state.catalog.oauthClients.length" class="empty-state">还没有外部应用。</div>
+              </td>
+            </tr>
+            <tr v-if="!oauthClientsList.filtered.value.length"><td colspan="9" class="empty-row">{{ state.catalog.oauthClients.length ? "没有匹配的外部应用。" : "还没有外部应用。" }}</td></tr>
+          </tbody>
+        </table>
+        <div v-if="oauthClientsList.filtered.value.length > oauthClientsList.state.size" class="list-pager">
+          <button @click="oauthClientsList.state.page = Math.max(0, oauthClientsList.state.page - 1)" :disabled="oauthClientsList.state.page === 0">上一页</button>
+          <span>第 {{ oauthClientsList.state.page + 1 }} / {{ oauthClientsList.totalPages.value }} 页 · 共 {{ oauthClientsList.filtered.value.length }} 条</span>
+          <button @click="oauthClientsList.state.page = Math.min(oauthClientsList.totalPages.value - 1, oauthClientsList.state.page + 1)" :disabled="oauthClientsList.state.page >= oauthClientsList.totalPages.value - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="oauthClientsList.state.size" @change="oauthClientsList.state.page = 0">
+            <option :value="12">12</option>
+            <option :value="24">24</option>
+            <option :value="48">48</option>
+          </select>
         </div>
       </section>
 
@@ -6813,11 +9544,21 @@ function formatTimelineEventContent(event) {
             <input v-model="oauthClientForm.scopes" placeholder='["openid","profile"]' />
           </label>
           <label>
-            <span>状态</span>
+            <span>状态(功能开关)</span>
             <select v-model="oauthClientForm.status">
-              <option value="ACTIVE">ACTIVE</option>
-              <option value="DISABLED">DISABLED</option>
+              <option value="ACTIVE">ACTIVE — 启用,OAuth 正常发 token,功能可用</option>
+              <option value="DISABLED">DISABLED — 禁用,OAuth 拒发 token,功能不可用</option>
             </select>
+          </label>
+          <label style="flex-direction: row; gap: 8px; align-items: center;">
+            <input type="checkbox" v-model="oauthClientForm.displayEnabled" />
+            <span>
+              <strong>显示 AI 按钮</strong> ·
+              <span class="muted" style="font-size:12px;">
+                关掉 → xmap 嵌入端 AI 按钮 v-if 隐藏(功能不受影响,console 调 <code>__forceShowAi(true)</code> 仍可强显)。
+                跟"状态(功能开关)"双管:状态=DISABLED 时无论这里开关如何,按钮都藏 + 功能禁用。
+              </span>
+            </span>
           </label>
           <label>
             <span>owner user_id</span>
@@ -6846,6 +9587,11 @@ function formatTimelineEventContent(event) {
             <button class="recent-drawer-close" @click="closeRecentSessionsDrawer">关闭</button>
           </div>
         </div>
+        <div class="recent-drawer-search">
+          <input v-model="recentSessionsFilter.keyword"
+                 placeholder="搜索 标题 / sessionId / agentId" />
+          <span class="recent-drawer-search-stat">共 {{ recentSessionsTotal }} 条</span>
+        </div>
         <div class="session-list">
           <button
             v-for="session in recentSessions"
@@ -6860,7 +9606,23 @@ function formatTimelineEventContent(event) {
             </div>
             <span>{{ session.agentId }} · {{ session.sessionId }}</span>
           </button>
-          <div v-if="!recentSessions.length" class="empty-state compact">运行后会在这里保留最近会话。</div>
+          <div v-if="!recentSessions.length && !recentSessionsTotal" class="empty-state compact">
+            {{ recentSessionsFilter.keyword ? '没有匹配的会话。' : '运行后会在这里保留最近会话。' }}
+          </div>
+        </div>
+        <!-- 分页器:跟其他列表统一样式,贴抽屉底部 -->
+        <div v-if="recentSessionsTotal > 0" class="list-pager recent-drawer-pager">
+          <button @click="recentSessionsPage.page = Math.max(0, recentSessionsPage.page - 1)"
+                  :disabled="recentSessionsPage.page === 0">上一页</button>
+          <span>第 {{ recentSessionsPage.page + 1 }} / {{ recentSessionsTotalPages }} 页</span>
+          <button @click="recentSessionsPage.page = Math.min(recentSessionsTotalPages - 1, recentSessionsPage.page + 1)"
+                  :disabled="recentSessionsPage.page >= recentSessionsTotalPages - 1">下一页</button>
+          <span style="margin-left:auto;">每页:</span>
+          <select v-model.number="recentSessionsPage.size">
+            <option :value="15">15</option>
+            <option :value="30">30</option>
+            <option :value="60">60</option>
+          </select>
         </div>
       </aside>
     </transition>

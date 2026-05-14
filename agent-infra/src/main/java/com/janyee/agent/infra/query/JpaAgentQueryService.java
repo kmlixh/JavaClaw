@@ -12,7 +12,6 @@ import com.janyee.agent.infra.persistence.repository.RunRecordRepository;
 import com.janyee.agent.infra.persistence.repository.SessionMessageRepository;
 import com.janyee.agent.infra.persistence.repository.SessionRepository;
 import com.janyee.agent.infra.persistence.repository.ToolAuditLogRepository;
-import com.janyee.agent.infra.run.StaleRunReconciler;
 import com.janyee.agent.runtime.query.AgentQueryService;
 import com.janyee.agent.runtime.query.ArtifactView;
 import com.janyee.agent.runtime.query.SessionSummaryView;
@@ -36,7 +35,6 @@ public class JpaAgentQueryService implements AgentQueryService {
     private final ToolAuditLogRepository toolAuditLogRepository;
     private final ArtifactFileRepository artifactFileRepository;
     private final MemoryNoteRepository memoryNoteRepository;
-    private final StaleRunReconciler staleRunReconciler;
 
     public JpaAgentQueryService(
             SessionRepository sessionRepository,
@@ -44,8 +42,7 @@ public class JpaAgentQueryService implements AgentQueryService {
             RunRecordRepository runRecordRepository,
             ToolAuditLogRepository toolAuditLogRepository,
             ArtifactFileRepository artifactFileRepository,
-            MemoryNoteRepository memoryNoteRepository,
-            StaleRunReconciler staleRunReconciler
+            MemoryNoteRepository memoryNoteRepository
     ) {
         this.sessionRepository = sessionRepository;
         this.sessionMessageRepository = sessionMessageRepository;
@@ -53,17 +50,104 @@ public class JpaAgentQueryService implements AgentQueryService {
         this.toolAuditLogRepository = toolAuditLogRepository;
         this.artifactFileRepository = artifactFileRepository;
         this.memoryNoteRepository = memoryNoteRepository;
-        this.staleRunReconciler = staleRunReconciler;
     }
 
     @Override
-    public List<SessionSummaryView> listSessions(String agentId) {
+    public com.janyee.agent.runtime.query.SessionPage listSessionsPaged(String agentId, int page, int size, String keyword) {
+        return listSessionsPagedAdvanced(
+                com.janyee.agent.runtime.query.SessionListFilter.of(agentId, page, size, keyword));
+    }
+
+    @Override
+    public com.janyee.agent.runtime.query.SessionPage listSessionsPagedAdvanced(
+            com.janyee.agent.runtime.query.SessionListFilter filter) {
+        com.janyee.agent.infra.auth.SessionVisibility v =
+                visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        int safePage = Math.max(0, filter.page());
+        int safeSize = Math.min(Math.max(1, filter.size()), 200);
+        String kw = filter.keyword() == null ? null : filter.keyword().trim().toLowerCase();
+        boolean hasKw = kw != null && !kw.isEmpty();
+        String runStatus = filter.runStatus() == null ? null : filter.runStatus().trim().toLowerCase();
+        boolean filterRunning = "running".equals(runStatus);
+        boolean filterIdle = "idle".equals(runStatus);
+
+        org.springframework.data.jpa.domain.Specification<SessionEntity> spec = (root, q, cb) -> {
+            java.util.List<jakarta.persistence.criteria.Predicate> conds = new java.util.ArrayList<>();
+            if (filter.agentId() != null && !filter.agentId().isBlank()) {
+                conds.add(cb.equal(root.get("agentId"), filter.agentId()));
+            }
+            if (filter.userId() != null && !filter.userId().isBlank()) {
+                conds.add(cb.equal(root.get("userId"), filter.userId()));
+            }
+            if (filter.appId() != null && !filter.appId().isBlank()) {
+                conds.add(cb.equal(root.get("appId"), filter.appId()));
+            }
+            if (filter.tenantId() != null && !filter.tenantId().isBlank()) {
+                // 非 readAll 用户在 visibility 那一段已经被锁到 own tenant 上;这里加 tenant 过滤
+                // 只有 readAll 时才有意义(让 sysadmin 跨租户审计)。要求过滤的值就是过滤的值,
+                // visibility 的预测让 readTenant 跨租户传值时下面那道再加一刀也会匹配为空。
+                conds.add(cb.equal(root.get("tenantId"), filter.tenantId()));
+            }
+            if (hasKw) {
+                String like = "%" + kw + "%";
+                conds.add(cb.or(
+                        cb.like(cb.lower(root.<String>get("title")), like),
+                        cb.like(cb.lower(root.<String>get("id")), like),
+                        cb.like(cb.lower(root.<String>get("agentId")), like)
+                ));
+            }
+            // 权限过滤:readAll 不加;readTenant 限本租户;readOwn 限本用户
+            if (!v.readAll()) {
+                if (v.readTenant()) {
+                    conds.add(cb.equal(root.get("tenantId"), v.tenantId() == null ? "" : v.tenantId()));
+                } else {
+                    conds.add(cb.equal(root.get("userId"), v.userId() == null ? "" : v.userId()));
+                }
+            }
+            // runStatus = running / idle 用 EXISTS 子查询 join run_record
+            if (filterRunning || filterIdle) {
+                jakarta.persistence.criteria.Subquery<Long> sub = q.subquery(Long.class);
+                jakarta.persistence.criteria.Root<com.janyee.agent.infra.persistence.entity.RunRecordEntity>
+                        runRoot = sub.from(com.janyee.agent.infra.persistence.entity.RunRecordEntity.class);
+                sub.select(cb.literal(1L)).where(
+                        cb.equal(runRoot.get("sessionId"), root.get("id")),
+                        runRoot.get("status").in(IN_PROGRESS_STATUSES_FOR_FILTER)
+                );
+                conds.add(filterRunning ? cb.exists(sub) : cb.not(cb.exists(sub)));
+            }
+            return cb.and(conds.toArray(new jakarta.persistence.criteria.Predicate[0]));
+        };
+
+        org.springframework.data.domain.Pageable pageable =
+                org.springframework.data.domain.PageRequest.of(safePage, safeSize,
+                        org.springframework.data.domain.Sort.by(
+                                org.springframework.data.domain.Sort.Direction.DESC, "updatedAt"));
+        org.springframework.data.domain.Page<SessionEntity> result = sessionRepository.findAll(spec, pageable);
+        List<SessionSummaryView> rows = result.getContent().stream()
+                .map(this::toSessionSummary)
+                .toList();
+        return new com.janyee.agent.runtime.query.SessionPage(
+                rows, result.getTotalElements(), safePage, safeSize
+        );
+    }
+
+    private static final List<String> IN_PROGRESS_STATUSES_FOR_FILTER = List.of(
+            "RECEIVED", "CONTEXT_BUILT", "MODEL_RUNNING",
+            "TOOL_REQUESTED", "TOOL_EXECUTING", "TOOL_RESULT_APPENDED", "WAITING_APPROVAL"
+    );
+
+    @Override
+    public List<SessionSummaryView> listSessions(String agentId, int limit) {
         com.janyee.agent.infra.auth.AuthPrincipal principal =
                 com.janyee.agent.infra.auth.SecurityContextHolder.current();
         com.janyee.agent.infra.auth.SessionVisibility v = visibilityFor(principal);
+        // 取上限到 500:再多没意义(前端可视范围 + 网络体积),并防止恶意大查询打 DB。
+        int safeLimit = Math.min(Math.max(1, limit), 500);
+        org.springframework.data.domain.Pageable pageable =
+                org.springframework.data.domain.PageRequest.of(0, safeLimit);
         List<SessionEntity> sessions = agentId == null || agentId.isBlank()
-                ? sessionRepository.findTop20ByOrderByUpdatedAtDesc()
-                : sessionRepository.findTop20ByAgentIdOrderByUpdatedAtDesc(agentId);
+                ? sessionRepository.findAllByOrderByUpdatedAtDesc(pageable)
+                : sessionRepository.findByAgentIdOrderByUpdatedAtDesc(agentId, pageable);
         return sessions.stream()
                 .filter(s -> v.canRead(s.getTenantId(), s.getUserId()))
                 .map(this::toSessionSummary)
@@ -116,7 +200,9 @@ public class JpaAgentQueryService implements AgentQueryService {
         if (!v.canRead(run.getTenantId(), run.getUserId())) {
             throw new SecurityException("no permission to read run " + runId);
         }
-        staleRunReconciler.reconcileIfStale(run);
+        // 读路径不再 reconcile。读 DB 不能有副作用,更不能"顺手把别人在跑的 run 杀掉"——这是
+        // 之前观察到的 bug 的根源。run 终态由 executeRun 自己写,JVM 重启由 RunStartupRecoveryService
+        // 写,真卡死 60min 由 ScheduledRunReconcileSweeper 写,三条路径覆盖足够。
         return toRunDetail(run);
     }
 
@@ -133,17 +219,14 @@ public class JpaAgentQueryService implements AgentQueryService {
         }
         List<RunRecordEntity> runs = runRecordRepository.findBySessionId(sessionId);
         return runs.stream()
-                .map(run -> {
-                    staleRunReconciler.reconcileIfStale(run);
-                    return new RunSummaryView(
-                            run.getId(),
-                            run.getSessionId(),
-                            run.getStatus(),
-                            run.getDetail(),
-                            run.getCreatedAt(),
-                            run.getUpdatedAt()
-                    );
-                })
+                .map(run -> new RunSummaryView(
+                        run.getId(),
+                        run.getSessionId(),
+                        run.getStatus(),
+                        run.getDetail(),
+                        run.getCreatedAt(),
+                        run.getUpdatedAt()
+                ))
                 .toList();
     }
 
@@ -160,11 +243,33 @@ public class JpaAgentQueryService implements AgentQueryService {
         }
         return runRecordRepository.findFirstBySessionIdAndStatusInOrderByUpdatedAtDesc(
                         sessionId,
-                        List.of("RECEIVED", "CONTEXT_BUILT", "MODEL_RUNNING", "TOOL_REQUESTED", "TOOL_EXECUTING", "TOOL_RESULT_APPENDED", "WAITING_APPROVAL")
+                        IN_PROGRESS_STATUSES_FOR_FILTER
                 )
                 .filter(run -> !"service restarted before run completed".equals(run.getDetail()))
-                .filter(run -> !staleRunReconciler.reconcileIfStale(run))
                 .map(this::toRunDetail);
+    }
+
+    @Override
+    public List<RunDetailView> listVisibleActiveRuns() {
+        com.janyee.agent.infra.auth.SessionVisibility v =
+                visibilityFor(com.janyee.agent.infra.auth.SecurityContextHolder.current());
+        // 拉所有非终态 run。SessionVisibility 在 Java 层过滤 —— run_record 自己带 tenant/user,
+        // 用 canRead 判一刀即可,不用再 join session。规模上 in-progress run 同时几十条到上百条,
+        // 不会爆,不需要 DB 端再 push down 过滤。
+        List<RunRecordEntity> inProgressRuns = runRecordRepository.findByStatusIn(IN_PROGRESS_STATUSES_FOR_FILTER);
+        return inProgressRuns.stream()
+                .filter(run -> !"service restarted before run completed".equals(run.getDetail()))
+                .filter(run -> v.canRead(run.getTenantId(), run.getUserId()))
+                .sorted((a, b) -> {
+                    java.time.Instant aT = a.getUpdatedAt();
+                    java.time.Instant bT = b.getUpdatedAt();
+                    if (aT == null && bT == null) return 0;
+                    if (aT == null) return 1;
+                    if (bT == null) return -1;
+                    return bT.compareTo(aT);  // updated_at desc
+                })
+                .map(this::toRunDetail)
+                .toList();
     }
 
     private com.janyee.agent.infra.auth.SessionVisibility visibilityFor(com.janyee.agent.infra.auth.AuthPrincipal principal) {
@@ -262,7 +367,10 @@ public class JpaAgentQueryService implements AgentQueryService {
                 entity.getReferencesJson(),
                 entity.getAttachmentsJson(),
                 entity.getSeqNo(),
-                entity.getCreatedAt()
+                entity.getCreatedAt(),
+                entity.getPromptTokens(),
+                entity.getCompletionTokens(),
+                entity.getTotalTokens()
         );
     }
 

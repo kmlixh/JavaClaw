@@ -34,11 +34,15 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
     private final LlmProvider llmProvider;
     private final ToolRegistry toolRegistry;
     private final ToolPolicyService toolPolicyService;
+    private final com.janyee.agent.runtime.run.RunEventSink runEventSink;
 
-    public DefaultModelTurnExecutor(LlmProvider llmProvider, ToolRegistry toolRegistry, ToolPolicyService toolPolicyService) {
+    public DefaultModelTurnExecutor(LlmProvider llmProvider, ToolRegistry toolRegistry,
+                                    ToolPolicyService toolPolicyService,
+                                    com.janyee.agent.runtime.run.RunEventSink runEventSink) {
         this.llmProvider = llmProvider;
         this.toolRegistry = toolRegistry;
         this.toolPolicyService = toolPolicyService;
+        this.runEventSink = runEventSink;
     }
 
     @Override
@@ -47,6 +51,15 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
                 .filter(tool -> toolPolicyService.isAllowed(context.agentId(), tool.name()))
                 .map(tool -> tool.schema())
                 .toList();
+        // 复盘埋点:这次 LLM 调用的完整 prompt(含 plan / completed queries / 用户消息等)
+        if (runEventSink != null) {
+            try {
+                runEventSink.recordPromptSent(context.runId(), context.iterationCount() + 1,
+                        context.llmConfigId(), context.llmModel(), context.currentPrompt());
+            } catch (Exception ignored) {
+                // 埋点失败不影响主流程
+            }
+        }
         List<LlmStreamEvent> events = executeWithRetry(context, toolSchemas);
 
         events.stream()
@@ -68,8 +81,44 @@ public class DefaultModelTurnExecutor implements ModelTurnExecutor {
                 .orElse("stop");
         boolean finished = events.stream()
                 .anyMatch(event -> "finish".equalsIgnoreCase(event.type()));
+        // usage event 由 OpenAiCompatibleLlmProvider 在响应里有 usage 字段时 emit。
+        // 一次 LLM 调用最多一条;供应商不返就没有,三个值全 null。
+        Integer promptTokens = null;
+        Integer completionTokens = null;
+        Integer totalTokens = null;
+        for (LlmStreamEvent event : events) {
+            if (!"usage".equalsIgnoreCase(event.type()) || event.content() == null) {
+                continue;
+            }
+            try {
+                com.fasterxml.jackson.databind.JsonNode node =
+                        new com.fasterxml.jackson.databind.ObjectMapper().readTree(event.content());
+                promptTokens = node.path("prompt").asInt(0);
+                completionTokens = node.path("completion").asInt(0);
+                totalTokens = node.path("total").asInt(0);
+            } catch (Exception ignored) {
+                // 解析失败保持 null,不影响主流程
+            }
+            break;
+        }
 
-        return new ModelTurnResult(fullText, events, finished, finishReason);
+        // 复盘埋点:这次 LLM 调用的完整响应(fullText / finishReason / usage / thinking)
+        if (runEventSink != null) {
+            try {
+                String thinking = events.stream()
+                        .filter(e -> "thinking".equalsIgnoreCase(e.type()))
+                        .map(LlmStreamEvent::content)
+                        .reduce("", String::concat);
+                runEventSink.recordLlmResponse(context.runId(), context.iterationCount() + 1,
+                        finishReason, fullText, thinking,
+                        promptTokens, completionTokens, totalTokens);
+            } catch (Exception ignored) {
+                // 埋点失败不影响主流程
+            }
+        }
+
+        return new ModelTurnResult(fullText, events, finished, finishReason,
+                promptTokens, completionTokens, totalTokens);
     }
 
     private List<LlmStreamEvent> executeWithRetry(ToolLoopContext context, List<ToolSchema> toolSchemas) {

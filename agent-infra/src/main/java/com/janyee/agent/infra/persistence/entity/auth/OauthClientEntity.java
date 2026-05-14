@@ -31,9 +31,18 @@ public class OauthClientEntity {
     @Column(name = "scopes", nullable = false, columnDefinition = "TEXT")
     private String scopes;
 
-    /** ACTIVE | DISABLED */
+    /** ACTIVE | DISABLED —— 控制功能:DISABLED 时 OAuth 拒发 token,所有 chat / send 功能不可用。 */
     @Column(name = "status", length = 32, nullable = false)
     private String status;
+
+    /**
+     * UI 显示开关 —— 控制嵌入页面(xmap-ol-front 等)的 AI 按钮 v-if。
+     * displayEnabled=false 时按钮隐藏,功能不受影响;
+     * status=DISABLED + displayEnabled=true:按钮也隐藏(AppStatusService 统一返回 enabled=false)。
+     * 默认 true,沿用历史行为(从前没这字段 → status=ACTIVE 时默认显示)。
+     */
+    @Column(name = "display_enabled", nullable = false)
+    private boolean displayEnabled = true;
 
     @Column(name = "owner_user_id", length = 64)
     private String ownerUserId;
@@ -77,6 +86,8 @@ public class OauthClientEntity {
     public void setScopes(String scopes) { this.scopes = scopes; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+    public boolean isDisplayEnabled() { return displayEnabled; }
+    public void setDisplayEnabled(boolean displayEnabled) { this.displayEnabled = displayEnabled; }
     public String getOwnerUserId() { return ownerUserId; }
     public void setOwnerUserId(String ownerUserId) { this.ownerUserId = ownerUserId; }
     public String getTenantId() { return tenantId; }

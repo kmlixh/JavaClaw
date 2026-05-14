@@ -50,6 +50,13 @@ public class RedisSessionLockManager implements SessionLockManager {
         }
     }
 
+    @Override
+    public boolean isLocked(String sessionId) {
+        if (sessionId == null) return false;
+        Boolean exists = redisTemplate.hasKey(lockKey(sessionId));
+        return Boolean.TRUE.equals(exists);
+    }
+
     private String lockKey(String sessionId) {
         String prefix = properties.sessionLock() != null && properties.sessionLock().keyPrefix() != null
                 ? properties.sessionLock().keyPrefix()

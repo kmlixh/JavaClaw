@@ -37,8 +37,43 @@ public class JpaRunRecordService implements RunRecordService {
             String llmProvider,
             String llmModel
     ) {
-        RunRecordEntity entity = new RunRecordEntity();
         String runId = UUID.randomUUID().toString();
+        doCreate(runId, sessionId, agentId, userId, message, references, attachments,
+                llmConfigId, llmProvider, llmModel);
+        return runId;
+    }
+
+    @Override
+    @Transactional
+    public void createAcceptedRunWithId(
+            String runId,
+            String sessionId,
+            String agentId,
+            String userId,
+            String message,
+            List<ChatContextReference> references,
+            List<ChatAttachment> attachments,
+            String llmConfigId,
+            String llmProvider,
+            String llmModel
+    ) {
+        if (runId == null || runId.isBlank()) {
+            throw new IllegalArgumentException("runId 不能为空");
+        }
+        // 幂等:如果已经存在(例如 lab 重启)直接跳过,不抢覆盖
+        if (runRecordRepository.findById(runId).isPresent()) {
+            return;
+        }
+        doCreate(runId, sessionId, agentId, userId, message, references, attachments,
+                llmConfigId, llmProvider, llmModel);
+    }
+
+    private void doCreate(
+            String runId, String sessionId, String agentId, String userId,
+            String message, List<ChatContextReference> references, List<ChatAttachment> attachments,
+            String llmConfigId, String llmProvider, String llmModel
+    ) {
+        RunRecordEntity entity = new RunRecordEntity();
         entity.setId(runId);
         entity.setSessionId(sessionId);
         entity.setAgentId(agentId);
@@ -66,7 +101,6 @@ public class JpaRunRecordService implements RunRecordService {
             entity.setAppId(principal.appId());
         }
         runRecordRepository.save(entity);
-        return runId;
     }
 
     @Override
@@ -79,6 +113,31 @@ public class JpaRunRecordService implements RunRecordService {
         });
     }
 
+    private static final java.util.Set<String> IN_PROGRESS_STATUSES = java.util.Set.of(
+            RunStatus.RECEIVED.name(),
+            RunStatus.CONTEXT_BUILT.name(),
+            RunStatus.MODEL_RUNNING.name(),
+            RunStatus.TOOL_REQUESTED.name(),
+            RunStatus.TOOL_EXECUTING.name(),
+            RunStatus.TOOL_RESULT_APPENDED.name()
+    );
+
+    @Override
+    @Transactional
+    public boolean updateStatusIfInProgress(String runId, RunStatus status, String detail) {
+        return runRecordRepository.findById(runId)
+                .map(entity -> {
+                    if (!IN_PROGRESS_STATUSES.contains(entity.getStatus())) {
+                        return false;
+                    }
+                    entity.setStatus(status.name());
+                    entity.setDetail(detail);
+                    runRecordRepository.save(entity);
+                    return true;
+                })
+                .orElse(false);
+    }
+
     @Override
     @Transactional
     public void updatePlan(String runId, String planJson) {
@@ -86,6 +145,26 @@ public class JpaRunRecordService implements RunRecordService {
         runRecordRepository.findById(runId).ifPresent(entity -> {
             // 空串当成"无 plan"处理 -> null;前端读到 null 就不渲染 plan 面板。
             entity.setPlanJson(planJson == null || planJson.isBlank() ? null : planJson);
+            runRecordRepository.save(entity);
+        });
+    }
+
+    @Override
+    @Transactional
+    public void attachEventLog(String runId, String eventLogJson) {
+        if (runId == null || runId.isBlank()) return;
+        runRecordRepository.findById(runId).ifPresent(entity -> {
+            entity.setEventLogJson(eventLogJson == null || eventLogJson.isBlank() ? null : eventLogJson);
+            runRecordRepository.save(entity);
+        });
+    }
+
+    @Override
+    @Transactional
+    public void attachRawLog(String runId, String rawLogText) {
+        if (runId == null || runId.isBlank()) return;
+        runRecordRepository.findById(runId).ifPresent(entity -> {
+            entity.setRawLogText(rawLogText == null || rawLogText.isBlank() ? null : rawLogText);
             runRecordRepository.save(entity);
         });
     }

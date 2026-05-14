@@ -118,29 +118,32 @@ final class FlowTestSupport {
         require(llmConfigId.equals(accepted.llmConfigId()), "chat send did not persist llm config id");
         require(expectedModel.equals(accepted.llmModel()), "chat send did not echo selected llm model");
 
-        String streamBody = webClient.get()
-                .uri(uriBuilder -> uriBuilder.path("/api/chat/stream")
-                        .queryParam("runId", accepted.runId())
-                        .queryParam("sessionId", accepted.sessionId())
-                        .queryParam("agentId", accepted.agentId())
-                        .queryParam("llmConfigId", accepted.llmConfigId())
-                        .queryParam("llmModel", expectedModel)
-                        .queryParam("userId", "smoke-user")
-                        .queryParam("message", message)
-                        .build())
-                .accept(MediaType.TEXT_EVENT_STREAM)
-                .retrieve()
-                .bodyToMono(String.class)
-                .block();
-        require(streamBody != null && streamBody.contains("event:RUN_COMPLETED"), "stream did not complete successfully");
-        require(streamBody.contains("event:RUN_STARTED"), "stream did not emit RUN_STARTED");
-
-        RunDetailResponse run = webClient.get()
-                .uri("/api/runs/{id}", accepted.runId())
-                .retrieve()
-                .bodyToMono(RunDetailResponse.class)
-                .block();
+        // 通信架构改造后,实时事件不再走 SSE/HTTP `/api/chat/stream`(已删),走单条用户级
+        // `/ws/events` WebSocket 总线。smoke test 不开 WS,改成轮询 `/api/runs/{id}` 看终态。
+        // 投票超时上限按 60s,够 dev-agent + 简单 message 跑完;超时直接 fail。
+        RunDetailResponse run = null;
+        long deadline = System.currentTimeMillis() + 60_000L;
+        while (System.currentTimeMillis() < deadline) {
+            run = webClient.get()
+                    .uri("/api/runs/{id}", accepted.runId())
+                    .retrieve()
+                    .bodyToMono(RunDetailResponse.class)
+                    .block();
+            if (run != null && isTerminalStatus(run.status())) {
+                break;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while polling run status", e);
+            }
+        }
         require(run != null, "run detail returned null");
+        require(isTerminalStatus(run.status()),
+                "run did not reach terminal status within timeout; lastStatus=" + run.status());
+        require("COMPLETED".equals(run.status()),
+                "run terminated non-successfully: status=" + run.status() + ", detail=" + run.detail());
         require(llmConfigId.equals(run.llmConfigId()), "run detail lost llm config id");
         require(expectedModel.equals(run.llmModel()), "run detail lost llm model");
 
@@ -155,6 +158,10 @@ final class FlowTestSupport {
                 "session transcript did not include assistant message");
         require(session.messages().stream().anyMatch(item -> "user".equals(item.role()) && message.equals(item.content())),
                 "session transcript did not include original user message");
+    }
+
+    private static boolean isTerminalStatus(String status) {
+        return "COMPLETED".equals(status) || "FAILED".equals(status) || "CANCELLED".equals(status);
     }
 
     static void require(boolean condition, String message) {

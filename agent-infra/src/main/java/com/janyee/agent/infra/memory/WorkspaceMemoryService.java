@@ -40,19 +40,10 @@ public class WorkspaceMemoryService implements MemoryService {
             candidates.addAll(extractCandidates(file.relativePath(), file.content()));
         }
 
-        // 按 scope 检索（V14 之后的权威规则）：
-        //   - 本 session 的 session-scope note（通常是 run_summary）—— 只本 session 可见
-        //   - 全部 agent-scope / global-scope note —— 跨 session 共享
-        // 旧的 source='pinned' 兼容也保留：历史数据在 V14 迁移后已被重标为 scope='agent'，
-        //   但手工写入的代码路径还有可能用 source=pinned 作标签，这里按 source 再兜一层。
-        if (query.sessionId() != null && !query.sessionId().isBlank()) {
-            memoryNoteRepository.findTop20ByAgentIdAndSessionIdOrderByCreatedAtDesc(
-                            query.agentId(), query.sessionId())
-                    .stream()
-                    .filter(note -> "session".equals(safeScope(note.getScope())))
-                    .forEach(note -> candidates.add(
-                            new Candidate("db-note#" + note.getId() + "/session", note.getContent())));
-        }
+        // 用户决策:会话内的历史消息(run_summary、上一次 Run 产出的中间结论等)**不再**
+        // 注入当前 Run 的 prompt。以前 session-scope note 会被拉进来,导致 LLM 把上一次报告
+        // 里的数字当成"已知事实",直接写进新报告(典型的"幻觉数据"来源)。
+        // 保留的:agent / global scope —— 这是用户显式 pin 的长期备注,跨 session 共享。
         memoryNoteRepository.findTop40ByAgentIdAndScopeInOrderByCreatedAtDesc(
                         query.agentId(), java.util.List.of("agent", "global"))
                 .forEach(note -> candidates.add(

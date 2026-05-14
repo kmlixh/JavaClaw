@@ -23,10 +23,21 @@ public final class SmokeTestMain {
                     true
             );
 
-            WebClient webClient = FlowTestSupport.createClient(context);
-            FlowTestSupport.verifyHttpFlow(webClient, "smoke-glm47", "Pro/zai-org/GLM-4.7", "/tool echo smoke");
-
-            System.out.println("SMOKE TEST PASSED");
+            try {
+                WebClient webClient = FlowTestSupport.createClient(context);
+                FlowTestSupport.verifyHttpFlow(webClient, "smoke-glm47", "Pro/zai-org/GLM-4.7", "/tool echo smoke");
+                System.out.println("SMOKE TEST PASSED");
+            } finally {
+                // 一定要清掉:smoke-glm47 用的是 127.0.0.1:9 这种不存在的 LLM endpoint,种子留在
+                // 共享 DB 里会污染所有真实用户的 chat —— 没指定 llmConfigId 就被当成 default 选中,
+                // 真实 chat 请求挂在 Connection refused 上。historically 这条没清,导致开发环境
+                // 手动测的人莫名其妙就遇到 LLM 拒连。
+                try {
+                    FlowTestSupport.deleteLlmConfig(context, "smoke-glm47");
+                } catch (Exception cleanupError) {
+                    System.err.println("smoke-test cleanup failed: " + cleanupError.getMessage());
+                }
+            }
         }
     }
 }

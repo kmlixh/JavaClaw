@@ -125,6 +125,8 @@ public class JiutianLlmProvider implements LlmProvider {
             if (content.isBlank()) {
                 content = firstChoice.path("text").asText("");
             }
+            // 非流式响应里 usage 跟 choices 在同一层。九天返了就抽出来,跟 OpenAI 兼容口径对齐。
+            LlmStreamEvent usage = extractUsageEvent(root);
             JsonNode toolCalls = firstChoice.path("message").path("tool_calls");
             if (toolCalls.isArray() && !toolCalls.isEmpty()) {
                 JsonNode firstToolCall = toolCalls.get(0);
@@ -133,19 +135,20 @@ public class JiutianLlmProvider implements LlmProvider {
                         "name", firstToolCall.path("function").path("name").asText(""),
                         "arguments", firstToolCall.path("function").path("arguments").asText("{}")
                 ));
-                return Flux.just(
-                        new LlmStreamEvent("tool_call_request", payload),
-                        new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("tool_calls"))
-                );
+                java.util.List<LlmStreamEvent> events = new java.util.ArrayList<>();
+                events.add(new LlmStreamEvent("tool_call_request", payload));
+                events.add(new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("tool_calls")));
+                if (usage != null) events.add(usage);
+                return Flux.fromIterable(events);
             }
 
+            java.util.List<LlmStreamEvent> events = new java.util.ArrayList<>();
             if (!content.isBlank()) {
-                return Flux.just(
-                        new LlmStreamEvent("token", content),
-                        new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop"))
-                );
+                events.add(new LlmStreamEvent("token", content));
             }
-            return Flux.just(new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop")));
+            events.add(new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop")));
+            if (usage != null) events.add(usage);
+            return Flux.fromIterable(events);
         } catch (Exception error) {
             return Flux.just(new LlmStreamEvent("error", "invalid llm response: " + error.getMessage()));
         }
@@ -162,9 +165,12 @@ public class JiutianLlmProvider implements LlmProvider {
 
         try {
             JsonNode root = objectMapper.readTree(data);
+            // 九天/Moma 流式最后一帧:choices=[] + usage={...}(开了 stream_options.include_usage 后才下发)。
+            // choices 非空时也可能挂带 usage(部分变体提前给),两处都查。
+            LlmStreamEvent usage = extractUsageEvent(root);
             JsonNode choices = root.path("choices");
             if (!choices.isArray() || choices.isEmpty()) {
-                return List.of();
+                return usage == null ? List.of() : List.of(usage);
             }
 
             JsonNode firstChoice = choices.get(0);
@@ -214,9 +220,39 @@ public class JiutianLlmProvider implements LlmProvider {
             if (!finishReason.isBlank()) {
                 out.add(new LlmStreamEvent("finish", finishReason));
             }
+            if (usage != null) {
+                out.add(usage);
+            }
             return out;
         } catch (Exception error) {
             return List.of(new LlmStreamEvent("error", "invalid llm stream chunk: " + error.getMessage()));
+        }
+    }
+
+    /**
+     * 抽 usage 字段成 LlmStreamEvent("usage", {...} JSON)。九天/Moma 不返就 null。
+     * key 用 prompt/completion/total,跟 session_message 的列名对齐,DefaultModelTurnExecutor 直接读。
+     */
+    private LlmStreamEvent extractUsageEvent(JsonNode root) {
+        JsonNode usage = root.path("usage");
+        if (!usage.isObject()) {
+            return null;
+        }
+        int prompt = usage.path("prompt_tokens").asInt(0);
+        int completion = usage.path("completion_tokens").asInt(0);
+        int total = usage.path("total_tokens").asInt(0);
+        if (prompt == 0 && completion == 0 && total == 0) {
+            return null;
+        }
+        try {
+            String payload = objectMapper.writeValueAsString(Map.of(
+                    "prompt", prompt,
+                    "completion", completion,
+                    "total", total
+            ));
+            return new LlmStreamEvent("usage", payload);
+        } catch (Exception error) {
+            return null;
         }
     }
 
@@ -224,6 +260,11 @@ public class JiutianLlmProvider implements LlmProvider {
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", defaultIfBlank(request.model(), llm.model()));
         payload.put("stream", stream);
+        if (stream) {
+            // OpenAI 兼容口径:开 include_usage 后,流式响应最后一帧 choices=[] 带 usage,
+            // 拿到 prompt/completion/total tokens。九天 Moma 文档明确支持;不支持也不会报错。
+            payload.put("stream_options", Map.of("include_usage", true));
+        }
         payload.put("auditSwitch", true);
         payload.put("messages", List.of(Map.of("role", "user", "content", request.prompt())));
         if (request.tools() != null && !request.tools().isEmpty()) {

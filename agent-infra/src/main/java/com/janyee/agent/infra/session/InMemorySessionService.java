@@ -64,8 +64,14 @@ public class InMemorySessionService implements SessionService {
     @Override
     @Transactional
     public void deleteSession(String sessionId) {
-        if (!sessionRepository.existsById(sessionId)) {
-            throw new IllegalArgumentException("session not found: " + sessionId);
+        SessionEntity session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new IllegalArgumentException("session not found: " + sessionId));
+        // 越权防御:跟读路径同档判定 —— readAll(sysadmin)/readTenant(本租户)/readOwn(本人)。
+        // 之前缺这条,任何登录用户拿到 sessionId 就能 DELETE。
+        com.janyee.agent.infra.auth.SessionVisibility v =
+                com.janyee.agent.infra.auth.SessionVisibility.forCurrent();
+        if (!v.canRead(session.getTenantId(), session.getUserId())) {
+            throw new SecurityException("no permission to delete session " + sessionId);
         }
         toolAuditLogRepository.deleteBySessionId(sessionId);
         artifactFileRepository.deleteBySessionId(sessionId);

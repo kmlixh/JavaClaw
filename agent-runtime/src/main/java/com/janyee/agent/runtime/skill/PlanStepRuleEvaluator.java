@@ -210,13 +210,19 @@ public final class PlanStepRuleEvaluator {
     }
 
     /**
-     * 字符串规范化用于锚点匹配:把所有 Java 空白字符(\\s) + 中文全角空格 \\u3000 +
-     * 不间断空格 \\u00A0 等都去掉。这样 "OTT 5G 弱覆盖" / "OTT5G弱覆盖" / "OTT 5G弱覆盖"
-     * 视为同一锚点,LLM 在排版上的格式微差不会让 run 卡死在 plan.update 校验循环里。
+     * 字符串规范化用于锚点匹配。三件事:
+     * <ol>
+     *   <li>去所有 Java 空白(\\s) + 中文全角空格 \\u3000 + 不间断空格 \\u00A0,所以
+     *       "OTT 5G 弱覆盖" / "OTT5G弱覆盖" / "OTT 5G弱覆盖" 视为同一锚点</li>
+     *   <li>大小写归一化(toLowerCase),所以 "OTT" / "ott" / "Ott" 都算命中。LLM 偶尔会
+     *       把英文缩写写成小写或首字母大写,不该让校验把整轮 run 卡住</li>
+     *   <li>中文字符 toLowerCase 是 no-op,本步骤对中文锚点零影响</li>
+     * </ol>
+     * 校验时锚点和 content 双方都过这一遍,然后做 contains 比较。
      */
     private static String normalizeForAnchorMatch(String raw) {
         if (raw == null) return "";
-        return raw.replaceAll("[\\s\\u00A0\\u3000]+", "");
+        return raw.replaceAll("[\\s\\u00A0\\u3000]+", "").toLowerCase(java.util.Locale.ROOT);
     }
 
     /**

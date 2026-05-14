@@ -60,6 +60,18 @@ public class SessionMessageEntity {
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
+    // Token 用量(只有 role=assistant 行有非空值;user/tool 行恒为 null)。
+    // 一次 run 通常多轮 LLM 调用,这里存的是该 run 所有 LLM 调用的累计值,
+    // 跟最终生成的 assistant message 一一对应。给资费 / 用量分析用。
+    @Column(name = "prompt_tokens")
+    private Integer promptTokens;
+
+    @Column(name = "completion_tokens")
+    private Integer completionTokens;
+
+    @Column(name = "total_tokens")
+    private Integer totalTokens;
+
     public Long getId() {
         return id;
     }
@@ -154,6 +166,30 @@ public class SessionMessageEntity {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public Integer getPromptTokens() {
+        return promptTokens;
+    }
+
+    public void setPromptTokens(Integer promptTokens) {
+        this.promptTokens = promptTokens;
+    }
+
+    public Integer getCompletionTokens() {
+        return completionTokens;
+    }
+
+    public void setCompletionTokens(Integer completionTokens) {
+        this.completionTokens = completionTokens;
+    }
+
+    public Integer getTotalTokens() {
+        return totalTokens;
+    }
+
+    public void setTotalTokens(Integer totalTokens) {
+        this.totalTokens = totalTokens;
     }
 
     @PrePersist

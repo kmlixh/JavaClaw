@@ -49,7 +49,9 @@ async function check(response) {
   }
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    const err = new Error(text || `HTTP ${response.status}`);
+    err.status = response.status;
+    throw err;
   }
   return response;
 }
@@ -138,6 +140,30 @@ export async function changePassword(oldPassword, newPassword) {
   return res.json();
 }
 
+/**
+ * 大文件附件流式上传 —— FormData multipart,后端 transferTo 直接落工作区,
+ * 不走 base64 内联。返回 {name, path, contentType, size, sessionId, agentId}。
+ */
+export async function uploadChatAttachment(file, { sessionId, agentId } = {}) {
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (agentId) params.set("agentId", agentId);
+  const url = `/api/chat/attachments${params.toString() ? "?" + params.toString() : ""}`;
+  // 注意:不设 Content-Type,让浏览器自己加 multipart/form-data; boundary=...
+  const response = await authedFetch(url, { method: "POST", body: fd });
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.message) detail = body.message;
+    } catch (_) { /* 非 JSON 错误,保持 status text */ }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
 export async function listAgents() {
   return check(await authedFetch("/api/agents")).then((r) => r.json());
 }
@@ -162,9 +188,10 @@ export async function deleteAdminLlm(id) {
   return check(await authedFetch(`/api/admin/llms/${encodeURIComponent(id)}`, { method: "DELETE" }));
 }
 
-export async function listSessions(agentId) {
+export async function listSessions(agentId, limit) {
   const params = new URLSearchParams();
   if (agentId) params.set("agentId", agentId);
+  if (limit && Number.isFinite(limit) && limit > 0) params.set("limit", String(limit));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return check(await authedFetch(`/api/sessions${suffix}`)).then((r) => r.json());
 }
@@ -197,6 +224,17 @@ export async function deleteSession(sessionId) {
 
 export async function getRun(runId) {
   return check(await authedFetch(`/api/runs/${encodeURIComponent(runId)}`)).then((r) => r.json());
+}
+
+/**
+ * 拉一个进行中 run 的事件历史快照(内存里累积的)。
+ * 用于"刷新页面后恢复 in-progress run"流程:先 GET 这个端点把已发生的事件回灌 UI,再开 WS attach。
+ * 已结束 / 没权限 / 不存在都返回 [],前端按 type|runId|timestamp|content 自动 dedup。
+ */
+export async function getRunEventSnapshot(runId) {
+  const response = await authedFetch(`/api/runs/${encodeURIComponent(runId)}/event-snapshot`);
+  await check(response);
+  return response.json();
 }
 
 export async function getActiveRun(sessionId) {
@@ -473,107 +511,327 @@ export async function reject(id) {
   return check(await authedFetch(`/api/approvals/${encodeURIComponent(id)}/reject`, { method: "POST" })).then((r) => r.json());
 }
 
-export function createSseStream({ sessionId, agentId, llmConfigId, llmModel, userId, message, runId, onEvent, onError }) {
-  const params = new URLSearchParams({ sessionId, userId, message });
-  if (agentId) params.set("agentId", agentId);
-  if (llmConfigId) params.set("llmConfigId", llmConfigId);
-  if (llmModel) params.set("llmModel", llmModel);
-  if (runId) params.set("runId", runId);
-  if (embedAccessToken) params.set("access_token", embedAccessToken);
-  // SSE EventSource 不能设 header,token 走 query。后端 JwtAuthWebFilter 会读 access_token。
-  const source = new EventSource(`/api/chat/stream?${params.toString()}`);
-  let terminalReceived = false;
+/**
+ * 用户级单连接 WebSocket。登录之后建一条到 /ws/events 的长连接,后端 UserEventHub 按用户权限
+ * fan-out 所有可见 session 的事件流到这一条 socket。每个浏览器 tab 一条,断线指数退避重连。
+ *
+ * 旧的 createSseStream / createWebSocketStream(每发一条消息或每打开一个 session 就开一条新 WS)
+ * 已经完全删掉:消息发送走 HTTP POST /api/chat/send,事件接收走这条单 socket。
+ *
+ * @param {{onEvent, onOpen, onClose, onError}} cbs - 仅 onEvent 必填。
+ * @returns 一个 { close() } 句柄,调用 close 永久断开本连接(不自动重连)。
+ */
+export function openGlobalEventSocket({ onEvent, onOpen, onClose, onError } = {}) {
+  if (typeof onEvent !== "function") {
+    throw new Error("openGlobalEventSocket: onEvent is required");
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  let socket = null;
+  let pingTimer = null;
+  let pongWatchdog = null;
+  let nextPingId = 1;
+  let lastPingId = 0;
+  let manuallyClosed = false;
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
 
-  [
-    "RUN_STARTED",
-    "RUN_STATUS",
-    "TOKEN_DELTA",
-    "TOOL_REQUESTED",
-    "TOOL_STARTED",
-    "TOOL_COMPLETED",
-    "APPROVAL_REQUIRED",
-    "PLAN_UPDATED",
-    "RUN_COMPLETED",
-    "RUN_FAILED"
-  ].forEach((type) => {
-    source.addEventListener(type, (event) => {
-      if (type === "RUN_COMPLETED" || type === "RUN_FAILED") {
-        terminalReceived = true;
+  const PING_INTERVAL_MS = 15_000;
+  const PONG_TIMEOUT_MS = 10_000;
+  const RECONNECT_BASE_MS = 1_000;
+  const RECONNECT_MAX_MS = 30_000;
+
+  function buildUrl() {
+    // embed 模式必须把 token 拼到 URL(浏览器 WebSocket API 不能设 header)。同源 cookie 模式
+    // 不需要 access_token,AGENT_TOKEN cookie 会被浏览器自动带上 handshake。
+    const params = new URLSearchParams();
+    if (embedAccessToken) params.set("access_token", embedAccessToken);
+    const qs = params.toString();
+    return `${protocol}//${window.location.host}/ws/events${qs ? `?${qs}` : ""}`;
+  }
+
+  function stopHeartbeat() {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (pongWatchdog) { clearTimeout(pongWatchdog); pongWatchdog = null; }
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    pingTimer = setInterval(() => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const id = nextPingId++;
+      lastPingId = id;
+      try {
+        socket.send(JSON.stringify({ type: "ping", id, ts: Date.now() }));
+      } catch (sendError) {
+        console.warn("[global.ws.ping.send_failed]", sendError);
+        return;
       }
-      onEvent({
-        type,
-        runId: event.lastEventId,
-        content: event.data,
-        timestamp: new Date().toISOString()
-      });
-    });
-  });
+      if (pongWatchdog) clearTimeout(pongWatchdog);
+      pongWatchdog = setTimeout(() => {
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+          console.warn("[global.ws.pong.timeout_force_close]", { lastPingId });
+          try { socket.close(4000, "heartbeat_timeout"); } catch (_) { /* ignore */ }
+        }
+      }, PONG_TIMEOUT_MS);
+    }, PING_INTERVAL_MS);
+  }
 
-  source.onerror = (error) => {
-    if (terminalReceived || source.readyState === EventSource.CLOSED) {
-      source.close();
+  function scheduleReconnect() {
+    if (manuallyClosed) return;
+    if (reconnectTimer) return;
+    const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
+    reconnectAttempts += 1;
+    console.log("[global.ws.reconnect.scheduled]", { attempt: reconnectAttempts, delayMs: delay });
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (manuallyClosed) return;
+      connect();
+    }, delay);
+  }
+
+  function connect() {
+    const url = buildUrl();
+    console.log("[global.ws.connecting]", url);
+    try {
+      socket = new WebSocket(url);
+    } catch (error) {
+      console.error("[global.ws.construct_failed]", error);
+      scheduleReconnect();
       return;
     }
-    onError(error);
-    source.close();
-  };
+    socket.onopen = () => {
+      console.log("[global.ws.open]", url);
+      reconnectAttempts = 0;
+      startHeartbeat();
+      onOpen?.();
+    };
+    socket.onmessage = (event) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (parseError) {
+        console.error("[global.ws.invalid]", event.data, parseError);
+        return;
+      }
+      // 心跳响应,业务不感知
+      if (payload && payload.type === "pong") {
+        if (pongWatchdog) { clearTimeout(pongWatchdog); pongWatchdog = null; }
+        return;
+      }
+      // 后端的鉴权拒绝消息:走 401 流程跳登录
+      if (payload && payload.type === "AUTH_REJECTED") {
+        console.warn("[global.ws.auth_rejected]", payload.message);
+        manuallyClosed = true;
+        stopHeartbeat();
+        try { socket.close(4001, "auth_rejected"); } catch (_) { /* ignore */ }
+        dispatchUnauthorized();
+        return;
+      }
+      onEvent(payload);
+    };
+    socket.onerror = (error) => {
+      console.warn("[global.ws.error]", error);
+      onError?.(error);
+    };
+    socket.onclose = (event) => {
+      stopHeartbeat();
+      console.log("[global.ws.close]", {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean
+      });
+      onClose?.(event);
+      socket = null;
+      if (!manuallyClosed) {
+        scheduleReconnect();
+      }
+    };
+  }
 
-  return source;
+  connect();
+
+  return {
+    close() {
+      manuallyClosed = true;
+      stopHeartbeat();
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (socket) {
+        try { socket.close(1000, "client_close"); } catch (_) { /* ignore */ }
+        socket = null;
+      }
+    }
+  };
 }
 
-export function createWebSocketStream({ sessionId, agentId, llmConfigId, llmModel, userId, message, runId, attach, onEvent, onClose, onError, onOpen }) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const params = new URLSearchParams({ sessionId, userId, message });
-  if (agentId) params.set("agentId", agentId);
-  if (llmConfigId) params.set("llmConfigId", llmConfigId);
-  if (llmModel) params.set("llmModel", llmModel);
-  if (runId) params.set("runId", runId);
-  if (attach) params.set("attach", "true");
-  if (embedAccessToken) params.set("access_token", embedAccessToken);
-  const wsUrl = `${protocol}//${window.location.host}/ws/chat?${params.toString()}`;
-  console.log("[ws.connecting]", {
-    url: wsUrl,
-    sessionId,
-    agentId: agentId || "",
-    llmConfigId: llmConfigId || "",
-    llmModel: llmModel || "",
-    runId: runId || "",
-    attach: !!attach
+// ----- Token Usage --------------------------------------------------------
+// 三组接口用于"Token 用量"页面;权限过滤后端做(SessionVisibility 三档)。
+// 时间参数支持 ISO-8601(2026-05-09T00:00:00Z) 或 epoch millis。
+
+export async function fetchUsageSummary({ from, to, groupBy } = {}) {
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  if (groupBy) params.set("groupBy", groupBy);
+  const response = await authedFetch(`/api/usage/summary?${params}`);
+  await check(response);
+  return response.json();
+}
+
+export async function fetchUsageTimeseries({ from, to, interval, groupBy } = {}) {
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  if (interval) params.set("interval", interval);
+  if (groupBy) params.set("groupBy", groupBy);
+  const response = await authedFetch(`/api/usage/timeseries?${params}`);
+  await check(response);
+  return response.json();
+}
+
+export async function fetchUsageRecent({ limit = 50 } = {}) {
+  const response = await authedFetch(`/api/usage/recent?limit=${limit}`);
+  await check(response);
+  return response.json();
+}
+
+// ----- Agent 实验室 -------------------------------------------------------
+// 仅系统管理员可见,后端要求 permission session.read.all 或 agent.lab.use 之一,
+// 匿名期(anonymous-enabled=true)无障碍。
+
+export async function labCreateTask(payload) {
+  const response = await authedFetch("/api/lab/tasks", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
   });
-  const socket = new WebSocket(wsUrl);
+  await check(response);
+  return response.json();
+}
 
-  socket.onopen = () => {
-    console.log("[ws.open]", {
-      url: wsUrl,
-      readyState: socket.readyState
-    });
-    onOpen?.();
-  };
+export async function labListTasks() {
+  const response = await authedFetch("/api/lab/tasks");
+  await check(response);
+  return response.json();
+}
 
-  socket.onmessage = (event) => {
-    console.log("[ws.raw.text]", event.data);
-    let payload = null;
-    try {
-      payload = JSON.parse(event.data);
-    } catch (error) {
-      console.error("[ws.raw.invalid]", event.data, error);
-      return;
-    }
-    console.log("[ws.raw]", payload);
-    onEvent(payload);
-  };
-  socket.onerror = (error) => {
-    console.error("[ws.error]", error);
-    onError?.(error);
-  };
-  socket.onclose = (event) => {
-    console.log("[ws.close]", {
-      code: event.code,
-      reason: event.reason,
-      wasClean: event.wasClean
-    });
-    onClose?.(event);
-  };
+export async function labTaskDetail(taskId) {
+  const response = await authedFetch(`/api/lab/tasks/${encodeURIComponent(taskId)}`);
+  await check(response);
+  return response.json();
+}
 
-  return socket;
+export async function labCancelTask(taskId) {
+  const response = await authedFetch(`/api/lab/tasks/${encodeURIComponent(taskId)}/run`, {
+    method: "DELETE"
+  });
+  await check(response);
+  return response.json();
+}
+
+export async function labRestartTask(taskId) {
+  const response = await authedFetch(`/api/lab/tasks/${encodeURIComponent(taskId)}/restart`, {
+    method: "POST"
+  });
+  await check(response);
+  return response.json();
+}
+
+/** 改写约束规则后再次迭代。body: {constraintRules, referenceDocuments?} */
+export async function labRefineConstraints(taskId, payload) {
+  const response = await authedFetch(`/api/lab/tasks/${encodeURIComponent(taskId)}/refine`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+  await check(response);
+  return response.json();
+}
+
+/**
+ * "AI 帮我完善目标描述":一次 LLM 调用 + 多轮对话历史。
+ * 后端无持久化 —— 客户端自己在 Lab modal 里维护对话历史。
+ */
+export async function labRefineGoal(payload) {
+  const response = await authedFetch("/api/lab/refine-goal", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+  await check(response);
+  return response.json();
+}
+
+/** 拉所有 skill(用于 Agent 实验室的 Skill 选择下拉)。 */
+export async function labListAllSkills() {
+  const response = await authedFetch("/api/admin/skills");
+  await check(response);
+  return response.json();
+}
+
+// ----- 管理员会话审计 -----------------------------------------------------
+// 系统管理员/租户管理员看到所有(或本租户)会话列表 + 单 run 复盘。
+// 后端权限走 SessionVisibility 三档,匿名兜底。
+
+export async function adminListSessions({ userId, tenantId, appId, agentId, from, to, page = 0, size = 20 } = {}) {
+  const params = new URLSearchParams();
+  if (userId) params.set("userId", userId);
+  if (tenantId) params.set("tenantId", tenantId);
+  if (appId) params.set("appId", appId);
+  if (agentId) params.set("agentId", agentId);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  params.set("page", String(page));
+  params.set("size", String(size));
+  const response = await authedFetch(`/api/admin/sessions?${params}`);
+  await check(response);
+  return response.json();
+}
+
+export async function adminGetRunReplay(runId) {
+  const response = await authedFetch(`/api/admin/runs/${encodeURIComponent(runId)}/replay`);
+  await check(response);
+  return response.json();
+}
+
+/**
+ * V42 行级复盘端点。后端 SQL 服务端按 categories 过滤,前端不用 parse 整段 JSON。
+ * categories 为空 / null = 不过滤,返回全量。
+ * 返回 AdminRunStep[]:每条带 seq / ts / category / eventType / toolName / summary / payloadJson。
+ */
+export async function adminGetRunSteps(runId, categories) {
+  const params = new URLSearchParams();
+  if (Array.isArray(categories) && categories.length > 0) {
+    params.set("category", categories.join(","));
+  }
+  const qs = params.toString();
+  const url = qs
+    ? `/api/admin/runs/${encodeURIComponent(runId)}/steps?${qs}`
+    : `/api/admin/runs/${encodeURIComponent(runId)}/steps`;
+  const response = await authedFetch(url);
+  await check(response);
+  return response.json();
+}
+
+export async function adminListSessionRuns(sessionId) {
+  const response = await authedFetch(`/api/admin/sessions/${encodeURIComponent(sessionId)}/runs`);
+  await check(response);
+  return response.json();
+}
+
+/** 真分页 session 列表。返回 { rows, total, page, size }。
+ *  支持多维过滤:agentId / userId / tenantId / appId / runStatus(running/idle/all)/ keyword。
+ *  权限由后端 SessionVisibility 兜底,这里只是前端透传。 */
+export async function listSessionsPaged({ agentId, userId, tenantId, appId, runStatus, page = 0, size = 15, keyword } = {}) {
+  const params = new URLSearchParams();
+  if (agentId) params.set("agentId", agentId);
+  if (userId) params.set("userId", userId);
+  if (tenantId) params.set("tenantId", tenantId);
+  if (appId) params.set("appId", appId);
+  if (runStatus && runStatus !== "all") params.set("runStatus", runStatus);
+  params.set("page", String(page));
+  params.set("size", String(size));
+  if (keyword && keyword.trim()) params.set("keyword", keyword.trim());
+  const response = await authedFetch(`/api/sessions/paged?${params}`);
+  await check(response);
+  return response.json();
 }

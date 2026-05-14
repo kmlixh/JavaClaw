@@ -15,7 +15,6 @@ allow:
   - db.query
   - db.execute
   - db.schema.inspect
-  - table.render
   - chart.echarts
   # 嵌入场景的浏览器回调通道(xmap-ol-front 这类宿主调用)
   - host.invoke

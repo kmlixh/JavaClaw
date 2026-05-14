@@ -123,6 +123,9 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
     private Flux<LlmStreamEvent> mapResponseToEvents(String body) {
         try {
             JsonNode root = objectMapper.readTree(body);
+            // 非流式 usage 在 root 一级,跟 choices 同层。先抓出来,后面跟其他 events
+            // 一起发(orchestrator 累计每轮 usage 用)。choices 为空仍然是错误,但 usage 单独存在。
+            LlmStreamEvent usage = extractUsageEvent(root);
             JsonNode choices = root.path("choices");
             if (!choices.isArray() || choices.isEmpty()) {
                 return Flux.just(new LlmStreamEvent("error", "missing choices in llm response"));
@@ -141,22 +144,26 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
                         "name", firstToolCall.path("function").path("name").asText(""),
                         "arguments", firstToolCall.path("function").path("arguments").asText("{}")
                 ));
-                return Flux.just(
+                return appendUsage(Flux.just(
                         new LlmStreamEvent("tool_call_request", payload),
                         new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("tool_calls"))
-                );
+                ), usage);
             }
 
             if (!content.isBlank()) {
-                return Flux.just(
+                return appendUsage(Flux.just(
                         new LlmStreamEvent("token", content),
                         new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop"))
-                );
+                ), usage);
             }
-            return Flux.just(new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop")));
+            return appendUsage(Flux.just(new LlmStreamEvent("finish", firstChoice.path("finish_reason").asText("stop"))), usage);
         } catch (Exception error) {
             return Flux.just(new LlmStreamEvent("error", "invalid llm response: " + error.getMessage()));
         }
+    }
+
+    private Flux<LlmStreamEvent> appendUsage(Flux<LlmStreamEvent> base, LlmStreamEvent usage) {
+        return usage == null ? base : base.concatWith(Flux.just(usage));
     }
 
     private List<LlmStreamEvent> mapStreamChunkToEvents(ServerSentEvent<String> event) {
@@ -170,9 +177,12 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
 
         try {
             JsonNode root = objectMapper.readTree(data);
+            // OpenAI 流式 usage 在最后一帧:choices=[],usage={...}。开 stream_options.include_usage
+            // 才会下发。choices 非空时也可能挂带 usage(部分供应商提前给),所以两边都检查。
+            LlmStreamEvent usage = extractUsageEvent(root);
             JsonNode choices = root.path("choices");
             if (!choices.isArray() || choices.isEmpty()) {
-                return List.of();
+                return usage == null ? List.of() : List.of(usage);
             }
 
             JsonNode firstChoice = choices.get(0);
@@ -226,9 +236,39 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
             if (!finishReason.isBlank()) {
                 out.add(new LlmStreamEvent("finish", finishReason));
             }
+            if (usage != null) {
+                out.add(usage);
+            }
             return out;
         } catch (Exception error) {
             return List.of(new LlmStreamEvent("error", "invalid llm stream chunk: " + error.getMessage()));
+        }
+    }
+
+    /**
+     * 抽 usage 字段成 LlmStreamEvent("usage", {...} JSON)。供应商不返 usage / 字段缺失返 null。
+     * 三个数字以 "prompt"/"completion"/"total" key 输出,跟 session_message 表的列名对齐方便累加。
+     */
+    private LlmStreamEvent extractUsageEvent(JsonNode root) {
+        JsonNode usage = root.path("usage");
+        if (!usage.isObject()) {
+            return null;
+        }
+        int prompt = usage.path("prompt_tokens").asInt(0);
+        int completion = usage.path("completion_tokens").asInt(0);
+        int total = usage.path("total_tokens").asInt(0);
+        if (prompt == 0 && completion == 0 && total == 0) {
+            return null;
+        }
+        try {
+            String payload = objectMapper.writeValueAsString(Map.of(
+                    "prompt", prompt,
+                    "completion", completion,
+                    "total", total
+            ));
+            return new LlmStreamEvent("usage", payload);
+        } catch (Exception error) {
+            return null;
         }
     }
 
@@ -236,6 +276,12 @@ public class OpenAiCompatibleLlmProvider implements LlmProvider {
         Map<String, Object> payload = new HashMap<>();
         payload.put("model", defaultIfBlank(request.model(), llm.model()));
         payload.put("stream", stream);
+        if (stream) {
+            // OpenAI 标准:开 include_usage 后,流式响应最后一帧的 choices=[] + 带 usage,
+            // 让我们能拿到 prompt/completion/total tokens。Dify/SiliconFlow/Moma 等兼容端
+            // 是否真实现取决于供应商,不实现也不会报错(他们多半就当未知字段忽略)。
+            payload.put("stream_options", Map.of("include_usage", true));
+        }
         payload.put("messages", List.of(Map.of("role", "user", "content", request.prompt())));
         if (request.tools() != null && !request.tools().isEmpty()) {
             payload.put("tools", request.tools().stream().map(this::toToolDefinition).toList());

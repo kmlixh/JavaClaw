@@ -462,6 +462,8 @@ public class AdminUserManagementService {
         entity.setRedirectUris(cmd.redirectUris() == null ? "[]" : cmd.redirectUris());
         entity.setScopes(cmd.scopes() == null ? "[]" : cmd.scopes());
         entity.setStatus(isBlank(cmd.status()) ? "ACTIVE" : cmd.status().trim().toUpperCase());
+        // displayEnabled null = 用默认 true(实体里 @Column 默认值已经是 true,但显式赋值更稳)
+        entity.setDisplayEnabled(cmd.displayEnabled() == null ? true : cmd.displayEnabled());
         entity.setOwnerUserId(p.anonymous() ? blankToNull(cmd.ownerUserId()) : p.userId());
         entity.setDescription(blankToNull(cmd.description()));
         // 租户归属:新 client 强制落到 principal 的租户,防止租户管理员越权创建到别家。
@@ -482,6 +484,7 @@ public class AdminUserManagementService {
         if (cmd.redirectUris() != null) entity.setRedirectUris(cmd.redirectUris());
         if (cmd.scopes() != null) entity.setScopes(cmd.scopes());
         if (cmd.status() != null) entity.setStatus(cmd.status().trim().toUpperCase());
+        if (cmd.displayEnabled() != null) entity.setDisplayEnabled(cmd.displayEnabled());
         if (cmd.description() != null) entity.setDescription(blankToNull(cmd.description()));
         return toOauthClientView(oauthClientRepository.save(entity));
     }
@@ -531,8 +534,8 @@ public class AdminUserManagementService {
     }
 
     private OauthClientView toOauthClientView(OauthClientEntity e) {
-        return new OauthClientView(e.getClientId(), e.getDisplayName(), e.getRedirectUris(),
-                e.getScopes(), e.getStatus(), e.getOwnerUserId(), e.getDescription(),
+        return new OauthClientView(e.getClientId(), e.getTenantId(), e.getDisplayName(), e.getRedirectUris(),
+                e.getScopes(), e.getStatus(), e.isDisplayEnabled(), e.getOwnerUserId(), e.getDescription(),
                 e.getCreatedAt(), e.getUpdatedAt());
     }
 
@@ -581,10 +584,11 @@ public class AdminUserManagementService {
     public record UserPermissionView(String userId, String tenantId, String permissionCode,
                                       String effect, Instant grantedAt) {}
 
-    public record OauthClientView(String clientId, String displayName, String redirectUris,
-                                   String scopes, String status, String ownerUserId, String description,
-                                   Instant createdAt, Instant updatedAt) {}
+    public record OauthClientView(String clientId, String tenantId, String displayName, String redirectUris,
+                                   String scopes, String status, boolean displayEnabled, String ownerUserId,
+                                   String description, Instant createdAt, Instant updatedAt) {}
     public record OauthClientCommand(String clientId, String displayName, String redirectUris,
-                                      String scopes, String status, String ownerUserId, String description) {}
+                                      String scopes, String status, Boolean displayEnabled,
+                                      String ownerUserId, String description) {}
     public record OauthClientCreated(OauthClientView client, String clientSecret) {}
 }

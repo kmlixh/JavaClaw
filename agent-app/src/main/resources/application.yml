@@ -37,6 +37,12 @@ agent:
     # 部署在 http(非 https)时必须 false,否则浏览器拒绝设置 Secure cookie 导致登录失败。
     # 上 https 后改 true。
     cookie-secure: false
+    # 用户登录态(AGENT_TOKEN cookie)有效期。**显式写在这里**而不是靠 JwtService 的 @Value 默认值
+    # 兜底,避免哪天 default 被改成更短的值导致用户频繁要重登。下限要求 4h,选 8h 给一个完整工作日。
+    # 上 https + 多端协同时如需更长,直接调大即可,JwtService 会重读。
+    session-ttl: PT8H
+    # 外部 OAuth access_token TTL,不影响主控台登录态,只影响 iframe / SDK 调 /oauth/token 拿到的 Bearer。
+    oauth-access-ttl: PT2H
   workspace-root: ./workspaces
   default-agent-id: dev-agent
   runtime:

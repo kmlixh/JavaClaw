@@ -1,0 +1,11 @@
+-- V40: oauth_client 加 display_enabled 列,语义跟 status 解耦。
+--
+-- status (ACTIVE/DISABLED) = 功能开关:DISABLED 时 OAuth 拒发 token,chat / send 全失效。
+-- display_enabled (true/false) = UI 显示开关:false 时 xmap-ol-front 的 AI 按钮 v-if=false。
+--
+-- 旧行为(没这字段)= 仅看 status:status=ACTIVE 则显示按钮 + 功能可用。
+-- 新行为 = AppStatusService 同时看二者:status=ACTIVE AND display_enabled=true 才显示按钮;
+--         单 status=DISABLED  → 按钮藏 + 功能不可用;
+--         单 display_enabled=false → 按钮藏 + 功能可用(管理员临时不想露入口、但允许 OAuth 调试);
+--         二者都 false             → 按钮藏 + 功能不可用。
+ALTER TABLE oauth_client ADD COLUMN IF NOT EXISTS display_enabled BOOLEAN NOT NULL DEFAULT TRUE;

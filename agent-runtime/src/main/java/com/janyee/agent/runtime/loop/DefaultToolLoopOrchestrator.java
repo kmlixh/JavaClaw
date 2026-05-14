@@ -65,6 +65,11 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
         log.info("tool.loop.start runId={}, sessionId={}, agentId={}, maxIterations={}",
                 context.runId(), context.sessionId(), context.agentId(), context.maxIterations());
 
+        // 跨多轮 LLM 调用累加 token,run 结束时塞进 ToolLoopResult。
+        // 供应商不返 usage → tokenSeen 始终 false → 三个值最终给 null,SimpleAgentRunner 落 NULL 列。
+        long[] tokenSum = {0, 0, 0};
+        boolean[] tokenSeen = {false};
+
         while (true) {
             if (context.isCancelRequested()) {
                 String reason = context.cancelReason();
@@ -84,6 +89,13 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
             context.advanceState(context.iterationCount() == 0 ? ToolLoopState.MODEL_REQUESTING : ToolLoopState.MODEL_RESUMING);
 
             ModelTurnResult modelTurnResult = modelTurnExecutor.executeTurn(context);
+            // 累加本轮 token (供应商不返 usage 时 totalTokens=null,跳过)
+            if (modelTurnResult.totalTokens() != null) {
+                tokenSum[0] += zeroIfNull(modelTurnResult.promptTokens());
+                tokenSum[1] += zeroIfNull(modelTurnResult.completionTokens());
+                tokenSum[2] += modelTurnResult.totalTokens();
+                tokenSeen[0] = true;
+            }
             // executeTurn 里可能因为 cancelSignal 被掐断提前返回空 ModelTurnResult;下一轮循环顶部
             // 会看到 cancel flag 并走正规的 CANCELLED 返回,但如果在执行工具前就先动手,会多耗一次
             // 工具执行时间。这里抢先 short-circuit 一次,让 terminate 响应更快。
@@ -131,7 +143,10 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                         context.assistantText(),
                         context.toolOutcomes(),
                         context.iterations(),
-                        null
+                        null,
+                        tokenSeen[0] ? (int) tokenSum[0] : null,
+                        tokenSeen[0] ? (int) tokenSum[1] : null,
+                        tokenSeen[0] ? (int) tokenSum[2] : null
                 );
             }
 
@@ -185,7 +200,10 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                             context.assistantText(),
                             context.toolOutcomes(),
                             context.iterations(),
-                            null
+                            null,
+                            tokenSeen[0] ? (int) tokenSum[0] : null,
+                            tokenSeen[0] ? (int) tokenSum[1] : null,
+                            tokenSeen[0] ? (int) tokenSum[2] : null
                     );
                 }
                 context.setLastModelRawOutput("""
@@ -210,6 +228,55 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
             }
 
             if (!decision.allowed()) {
+                // 软拒 vs 硬拒:
+                //   - recoverable=true  → 把 reason 当一条工具错误塞回 LLM context,让 LLM 下一轮
+                //                        自己纠错(典型场景:plan-step 守卫"先 plan.update 再 db.query"、
+                //                        wave barrier 依赖未完、artifact 占位符)。**不**终止 run。
+                //   - recoverable=false → run 整体 FAIL,reason 写进 errorMessage。LLM 怎么调都没救的
+                //                        系统性拒绝才会走这条。
+                if (decision.recoverable()) {
+                    log.warn("tool.loop.blocked_recoverable runId={}, toolName={}, reason={}",
+                            context.runId(), toolCallRequest.get().toolName(), decision.reason());
+                    // 把 policy reason 当一条工具错误结果塞回 LLM context。tool_info displayType
+                    // 让前端把它当系统提示而不是工具产物渲染。errorMessage 也写一份,LLM 下一轮
+                    // prompt 里能直接看见。
+                    ToolResult nudgeResult = new ToolResult(
+                            false,
+                            decision.reason(),
+                            "{\"displayType\":\"tool_info\",\"tool\":\""
+                                    + jsonEscape(decision.normalizedToolName()) + "\","
+                                    + "\"message\":\"" + jsonEscape(decision.reason()) + "\"}",
+                            "[]",
+                            decision.reason()
+                    );
+                    ToolCallOutcome nudgeOutcome = new ToolCallOutcome(
+                            toolCallRequest.get(),
+                            decision,
+                            false,
+                            false,
+                            nudgeResult,
+                            decision.reason(),
+                            0L
+                    );
+                    context.emitEvent(AgentEventType.TOOL_COMPLETED, renderToolCompletionContent(nudgeOutcome));
+                    toolAuditService.recordExecutionOutcome(context, nudgeOutcome);
+                    context.addToolOutcome(nudgeOutcome);
+                    context.advanceState(ToolLoopState.TOOL_RESULT_APPENDING);
+                    toolResultAppender.append(context, nudgeOutcome);
+                    context.incrementIteration();
+                    context.recordIteration(new ToolLoopIteration(
+                            context.iterationCount(),
+                            summarize(modelTurnResult.fullText()),
+                            toolCallRequest.get(),
+                            decision,
+                            nudgeOutcome,
+                            ToolLoopState.TOOL_CALL_DETECTED,
+                            ToolLoopState.MODEL_RESUMING
+                    ));
+                    context.clearPendingToolCall();
+                    context.advanceState(ToolLoopState.MODEL_RESUMING);
+                    continue;
+                }
                 log.warn("tool.loop.blocked runId={}, toolName={}, reason={}",
                         context.runId(), toolCallRequest.get().toolName(), decision.reason());
                 context.recordIteration(new ToolLoopIteration(
@@ -353,7 +420,10 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                         context.assistantText(),
                         context.toolOutcomes(),
                         context.iterations(),
-                        null
+                        null,
+                        tokenSeen[0] ? (int) tokenSum[0] : null,
+                        tokenSeen[0] ? (int) tokenSum[1] : null,
+                        tokenSeen[0] ? (int) tokenSum[2] : null
                 );
             }
             context.advanceState(ToolLoopState.TOOL_RESULT_APPENDING);
@@ -414,19 +484,15 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
                 ? safe(outcome.toolResult().summary())
                 : safe(outcome.errorMessage());
         String dataJson = outcome.toolResult() != null ? safe(outcome.toolResult().dataJson()) : "";
-        if (!shouldEmitRenderablePayload(toolName) || dataJson.isBlank() || "{}".equals(dataJson.trim())) {
+        // 所有工具的返回数据都进 TOOL_COMPLETED content,复盘要看 SQL 查到的行、file.list 列出的文件...
+        // 之前 shouldEmitRenderablePayload 只对 artifact.* 放行,db.query / file.list / web.fetch 等结果直接丢,
+        // 复盘日志里看不到 AI 实际拿到了什么数据,等于没法 debug 它为啥做出某个判断。
+        if (dataJson.isBlank() || "{}".equals(dataJson.trim())) {
             return "tool=%s success=%s summary=%s".formatted(toolName, outcome.success(), summary);
         }
         return "tool=%s success=%s summary=%s".formatted(toolName, outcome.success(), summary)
                 + System.lineSeparator()
                 + dataJson;
-    }
-
-    private boolean shouldEmitRenderablePayload(String toolName) {
-        if (toolName == null || toolName.isBlank()) {
-            return false;
-        }
-        return toolName.startsWith("artifact.");
     }
 
     private Optional<ToolCallOutcome> findRepeatedOutcome(ToolLoopContext context, ToolCallDecision decision) {
@@ -706,5 +772,9 @@ public class DefaultToolLoopOrchestrator implements ToolLoopOrchestrator {
             }
         }
         return builder.toString().trim();
+    }
+
+    private static long zeroIfNull(Integer value) {
+        return value == null ? 0L : value.longValue();
     }
 }
