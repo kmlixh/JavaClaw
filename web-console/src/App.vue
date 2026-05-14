@@ -5912,8 +5912,9 @@ async function initAfterAuth() {
       form.sessionId = "";
     }
   }
-  // 没有 sessionId(新登录 / 没缓存)→ 在 chat 菜单下默认进会话列表页,后台拉一份数据
-  if (activeMenu.value === "chat" && !form.sessionId) {
+  // 没有 sessionId(新登录 / 没缓存)→ 在 chat 菜单下默认进会话列表页,后台拉一份数据。
+  // embed 模式不走会话列表,直接落到新建会话视图,所以这里跳过。
+  if (activeMenu.value === "chat" && !form.sessionId && !embedMode.value) {
     await refreshSessionsList(0).catch(error =>
       console.warn("[initAfterAuth.sessions_list_load_failed]", error?.message || error));
   }
@@ -6086,8 +6087,8 @@ watch(
     }
     // 进入 chat 菜单但没指定 sessionId → 展示会话列表(列表组件 v-if 已经触发了模板切换,
     // 这里负责拉数据)。比起每次切到列表都重新拉一次,我们只在"从别处进 chat 菜单/从 chat-session
-    // 切回 list"时拉。
-    if (activeMenu.value === "chat" && !form.sessionId) {
+    // 切回 list"时拉。embed 模式没有会话列表,跳过。
+    if (activeMenu.value === "chat" && !form.sessionId && !embedMode.value) {
       if (previousMenu !== "chat" || previousSessionId) {
         await refreshSessionsList(0);
       }
@@ -6993,7 +6994,7 @@ function formatTimelineEventContent(event) {
         </div>
       </header>
 
-      <section v-if="activeMenu === 'chat' && !form.sessionId" class="workspace-panel sessions-list-panel">
+      <section v-if="activeMenu === 'chat' && !form.sessionId && !embedMode" class="workspace-panel sessions-list-panel">
         <header class="sessions-list-header">
           <div>
             <h2>会话列表</h2>
@@ -7092,8 +7093,8 @@ function formatTimelineEventContent(event) {
         </div>
       </section>
 
-      <section v-if="activeMenu === 'chat' && form.sessionId" class="workspace-panel chat-workspace">
-        <div class="chat-back-bar">
+      <section v-if="activeMenu === 'chat' && (form.sessionId || embedMode)" class="workspace-panel chat-workspace">
+        <div v-if="!embedMode" class="chat-back-bar">
           <button class="chat-back-button" @click="leaveSessionToList">← 返回会话列表</button>
         </div>
         <aside v-if="isPlanPanelVisible" class="run-plan-panel" :class="{ collapsed: state.runPlan.collapsed }">
