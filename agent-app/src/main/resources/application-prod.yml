@@ -22,6 +22,24 @@ spring:
       max-lifetime: 240000
       keepalive-time: 60000
       minimum-idle: 2
+  data:
+    # Redis 用途:
+    #   1) JwtService 把 HMAC 签名密钥(agent:auth:jwt:secret)落到 Redis,跨 JVM 重启 / 多实例
+    #      部署都用同一份密钥,避免重启后旧 cookie 全失效让用户被强制重登
+    #   2) (可选)agent.session-lock.type=redis 时 RedisSessionLockManager 用同一份连接做
+    #      会话级互斥锁
+    # 凭证写明文是为了和上面的 PostgreSQL 凭证保持同口径(都在 prod yml 里硬编码,部署 zip
+    # 不带 .env)。要换成更安全的方式可以走环境变量 SPRING_DATA_REDIS_PASSWORD 覆盖。
+    redis:
+      host: 10.173.108.120
+      port: 6379
+      password: 9XLagGk4%V#MEcw4x
+      timeout: 3s
+      connect-timeout: 3s
+      lettuce:
+        pool:
+          enabled: false
+        shutdown-timeout: 100ms
   jpa:
     hibernate:
       ddl-auto: validate
