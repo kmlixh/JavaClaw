@@ -24,12 +24,13 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 端到端核对分区表自动感知链路：
+ * 端到端核对分区表元数据链路（后端不再自动 rewrite，由 AI 自己根据元数据写 WHERE 过滤）：
  * <ol>
- *   <li>{@link PartitionInspector#inspect} 能正确识别分区父表 + 取到最新子分区名；</li>
- *   <li>{@link DatabaseQueryTool} 在执行 SQL 前，会把 {@code FROM parent} 自动替换成最新子分区;</li>
- *   <li>{@link DatabaseSchemaInspectTool} 会在 metadata.partition 中暴露 isPartitioned / latestPartition；</li>
- *   <li>对普通（非分区）表，上述通路全部保持 no-op。</li>
+ *   <li>{@link PartitionInspector#inspect} 能识别分区父表，并暴露策略 / 键列 / 键类型 / earliest+latest bound；</li>
+ *   <li>{@link DatabaseQueryTool} 不再做 partition rewrite —— {@code FROM parent} 透传给 PG，
+ *       AI 写 {@code WHERE dt = '...'} 时 PG native pruning 落到对应 child；不写过滤就是全表扫；</li>
+ *   <li>{@link DatabaseSchemaInspectTool} 在 {@code metadata.partition} 中暴露上述字段；</li>
+ *   <li>对普通（非分区）表，所有路径保持 no-op。</li>
  * </ol>
  *
  * 测试自建两张样本表：
@@ -128,12 +129,18 @@ class PartitionInspectorTest {
 
             assertTrue(info.isPartitioned(), "events 父表应被识别为分区表");
             assertEquals("dt", info.partitionKey(), "分区键应指向 dt 列");
+            assertEquals("timestamp", info.partitionKeyType(), "分区键类型应为 timestamp");
+            assertEquals("range", info.partitionStrategy(), "events 是 RANGE 分区");
             assertEquals(TEST_SCHEMA + "." + LATEST_CHILD, info.latestPartition(),
                     "按 relname DESC 取到的应当是最新命名的子分区");
+            assertEquals(TEST_SCHEMA + "." + OLDEST_CHILD, info.earliestPartition(),
+                    "按 relname ASC 取到的应当是最早命名的子分区");
             assertEquals(3, info.childCount(), "目前挂载了 3 个子分区");
             assertNotNull(info.latestPartitionBound());
             assertTrue(info.latestPartitionBound().contains("2026-03-01"),
                     "最新分区的边界应包含 2026-03-01，实际=" + info.latestPartitionBound());
+            assertTrue(info.earliestPartitionBound().contains("2026-01-01"),
+                    "最早分区的边界应包含 2026-01-01，实际=" + info.earliestPartitionBound());
         }
     }
 
@@ -150,38 +157,47 @@ class PartitionInspectorTest {
     }
 
     @Test
-    void dbQueryAutoRewritesPartitionedParentToLatestChild() throws Exception {
+    void dbQueryOnPartitionedParentWithoutFilterScansAllChildren() throws Exception {
         PartitionInspector.invalidateCache();
 
+        // 不写 WHERE 过滤分区键 —— 后端不再自动 rewrite，SQL 原样下发给 PG，三个子分区都会被扫到。
         String sql = "SELECT payload FROM " + TEST_SCHEMA + "." + PARENT_TABLE + " ORDER BY dt";
         String args = objectMapper.writeValueAsString(Map.of("sql", sql));
 
         ToolResult result = databaseQueryTool.execute(new ToolInvocation(
                 "dev-agent", "partition-test-run", "partition-test-sess", "junit", "db.query", args));
         assertTrue(result.ok(), "partitioned query should succeed: " + result.error());
-
-        // 重写在 summary 中必须显式出现，UI 与模型都能看到
-        assertTrue(result.summary().contains("rewritten to latest partition"),
-                "summary 应当显式标注分区自动切换，实际=" + result.summary());
-        assertTrue(result.summary().contains(LATEST_CHILD),
-                "summary 应当包含 latest child 名称，实际=" + result.summary());
+        assertFalse(result.summary().contains("rewritten to latest partition"),
+                "后端已下线 partition rewrite，summary 不应再出现 'rewritten to latest partition'，实际=" + result.summary());
 
         JsonNode data = objectMapper.readTree(result.dataJson());
-        JsonNode rewrite = data.path("partitionRewrite");
-        assertTrue(rewrite.isObject(), "data.partitionRewrite 应为对象");
-        assertTrue(rewrite.path("changed").asBoolean(), "partitionRewrite.changed 应为 true");
-        JsonNode rewrites = rewrite.path("rewrites");
-        assertEquals(TEST_SCHEMA + "." + LATEST_CHILD,
-                rewrites.path(TEST_SCHEMA + "." + PARENT_TABLE).asText(""),
-                "rewrites map 必须登记 parent → latest child");
-
-        // 实际执行的 SQL 要以 latest child 结尾；且 rows 只应包含 2026-03 的那条
-        assertTrue(data.path("sql").asText().contains(LATEST_CHILD),
-                "最终执行的 SQL 应该走最新子分区，实际=" + data.path("sql").asText());
+        assertTrue(data.path("partitionRewrite").isMissingNode(),
+                "partitionRewrite 字段已彻底移除");
+        assertEquals(sql, data.path("sql").asText(), "SQL 应保持原样下发给 PG");
         JsonNode rows = data.path("rows");
         assertTrue(rows.isArray());
-        assertEquals(1, rows.size(), "rewritten 后的 SQL 只应命中 latest child（1 行），实际=" + rows);
-        assertEquals("mar-latest", rows.get(0).path("payload").asText());
+        assertEquals(3, rows.size(), "无 WHERE 过滤时全部子分区都应被读取，实际行数=" + rows.size());
+    }
+
+    @Test
+    void dbQueryOnPartitionedParentWithKeyFilterPrunesToCorrectChild() throws Exception {
+        PartitionInspector.invalidateCache();
+
+        // 写 WHERE 过滤分区键 —— PG native partition pruning 自然落到 2026-02 那一个 child。
+        String sql = "SELECT payload FROM " + TEST_SCHEMA + "." + PARENT_TABLE
+                + " WHERE dt >= '2026-02-01' AND dt < '2026-03-01'";
+        String args = objectMapper.writeValueAsString(Map.of("sql", sql));
+
+        ToolResult result = databaseQueryTool.execute(new ToolInvocation(
+                "dev-agent", "partition-prune-run", "partition-prune-sess", "junit", "db.query", args));
+        assertTrue(result.ok(), "filtered query should succeed: " + result.error());
+
+        JsonNode data = objectMapper.readTree(result.dataJson());
+        assertEquals(sql, data.path("sql").asText(), "SQL 不应被改写");
+        JsonNode rows = data.path("rows");
+        assertEquals(1, rows.size(), "WHERE 命中 2026-02 那一行，应只有 1 行，实际=" + rows);
+        assertEquals("feb-middle", rows.get(0).path("payload").asText(),
+                "应命中 middle 子分区那条数据");
     }
 
     @Test
@@ -195,11 +211,11 @@ class PartitionInspectorTest {
                 "dev-agent", "partition-test-run", "partition-test-sess", "junit", "db.query", args));
         assertTrue(result.ok(), "regular query should succeed: " + result.error());
         assertFalse(result.summary().contains("rewritten to latest partition"),
-                "regular 表 summary 绝对不能出现 partition rewrite，实际=" + result.summary());
+                "summary 绝对不能出现 partition rewrite 文案，实际=" + result.summary());
 
         JsonNode data = objectMapper.readTree(result.dataJson());
-        assertTrue(data.path("partitionRewrite").isMissingNode() || !data.path("partitionRewrite").path("changed").asBoolean(),
-                "regular 表 data JSON 不应带 partitionRewrite.changed=true");
+        assertTrue(data.path("partitionRewrite").isMissingNode(),
+                "partitionRewrite 字段已彻底移除");
         assertEquals(sql, data.path("sql").asText(), "SQL 应保持原样");
     }
 
@@ -215,17 +231,27 @@ class PartitionInspectorTest {
         ToolResult result = databaseSchemaInspectTool.execute(new ToolInvocation(
                 "dev-agent", "partition-inspect-run", "sess", "junit", "db.schema.inspect", args));
         assertTrue(result.ok(), "schema inspect 应成功: " + result.error());
-        assertTrue(result.summary().contains("partitioned table"),
+        assertTrue(result.summary().contains("partitioned"),
                 "schema inspect summary 应注明分区信息，实际=" + result.summary());
         assertTrue(result.summary().contains(LATEST_CHILD),
                 "summary 应包含 latest child 名，实际=" + result.summary());
+        assertTrue(result.summary().contains(OLDEST_CHILD),
+                "summary 应包含 earliest child 名（数据可查的最早范围），实际=" + result.summary());
+        assertTrue(result.summary().contains("range"),
+                "summary 应注明分区策略 range，实际=" + result.summary());
 
         JsonNode data = objectMapper.readTree(result.dataJson());
         JsonNode partition = data.path("metadata").path("partition");
         assertTrue(partition.isObject(), "metadata.partition 应为对象");
         assertTrue(partition.path("isPartitioned").asBoolean(), "isPartitioned 必须为 true");
         assertEquals("dt", partition.path("partitionKey").asText());
+        assertEquals("timestamp", partition.path("partitionKeyType").asText(),
+                "AI 据此区分时间分区和数值分区");
+        assertEquals("range", partition.path("partitionStrategy").asText());
         assertEquals(TEST_SCHEMA + "." + LATEST_CHILD, partition.path("latestPartition").asText());
+        assertEquals(TEST_SCHEMA + "." + OLDEST_CHILD, partition.path("earliestPartition").asText());
+        assertTrue(partition.path("earliestPartitionBound").asText().contains("2026-01-01"));
+        assertTrue(partition.path("latestPartitionBound").asText().contains("2026-03-01"));
         assertEquals(3, partition.path("childCount").asInt());
     }
 

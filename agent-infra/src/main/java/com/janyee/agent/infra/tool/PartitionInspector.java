@@ -42,12 +42,20 @@ final class PartitionInspector {
             WHERE n.nspname = ? AND c.relname = ?
             """;
 
+    /**
+     * 单条返回分区键列名、列类型 (pg_type.typname，例如 timestamp / date / int4) 和分区策略
+     * (pg_partitioned_table.partstrat → r=RANGE, l=LIST, h=HASH)。AI 拿到 keyType + strategy
+     * 就能判断"时间分区 / 数值分区"和值的写法。
+     */
     private static final String PARTITION_KEY_SQL = """
-            SELECT a.attname
+            SELECT a.attname AS attname,
+                   t.typname AS typname,
+                   pt.partstrat AS partstrat
             FROM pg_partitioned_table pt
             JOIN pg_class c ON pt.partrelid = c.oid
             JOIN pg_namespace n ON c.relnamespace = n.oid
             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(pt.partattrs)
+            JOIN pg_type t ON a.atttypid = t.oid
             WHERE n.nspname = ? AND c.relname = ?
             ORDER BY array_position(pt.partattrs::int[], a.attnum::int)
             LIMIT 1
@@ -64,6 +72,24 @@ final class PartitionInspector {
             JOIN pg_namespace n2 ON c2.relnamespace = n2.oid
             WHERE n.nspname = ? AND c.relname = ?
             ORDER BY c2.relname DESC
+            LIMIT 1
+            """;
+
+    /**
+     * 最早子分区 —— 跟 LATEST_PARTITION_SQL 对称，只是 ORDER BY ASC。配合 latest 给 AI 一个完整的
+     * 可查数据范围：earliestBound → latestBound。
+     */
+    private static final String EARLIEST_PARTITION_SQL = """
+            SELECT n2.nspname AS child_schema,
+                   c2.relname AS child_name,
+                   pg_get_expr(c2.relpartbound, c2.oid) AS bound
+            FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhparent
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            JOIN pg_class c2 ON c2.oid = i.inhrelid
+            JOIN pg_namespace n2 ON c2.relnamespace = n2.oid
+            WHERE n.nspname = ? AND c.relname = ?
+            ORDER BY c2.relname ASC
             LIMIT 1
             """;
 
@@ -102,18 +128,24 @@ final class PartitionInspector {
                 CACHE.put(cacheKey, new CachedInfo(System.currentTimeMillis(), info));
                 return info;
             }
-            String partitionKey = queryPartitionKey(connection, schema, table);
+            PartitionKey keyInfo = queryPartitionKey(connection, schema, table);
             LatestChild latest = queryLatestChild(connection, schema, table);
+            LatestChild earliest = queryEarliestChild(connection, schema, table);
             int childCount = queryChildCount(connection, schema, table);
             PartitionInfo info = new PartitionInfo(
                     true,
-                    partitionKey,
+                    keyInfo.column(),
+                    keyInfo.columnType(),
+                    keyInfo.strategy(),
                     latest.qualifiedName(),
                     latest.bound(),
+                    earliest.qualifiedName(),
+                    earliest.bound(),
                     childCount
             );
-            log.info("partition.inspect schema={}, table={}, partitionKey={}, latestChild={}, childCount={}",
-                    schema, table, partitionKey, info.latestPartition(), childCount);
+            log.info("partition.inspect schema={}, table={}, key={}/{}, strategy={}, latest={}, earliest={}, childCount={}",
+                    schema, table, keyInfo.column(), keyInfo.columnType(), keyInfo.strategy(),
+                    info.latestPartition(), info.earliestPartition(), childCount);
             CACHE.put(cacheKey, new CachedInfo(System.currentTimeMillis(), info));
             return info;
         } catch (Exception error) {
@@ -137,18 +169,48 @@ final class PartitionInspector {
         }
     }
 
-    private static String queryPartitionKey(Connection connection, String schema, String table) throws Exception {
+    private static PartitionKey queryPartitionKey(Connection connection, String schema, String table) throws Exception {
         try (PreparedStatement ps = connection.prepareStatement(PARTITION_KEY_SQL)) {
             ps.setString(1, schema);
             ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : "";
+                if (!rs.next()) {
+                    return new PartitionKey("", "", "");
+                }
+                String attname = rs.getString("attname");
+                String typname = rs.getString("typname");
+                String partstrat = rs.getString("partstrat");
+                return new PartitionKey(
+                        attname == null ? "" : attname,
+                        typname == null ? "" : typname,
+                        decodeStrategy(partstrat));
             }
         }
     }
 
+    /**
+     * pg_partitioned_table.partstrat 是单字符 'r'/'l'/'h'，对 AI 来说不易解读，转成易读字符串。
+     */
+    private static String decodeStrategy(String code) {
+        if (code == null || code.isEmpty()) return "";
+        return switch (code.charAt(0)) {
+            case 'r', 'R' -> "range";
+            case 'l', 'L' -> "list";
+            case 'h', 'H' -> "hash";
+            default -> code;
+        };
+    }
+
     private static LatestChild queryLatestChild(Connection connection, String schema, String table) throws Exception {
-        try (PreparedStatement ps = connection.prepareStatement(LATEST_PARTITION_SQL)) {
+        return queryBoundaryChild(connection, schema, table, LATEST_PARTITION_SQL);
+    }
+
+    private static LatestChild queryEarliestChild(Connection connection, String schema, String table) throws Exception {
+        return queryBoundaryChild(connection, schema, table, EARLIEST_PARTITION_SQL);
+    }
+
+    private static LatestChild queryBoundaryChild(Connection connection, String schema, String table, String sqlTemplate) throws Exception {
+        try (PreparedStatement ps = connection.prepareStatement(sqlTemplate)) {
             ps.setString(1, schema);
             ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
@@ -189,40 +251,60 @@ final class PartitionInspector {
     }
 
     /**
-     * 注意 {@code latestPartition} 始终带 schema 前缀，便于直接替换到 SQL 的 FROM 子句中。
+     * 暴露给 AI 的分区元数据。{@code latestPartition} / {@code earliestPartition} 都带 schema 前缀。
+     *
+     * <p>{@code partitionStrategy} 是 "range" / "list" / "hash"（解码自 pg_partitioned_table.partstrat）；
+     * {@code partitionKeyType} 是 pg_type.typname，例如 "timestamp" / "date" / "int4"，让 AI 一眼分清
+     * 时间分区还是数值分区。两份 bound 表达式给的是 Postgres 原始 {@code FOR VALUES FROM (...) TO (...)} 文本，
+     * AI 解析出来就能拿到可查的最早 / 最晚日期。</p>
      */
     record PartitionInfo(
             boolean isPartitioned,
             String partitionKey,
+            String partitionKeyType,
+            String partitionStrategy,
             String latestPartition,
             String latestPartitionBound,
+            String earliestPartition,
+            String earliestPartitionBound,
             int childCount
     ) {
         PartitionInfo {
             partitionKey = partitionKey == null ? "" : partitionKey;
+            partitionKeyType = partitionKeyType == null ? "" : partitionKeyType;
+            partitionStrategy = partitionStrategy == null ? "" : partitionStrategy;
             latestPartition = latestPartition == null ? "" : latestPartition;
             latestPartitionBound = latestPartitionBound == null ? "" : latestPartitionBound;
+            earliestPartition = earliestPartition == null ? "" : earliestPartition;
+            earliestPartitionBound = earliestPartitionBound == null ? "" : earliestPartitionBound;
             if (childCount < 0) {
                 childCount = 0;
             }
         }
 
         static PartitionInfo regular() {
-            return new PartitionInfo(false, "", "", "", 0);
+            return new PartitionInfo(false, "", "", "", "", "", "", "", 0);
         }
 
         Map<String, Object> toMap() {
             Map<String, Object> map = new LinkedHashMap<>();
             map.put("isPartitioned", isPartitioned);
             map.put("partitionKey", partitionKey);
+            map.put("partitionKeyType", partitionKeyType);
+            map.put("partitionStrategy", partitionStrategy);
             map.put("latestPartition", latestPartition);
             map.put("latestPartitionBound", latestPartitionBound);
+            map.put("earliestPartition", earliestPartition);
+            map.put("earliestPartitionBound", earliestPartitionBound);
             map.put("childCount", childCount);
             return map;
         }
     }
 
     private record LatestChild(String qualifiedName, String bound) {
+    }
+
+    private record PartitionKey(String column, String columnType, String strategy) {
     }
 
     private record CachedInfo(long createdAtMillis, PartitionInfo info) {

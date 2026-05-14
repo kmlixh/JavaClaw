@@ -2140,8 +2140,10 @@ function openMapModal() {
   }
   mapModal.regions = [];
   mapModal.draftRegion = null;
-  mapModal.center = { lat: 35, lng: 105 };
-  mapModal.zoom = 5;
+  // 默认落到昆明 + zoom 12 —— 业务范围在云南,全国中心 + zoom 5 上画框对区县级太粗,
+  // 拖拽几屏才能定位过来。坐标跟 xmap-ol-front 的 layerKnowledge 默认值一致。
+  mapModal.center = { lat: 25.00481856, lng: 102.67093894 };
+  mapModal.zoom = 12;
   mapModal.mode = "pan";
   mapModal.drawing = false;
   mapModal.panning = false;
@@ -2830,6 +2832,13 @@ function pushEvent(event) {
         state.liveAssistant.runId = evtRunId;
         state.liveAssistant.content = streamed;
         if (nextStep !== null) state.liveAssistant.step = nextStep;
+        // 同一 run 重新流出 MODEL_OUTPUT = 之前 MODEL_RETRY 报的"超时/连接中断"已经恢复。
+        // 否则那个 banner 会一直顶在头上直到 RUN_COMPLETED,用户以为还卡着,实际数据已经在流了。
+        if (state.liveStatus.runId === evtRunId && state.liveStatus.phase === "MODEL_RETRY") {
+          state.liveStatus.phase = "";
+          state.liveStatus.text = "";
+          state.liveStatus.updatedAt = normalized.timestamp || new Date().toISOString();
+        }
       }
     } else if (phase === "MODEL_THINKING") {
       // 推理模型的 reasoning_content 累积流,跟 MODEL_OUTPUT 平行,前端单独显示(可折叠)。
@@ -3448,6 +3457,11 @@ async function executeChatRequest(payload) {
   }
   loading.sending = true;
   state.error = "";
+  // 把上一轮可能挂着的 liveStatus(尤其是 MODEL_RETRY / FAILED banner)清掉,新 run 开始就该是干净状态。
+  state.liveStatus.runId = "";
+  state.liveStatus.phase = "";
+  state.liveStatus.text = "";
+  state.liveStatus.updatedAt = "";
   clearStream();
   try {
     const outgoingMessage = payload.message;

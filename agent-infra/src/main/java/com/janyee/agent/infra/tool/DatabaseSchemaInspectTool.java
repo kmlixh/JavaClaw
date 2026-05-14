@@ -169,10 +169,16 @@ public class DatabaseSchemaInspectTool implements AgentTool {
                         "rows", columnRows,
                         "metadata", metadata
                 ));
-                String partitionSuffix = partitionInfo.isPartitioned() && !partitionInfo.latestPartition().isBlank()
-                        ? "; partitioned table — backend will auto-route queries to latest child '"
-                                + partitionInfo.latestPartition() + "' (key=" + partitionInfo.partitionKey()
-                                + ", " + partitionInfo.childCount() + " children)"
+                // 不再自动 rewrite，分区表的"取哪个 child"由 AI 自己决定。摘要里把决策需要的信息都给齐：
+                // 策略、键列、键类型、可查范围（earliest → latest），AI 据此写 WHERE 过滤。
+                String partitionSuffix = partitionInfo.isPartitioned()
+                        ? "; partitioned (" + partitionInfo.partitionStrategy() + ") on "
+                                + partitionInfo.partitionKey() + " " + partitionInfo.partitionKeyType()
+                                + "; children=" + partitionInfo.childCount()
+                                + ", earliest=" + partitionInfo.earliestPartition()
+                                + ", latest=" + partitionInfo.latestPartition()
+                                + " — write a WHERE filter on " + partitionInfo.partitionKey()
+                                + " to scope the query (no filter = full scan across all children)"
                         : "";
                 String summary = "Schema inspection returned %d columns for %s%s".formatted(
                         columnRows.size(), qualifiedName(resolvedTable), partitionSuffix);

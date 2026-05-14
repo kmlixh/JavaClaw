@@ -130,14 +130,9 @@ public class DatabaseQueryTool implements AgentTool {
                     return metadataResult;
                 }
 
-                // Auto-rewrite分区父表 → 最新子分区。只对已经通过白名单的 SELECT/CTE 生效，不影响 schema 探测。
-                PartitionRewrite rewrite = rewritePartitionedTables(connection, target.jdbcUrl(), sql, defaultSchema);
-                if (rewrite.changed()) {
-                    log.info("db.query.partition_rewrite runId={}, rewrites={}", invocation.runId(), rewrite.rewrites());
-                    sql = rewrite.rewrittenSql();
-                    normalized = sql.trim().toLowerCase(Locale.ROOT);
-                }
-
+                // 不再自动重写"父表 → 最新子分区"。AI 在 skill 引导下负责自己写 WHERE 过滤分区键，
+                // PG native partition pruning 会落到正确的 child。没写分区过滤 = 全表扫描，由 SQL 行为
+                // 自然反馈给 AI（慢 / 超时），不再后端兜底改写。
                 if (!normalized.startsWith("select") && !normalized.startsWith("with")) {
                     return buildRecoverableFailure(
                             connection,
@@ -156,7 +151,7 @@ public class DatabaseQueryTool implements AgentTool {
                     );
                 }
 
-                return executeQuery(connection, sql, maxRows, rewrite);
+                return executeQuery(connection, sql, maxRows);
             }
         } catch (Exception error) {
             return new ToolResult(false, "query failed", "{}", "[]", error.getMessage());
@@ -337,11 +332,11 @@ public class DatabaseQueryTool implements AgentTool {
         }
     }
 
-    private ToolResult executeQuery(Connection connection, String sql, int maxRows, PartitionRewrite rewrite) throws Exception {
+    private ToolResult executeQuery(Connection connection, String sql, int maxRows) throws Exception {
         try (Statement statement = connection.createStatement()) {
             statement.setMaxRows(maxRows);
             try (ResultSet resultSet = statement.executeQuery(sql)) {
-                return tableResult("Query returned", sql, resultSet, maxRows, rewrite);
+                return tableResult("Query returned", sql, resultSet, maxRows);
             } catch (SQLException error) {
                 ToolResult recovered = tryAutoRepair(connection, sql, error, maxRows);
                 if (recovered != null) {
@@ -568,10 +563,6 @@ public class DatabaseQueryTool implements AgentTool {
     }
 
     private ToolResult tableResult(String summaryPrefix, String sql, ResultSet resultSet, int maxRows) throws Exception {
-        return tableResult(summaryPrefix, sql, resultSet, maxRows, PartitionRewrite.none());
-    }
-
-    private ToolResult tableResult(String summaryPrefix, String sql, ResultSet resultSet, int maxRows, PartitionRewrite rewrite) throws Exception {
         ResultSetMetaData metaData = resultSet.getMetaData();
         List<String> columns = new ArrayList<>();
         for (int i = 1; i <= metaData.getColumnCount(); i++) {
@@ -590,16 +581,9 @@ public class DatabaseQueryTool implements AgentTool {
         payload.put("columns", columns);
         payload.put("rows", rows);
         payload.put("sql", sql);
-        if (rewrite != null && rewrite.changed()) {
-            payload.put("partitionRewrite", rewrite.toMetadata());
-            payload.put("originalSql", rewrite.originalSql());
-        }
-        String summarySuffix = (rewrite != null && rewrite.changed())
-                ? " (rewritten to latest partition: " + String.join(", ", rewrite.childNames()) + ")"
-                : "";
         return new ToolResult(
                 true,
-                summaryPrefix + " " + rows.size() + " rows" + summarySuffix,
+                summaryPrefix + " " + rows.size() + " rows",
                 objectMapper.writeValueAsString(payload),
                 "[]",
                 null
@@ -1099,91 +1083,4 @@ public class DatabaseQueryTool implements AgentTool {
     private record QualifiedName(String schema, String table) {
     }
 
-    /**
-     * 扫描 SQL 中所有 FROM/JOIN 目标表，对每一个已登记的分区父表，把 FROM/JOIN 后面的标识符
-     * 替换为 PartitionInspector 找到的最新子分区。整个操作是幂等的 —— 已经指向子分区的 SQL
-     * 在 PartitionInspector 里查不到 {@code pg_partitioned_table} 行，会原样返回。
-     *
-     * <p>如果没有任何表需要重写，返回 {@link PartitionRewrite#none()}；否则返回带新 SQL 与重写
-     * 明细的对象，以便 tableResult 把"从 parent → child"的事实写进 data JSON，让前端和后续
-     * Completed Queries 都能看到这次代换。</p>
-     */
-    private PartitionRewrite rewritePartitionedTables(Connection connection, String jdbcUrl, String sql, String defaultSchema) {
-        if (sql == null || sql.isBlank()) {
-            return PartitionRewrite.none();
-        }
-        java.util.Set<SqlTableExtractor.Ref> refs = SqlTableExtractor.extract(sql);
-        if (refs.isEmpty()) {
-            return PartitionRewrite.none();
-        }
-        String rewritten = sql;
-        Map<String, String> rewrites = new LinkedHashMap<>();
-        List<String> childNames = new ArrayList<>();
-        for (SqlTableExtractor.Ref ref : refs) {
-            String effectiveSchema = (ref.schema() == null || ref.schema().isEmpty()) ? defaultSchema : ref.schema();
-            if (effectiveSchema == null || effectiveSchema.isBlank()) {
-                continue;
-            }
-            PartitionInspector.PartitionInfo info = PartitionInspector.inspect(
-                    connection, jdbcUrl, effectiveSchema, ref.table());
-            if (!info.isPartitioned() || info.latestPartition().isBlank()) {
-                continue;
-            }
-            String originalQualified = effectiveSchema + "." + ref.table();
-            String latestChild = info.latestPartition();
-            if (originalQualified.equalsIgnoreCase(latestChild)) {
-                // Already pointing at the child (e.g. LLM did the substitution itself); no-op.
-                continue;
-            }
-            String replaced = replaceTableReferences(rewritten, ref.schema(), ref.table(), latestChild);
-            if (replaced.equals(rewritten)) {
-                continue;
-            }
-            rewritten = replaced;
-            rewrites.put(originalQualified, latestChild);
-            childNames.add(latestChild);
-        }
-        if (rewrites.isEmpty()) {
-            return PartitionRewrite.none();
-        }
-        return new PartitionRewrite(true, sql, rewritten, rewrites, childNames);
-    }
-
-    /**
-     * 只替换 FROM/JOIN 后面的表引用 —— 不能盲目字符串替换，否则字符串字面量或注释里包含父表名时
-     * 会被误改。所以继续复用 {@link #FROM_OR_JOIN_PATTERN}。支持两种写法：
-     * <ul>
-     *     <li>{@code from schema.table} → {@code from new_schema.new_table}</li>
-     *     <li>{@code from table}（ref.schema 为空）→ {@code from new_schema.new_table}</li>
-     * </ul>
-     */
-    private String replaceTableReferences(String sql, String schema, String table, String replacementQualified) {
-        String pattern;
-        if (schema != null && !schema.isEmpty()) {
-            pattern = "(?i)(\\b(?:from|join)\\s+)" + Pattern.quote(schema) + "\\s*\\.\\s*" + Pattern.quote(table) + "\\b";
-        } else {
-            pattern = "(?i)(\\b(?:from|join)\\s+)" + Pattern.quote(table) + "\\b";
-        }
-        return sql.replaceAll(pattern, "$1" + Matcher.quoteReplacement(replacementQualified));
-    }
-
-    record PartitionRewrite(
-            boolean changed,
-            String originalSql,
-            String rewrittenSql,
-            Map<String, String> rewrites,
-            List<String> childNames
-    ) {
-        static PartitionRewrite none() {
-            return new PartitionRewrite(false, "", "", Map.of(), List.of());
-        }
-
-        Map<String, Object> toMetadata() {
-            Map<String, Object> map = new LinkedHashMap<>();
-            map.put("changed", changed);
-            map.put("rewrites", rewrites);
-            map.put("childPartitions", childNames);
-            return map;
-        }
-    }
 }
